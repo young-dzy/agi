@@ -1,18 +1,22 @@
+# 对话模型配置
 llm:
   api_url: https://ark.cn-beijing.volces.com/api/v3/chat/completions
   api_key: "97443eb3-4d60-4738-bf9d-e7bf364566d2"
   model: ep-20260430233018-tqktj
   temperature: 0.7
 
+# 向量模型配置
 embedding:
   api_url: https://ark.cn-beijing.volces.com/api/v3/embeddings
   api_key: "97443eb3-4d60-4738-bf9d-e7bf364566d2"
   model: ep-20260119190844-zzrq7
 
+# 向量数据库配置
 milvus:
   host: localhost
   port: 19530
 
+# 关系型数据库配置
 postgres:
   host: localhost
   port: 5432
@@ -31,6 +35,7 @@ kafka:
     - localhost:29092
   topic: agent-events
 
+#rag策略
 rag:
   chunk_size: 200
   chunk_overlap: 50

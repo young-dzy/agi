@@ -1,12 +1,11 @@
 // Package rag 实现检索增强生成（Retrieval-Augmented Generation）。
-// 包含：文本分割器、TF 词袋向量存储、余弦相似度检索、RAG 引擎。
+// 包含：文本分割器、混合检索存储（Milvus 语义 + ES BM25 + RRF 融合）、RAG 引擎。
 package rag
 
 import (
 	"final/config"
 	"final/internal/infra"
 	"fmt"
-	"math"
 	"strings"
 )
 
@@ -52,94 +51,7 @@ func (s *TextSplitter) Split(text string) []Chunk {
 	return chunks
 }
 
-// ─────────────────────────────── 向量存储 ────────────────────────────────
-
-// VectorStore 是基于 TF 词袋的内存向量库
-type VectorStore struct {
-	Chunks   []Chunk
-	vectors  [][]float64
-	vocabMap map[string]int
-	vocab    []string
-}
-
-// NewVectorStore 创建空向量库
-func NewVectorStore() *VectorStore {
-	return &VectorStore{vocabMap: make(map[string]int)}
-}
-
-// tokenize 将文本切成词元（中文逐字，英文按单词）
-func tokenize(text string) []string {
-	var tokens []string
-	word := ""
-	for _, r := range text {
-		if r >= 0x4E00 && r <= 0x9FFF {
-			if word != "" {
-				tokens = append(tokens, strings.ToLower(word))
-				word = ""
-			}
-			tokens = append(tokens, string(r))
-		} else if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			word += string(r)
-		} else {
-			if word != "" {
-				tokens = append(tokens, strings.ToLower(word))
-				word = ""
-			}
-		}
-	}
-	if word != "" {
-		tokens = append(tokens, strings.ToLower(word))
-	}
-	return tokens
-}
-
-func (v *VectorStore) buildVocab(chunks []Chunk) {
-	for _, c := range chunks {
-		for _, t := range tokenize(c.Content) {
-			if _, ok := v.vocabMap[t]; !ok {
-				v.vocabMap[t] = len(v.vocab)
-				v.vocab = append(v.vocab, t)
-			}
-		}
-	}
-}
-
-func (v *VectorStore) textToVector(text string) []float64 {
-	vec := make([]float64, len(v.vocabMap))
-	for _, t := range tokenize(text) {
-		if idx, ok := v.vocabMap[t]; ok {
-			vec[idx]++
-		}
-	}
-	return vec
-}
-
-// cosine 计算余弦相似度
-func cosine(a, b []float64) float64 {
-	if len(a) != len(b) {
-		return 0
-	}
-	var dot, na, nb float64
-	for i := range a {
-		dot += a[i] * b[i]
-		na += a[i] * a[i]
-		nb += b[i] * b[i]
-	}
-	if na == 0 || nb == 0 {
-		return 0
-	}
-	return dot / (math.Sqrt(na) * math.Sqrt(nb))
-}
-
-// Index 对 Chunk 列表建立向量索引
-func (v *VectorStore) Index(chunks []Chunk) {
-	v.Chunks = chunks
-	v.buildVocab(chunks)
-	v.vectors = make([][]float64, len(chunks))
-	for i, c := range chunks {
-		v.vectors[i] = v.textToVector(c.Content)
-	}
-}
+// ─────────────────────────────── 检索结果 ────────────────────────────────
 
 // SearchResult 单条检索结果
 type SearchResult struct {
@@ -147,32 +59,12 @@ type SearchResult struct {
 	Similarity float64 `json:"similarity"`
 }
 
-// Search 检索与 query 最相似的 topK 条 Chunk（冒泡排序，适合小规模）
-func (v *VectorStore) Search(query string, topK int) []SearchResult {
-	qv := v.textToVector(query)
-	results := make([]SearchResult, len(v.Chunks))
-	for i, cv := range v.vectors {
-		results[i] = SearchResult{Chunk: v.Chunks[i], Similarity: cosine(qv, cv)}
-	}
-	for i := 0; i < len(results); i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[j].Similarity > results[i].Similarity {
-				results[i], results[j] = results[j], results[i]
-			}
-		}
-	}
-	if topK > len(results) {
-		topK = len(results)
-	}
-	return results[:topK]
-}
-
 // ─────────────────────────────── RAG 引擎 ────────────────────────────────
 
-// Engine 整合文本分割、向量检索与答案生成
+// Engine 整合文本分割、混合检索与答案生成
 type Engine struct {
 	cfg        *config.APIConfig
-	store      *VectorStore
+	store      *HybridStore
 	splitter   *TextSplitter
 	Loaded     bool
 	inf        *infra.Infrastructure
@@ -183,7 +75,7 @@ type Engine struct {
 func NewEngine(cfg *config.APIConfig, inf *infra.Infrastructure) *Engine {
 	return &Engine{
 		cfg:      cfg,
-		store:    NewVectorStore(),
+		store:    NewHybridStore(cfg, inf),
 		splitter: NewTextSplitter(cfg.ChunkSize, cfg.ChunkOverlap),
 		inf:      inf,
 	}
@@ -194,13 +86,38 @@ func (e *Engine) SetGenerateFn(fn func(systemPrompt string, userMsg string) stri
 	e.generateFn = fn
 }
 
-// Ingest 将文档切分并建立向量索引，返回切片数量
-func (e *Engine) Ingest(doc string) int {
+// SetEmbedFn 注入 Embedding 回调，供 HybridStore 语义向量化
+func (e *Engine) SetEmbedFn(fn func(text string) ([]float64, error)) {
+	e.store.SetEmbedFn(fn)
+}
+
+// Mode 返回当前检索模式
+func (e *Engine) Mode() string {
+	return e.store.Mode()
+}
+
+// Ingest 将文档切分并建立混合检索索引，返回 (chunk数量, docHash)
+func (e *Engine) Ingest(doc string) (int, string) {
 	chunks := e.splitter.Split(doc)
-	e.store.Index(chunks)
+	docHash := e.store.Index(chunks, doc)
 	e.Loaded = true
-	e.inf.PublishEvent("rag.ingest", fmt.Sprintf(`{"chunk_count":%d}`, len(chunks)))
-	return len(chunks)
+	e.inf.PublishEvent("rag.ingest", fmt.Sprintf(`{"chunk_count":%d,"mode":"%s","doc_hash":"%s"}`, len(chunks), e.store.Mode(), docHash))
+	return len(chunks), docHash
+}
+
+// Delete 按 docHash 删除文档的所有 chunks（PG + ES + Milvus）
+func (e *Engine) Delete(docHash string) error {
+	err := e.store.Delete(docHash)
+	// 删除后检查是否还有 chunks
+	rows, _ := e.inf.LoadAllRAGChunks()
+	e.Loaded = len(rows) > 0
+	return err
+}
+
+// RestoreChunks 从 PG 恢复 chunks，设置 Loaded 标记
+func (e *Engine) RestoreChunks(chunks []Chunk) {
+	e.store.RestoreChunks(chunks)
+	e.Loaded = len(chunks) > 0
 }
 
 // Query 检索知识库并返回答案和检索结果
@@ -208,10 +125,18 @@ func (e *Engine) Query(question string) (string, []SearchResult) {
 	if !e.Loaded {
 		return "知识库为空，请先上传文档。", nil
 	}
-	results := e.store.Search(question, e.cfg.TopK)
+	hybridResults := e.store.Search(question, e.cfg.TopK)
+	// 将 HybridResult 转换为 SearchResult（保持 API 兼容）
+	results := make([]SearchResult, len(hybridResults))
+	for i, hr := range hybridResults {
+		results[i] = SearchResult{
+			Chunk:      hr.Chunk,
+			Similarity: hr.Score,
+		}
+	}
 	var parts []string
 	for _, r := range results {
-		if r.Similarity > 0.01 {
+		if r.Chunk.Content != "" {
 			parts = append(parts, r.Chunk.Content)
 		}
 	}
@@ -229,7 +154,15 @@ func (e *Engine) Query(question string) (string, []SearchResult) {
 	return fmt.Sprintf("【知识库检索结果】\n%s", context), results
 }
 
-// Chunks 返回当前已索引的所有切片（供状态接口使用）
+// Chunks 返回当前已持久化的切片预览（从 PG 加载，供状态接口使用）
 func (e *Engine) Chunks() []Chunk {
-	return e.store.Chunks
+	rows, err := e.inf.LoadAllRAGChunks()
+	if err != nil {
+		return nil
+	}
+	chunks := make([]Chunk, len(rows))
+	for i, r := range rows {
+		chunks[i] = Chunk{ID: i, Content: r.Content}
+	}
+	return chunks
 }

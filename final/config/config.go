@@ -42,13 +42,23 @@ type APIConfig struct {
 	KafkaTopic   string
 
 	// ===== RAG 配置 =====
-	ChunkSize    int
-	ChunkOverlap int
-	TopK         int
+	ChunkSize          int
+	ChunkOverlap       int
+	TopK               int
+	RRFConstantK       int
+	SemanticWeight     float64
+	EnableHybridSearch bool
+	RAGMilvusDim       int
 
 	// ===== Memory 配置 =====
-	ShortTermMaxTurns int
-	LongTermTopK      int
+	ShortTermMaxTurns             int
+	LongTermTopK                  int
+	MemoryConsolidationSimilarity float64
+	MemoryConsolidationDedup      float64
+	MemoryConsolidationTTLDays    int
+	MemoryConsolidationDecayRate  float64
+	MemoryConsolidationMinImport  float64
+	MemoryConsolidationTrigger    int
 
 	// ===== Harness 配置 =====
 	MaxRetries    int
@@ -98,13 +108,25 @@ type yamlFile struct {
 		Topic   string   `yaml:"topic"`
 	} `yaml:"kafka"`
 	RAG struct {
-		ChunkSize    int `yaml:"chunk_size"`
-		ChunkOverlap int `yaml:"chunk_overlap"`
-		TopK         int `yaml:"top_k"`
+		ChunkSize          int     `yaml:"chunk_size"`
+		ChunkOverlap       int     `yaml:"chunk_overlap"`
+		TopK               int     `yaml:"top_k"`
+		RRFConstantK       int     `yaml:"rrf_constant_k"`
+		SemanticWeight     float64 `yaml:"semantic_weight"`
+		EnableHybridSearch bool    `yaml:"enable_hybrid_search"`
+		RAGMilvusDim       int     `yaml:"rag_milvus_dim"`
 	} `yaml:"rag"`
 	Memory struct {
-		ShortTermMaxTurns int `yaml:"short_term_max_turns"`
-		LongTermTopK      int `yaml:"long_term_top_k"`
+		ShortTermMaxTurns int     `yaml:"short_term_max_turns"`
+		LongTermTopK      int     `yaml:"long_term_top_k"`
+		Consolidation     struct {
+			SimilarityThreshold float64 `yaml:"similarity_threshold"`
+			DedupThreshold      float64 `yaml:"dedup_threshold"`
+			TTLDays             int     `yaml:"ttl_days"`
+			DecayRate           float64 `yaml:"decay_rate"`
+			MinImportance       float64 `yaml:"min_importance"`
+			TriggerInterval     int     `yaml:"trigger_interval"`
+		} `yaml:"consolidation"`
 	} `yaml:"memory"`
 	Harness struct {
 		MaxRetries    int `yaml:"max_retries"`
@@ -133,7 +155,7 @@ func DefaultConfig() *APIConfig {
 		log.Fatalf("解析 config/config.yaml 失败: %v", err)
 	}
 
-	return &APIConfig{
+	c := &APIConfig{
 		LLMAPIUrl:   y.LLM.APIUrl,
 		LLMAPIKey:   y.LLM.APIKey,
 		LLMModel:    y.LLM.Model,
@@ -159,12 +181,23 @@ func DefaultConfig() *APIConfig {
 		KafkaBrokers: y.Kafka.Brokers,
 		KafkaTopic:   y.Kafka.Topic,
 
-		ChunkSize:    y.RAG.ChunkSize,
-		ChunkOverlap: y.RAG.ChunkOverlap,
-		TopK:         y.RAG.TopK,
+		ChunkSize:          y.RAG.ChunkSize,
+		ChunkOverlap:       y.RAG.ChunkOverlap,
+		TopK:               y.RAG.TopK,
+		RRFConstantK:       y.RAG.RRFConstantK,
+		SemanticWeight:     y.RAG.SemanticWeight,
+		EnableHybridSearch: y.RAG.EnableHybridSearch,
+		RAGMilvusDim:       y.RAG.RAGMilvusDim,
 
 		ShortTermMaxTurns: y.Memory.ShortTermMaxTurns,
 		LongTermTopK:      y.Memory.LongTermTopK,
+
+		MemoryConsolidationSimilarity: y.Memory.Consolidation.SimilarityThreshold,
+		MemoryConsolidationDedup:      y.Memory.Consolidation.DedupThreshold,
+		MemoryConsolidationTTLDays:    y.Memory.Consolidation.TTLDays,
+		MemoryConsolidationDecayRate:  y.Memory.Consolidation.DecayRate,
+		MemoryConsolidationMinImport:  y.Memory.Consolidation.MinImportance,
+		MemoryConsolidationTrigger:    y.Memory.Consolidation.TriggerInterval,
 
 		MaxRetries:    y.Harness.MaxRetries,
 		RetryDelayMs:  y.Harness.RetryDelayMs,
@@ -176,6 +209,39 @@ func DefaultConfig() *APIConfig {
 
 		ServerPort: y.Server.Port,
 	}
+
+	// RAG 混合检索默认值
+	if c.RRFConstantK <= 0 {
+		c.RRFConstantK = 60
+	}
+	if c.SemanticWeight <= 0 {
+		c.SemanticWeight = 0.7
+	}
+	if c.RAGMilvusDim <= 0 {
+		c.RAGMilvusDim = 1024
+	}
+
+	// 记忆合并默认值
+	if c.MemoryConsolidationSimilarity <= 0 {
+		c.MemoryConsolidationSimilarity = 0.80
+	}
+	if c.MemoryConsolidationDedup <= 0 {
+		c.MemoryConsolidationDedup = 0.95
+	}
+	if c.MemoryConsolidationTTLDays <= 0 {
+		c.MemoryConsolidationTTLDays = 30
+	}
+	if c.MemoryConsolidationDecayRate <= 0 {
+		c.MemoryConsolidationDecayRate = 0.995
+	}
+	if c.MemoryConsolidationMinImport <= 0 {
+		c.MemoryConsolidationMinImport = 0.3
+	}
+	if c.MemoryConsolidationTrigger <= 0 {
+		c.MemoryConsolidationTrigger = 5
+	}
+
+	return c
 }
 
 func (c *APIConfig) IsRealLLM() bool      { return c.LLMAPIKey != "" }

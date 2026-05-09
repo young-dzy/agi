@@ -2,11 +2,13 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"final/config"
 	"final/internal/agent"
 	"final/internal/infra"
 	"final/internal/tools"
+	"fmt"
 	"net/http"
 	"unicode/utf8"
 )
@@ -26,18 +28,21 @@ func New(a *agent.UnifiedAgent, inf *infra.Infrastructure, cfg *config.APIConfig
 }
 
 func (s *Server) registerRoutes() {
-	http.HandleFunc("/api/chat",      s.chat)
-	http.HandleFunc("/api/upload",    s.upload)
-	http.HandleFunc("/api/memory",    s.memory)
-	http.HandleFunc("/api/tools",     s.toolsList)
-	http.HandleFunc("/api/tools/mcp", s.registerMCPTool)
-	http.HandleFunc("/api/snapshots", s.snapshots)
-	http.HandleFunc("/api/status",    s.status)
+	http.HandleFunc("/api/chat",       s.chat)
+	http.HandleFunc("/api/chat/stream", s.chatStream)
+	http.HandleFunc("/api/chat/cancel", s.chatCancel)
+	http.HandleFunc("/api/upload",     s.upload)
+	http.HandleFunc("/api/docs/delete", s.docsDelete)
+	http.HandleFunc("/api/memory",     s.memory)
+	http.HandleFunc("/api/tools",      s.toolsList)
+	http.HandleFunc("/api/tools/mcp",  s.registerMCPTool)
+	http.HandleFunc("/api/snapshots",  s.snapshots)
+	http.HandleFunc("/api/status",     s.status)
 }
 
 // ─────────────────────────────── 路由处理 ────────────────────────────────
 
-// POST /api/chat — 统一对话入口
+// POST /api/chat — 统一对话入口（同步模式，向后兼容）
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -46,8 +51,8 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Message       string   `json:"message"`
 		UseRAG        bool     `json:"use_rag"`
-		SelectedTools []string `json:"selected_tools"` // nil=自动路由, []=禁用工具, ["x"]=指定工具
-		Explicit      bool     `json:"explicit"`       // true 时前端显式控制路由
+		SelectedTools []string `json:"selected_tools"`
+		Explicit      bool     `json:"explicit"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -58,8 +63,80 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		SelectedTools: req.SelectedTools,
 		Explicit:      req.Explicit,
 	}
-	resp := s.agent.ProcessWithOptions(req.Message, opts)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	resp := s.agent.ProcessContext(ctx, req.Message, opts)
 	writeJSON(w, resp)
+}
+
+// POST /api/chat/stream — SSE 流式对话入口
+func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Message       string   `json:"message"`
+		UseRAG        bool     `json:"use_rag"`
+		SelectedTools []string `json:"selected_tools"`
+		Explicit      bool     `json:"explicit"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, canFlush := w.(http.Flusher)
+
+	// send SSE helper
+	sendSSE := func(event string, data interface{}) {
+		jsonData, _ := json.Marshal(data)
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, jsonData)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	// Send step progress events via a callback
+	opts := agent.ChatOptions{
+		UseRAG:        req.UseRAG,
+		SelectedTools: req.SelectedTools,
+		Explicit:      req.Explicit,
+	}
+
+	// Notify client that processing has started
+	sendSSE("start", map[string]interface{}{"message": req.Message})
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// Monitor client disconnect: if client closes connection, cancel context
+	notify := r.Context().Done()
+	go func() {
+		<-notify
+		cancel()
+	}()
+
+	resp := s.agent.ProcessContext(ctx, req.Message, opts)
+
+	// Send final response
+	sendSSE("done", resp)
+}
+
+// POST /api/chat/cancel — 取消当前正在执行的对话任务
+func (s *Server) chatCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.agent.Cancel()
+	writeJSON(w, map[string]interface{}{"ok": true, "message": "已发送取消信号"})
 }
 
 // POST /api/upload — 上传文档到 RAG 知识库
@@ -75,11 +152,36 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	count := s.agent.RAG().Ingest(req.Content)
+	count, docHash := s.agent.RAG().Ingest(req.Content)
 	writeJSON(w, map[string]interface{}{
 		"chunk_count": count,
+		"doc_hash":    docHash,
 		"chunks":      s.agent.RAG().Chunks(),
 	})
+}
+
+// POST /api/docs/delete — 删除指定文档的所有 chunks
+func (s *Server) docsDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		DocHash string `json:"doc_hash"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.DocHash == "" {
+		http.Error(w, "doc_hash is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.agent.RAG().Delete(req.DocHash); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"ok": true, "doc_hash": req.DocHash})
 }
 
 // GET /api/memory — 查看三层记忆状态
@@ -162,6 +264,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]interface{}{
 		"rag_loaded":       s.agent.RAG().Loaded,
+		"rag_mode":         s.agent.RAG().Mode(),
 		"rag_chunks":       chunkPreviews,
 		"short_term_count": len(s.agent.ShortTerm().Messages),
 		"long_term_count":  len(s.agent.LongTerm().Items),

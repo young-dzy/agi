@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"final/config"
 	"fmt"
@@ -35,9 +36,17 @@ func New(cfg *config.APIConfig) *Client {
 // Chat 发送对话请求，返回回复文本。
 // 若配置了真实 API Key 则调用远程接口，否则使用 Mock。
 func (c *Client) Chat(systemPrompt string, messages []Message) string {
+	return c.ChatContext(context.Background(), systemPrompt, messages)
+}
+
+// ChatContext 带 context 的对话请求，支持取消。
+func (c *Client) ChatContext(ctx context.Context, systemPrompt string, messages []Message) string {
 	if c.cfg.IsRealLLM() {
-		reply, err := c.callAPI(systemPrompt, messages)
+		reply, err := c.callAPIWithContext(ctx, systemPrompt, messages)
 		if err != nil {
+			if ctx.Err() != nil {
+				return "[已中断]"
+			}
 			log.Printf("LLM API 调用失败: %v，回退到 Mock", err)
 			return c.mock(messages)
 		}
@@ -66,6 +75,10 @@ type apiResponse struct {
 }
 
 func (c *Client) callAPI(systemPrompt string, messages []Message) (string, error) {
+	return c.callAPIWithContext(context.Background(), systemPrompt, messages)
+}
+
+func (c *Client) callAPIWithContext(ctx context.Context, systemPrompt string, messages []Message) (string, error) {
 	var msgs []Message
 	if systemPrompt != "" {
 		msgs = append(msgs, Message{Role: "system", Content: systemPrompt})
@@ -81,7 +94,7 @@ func (c *Client) callAPI(systemPrompt string, messages []Message) (string, error
 		return "", fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.cfg.LLMAPIUrl, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.LLMAPIUrl, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("构建请求失败: %w", err)
 	}
@@ -90,6 +103,9 @@ func (c *Client) callAPI(systemPrompt string, messages []Message) (string, error
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		return "", fmt.Errorf("HTTP 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
@@ -115,10 +131,11 @@ func (c *Client) callAPI(systemPrompt string, messages []Message) (string, error
 // ── Embedding API ──────────────────────────────────────────────────────
 
 type embedRequest struct {
-	Model string `json:"model"`
-	Input string `json:"input"`
+	Model string      `json:"model"`
+	Input interface{} `json:"input"` // string for text API, []map for multimodal API
 }
 
+// embedResponse 标准文本 embedding 响应（data 为数组）
 type embedResponse struct {
 	Data []struct {
 		Embedding []float64 `json:"embedding"`
@@ -128,16 +145,42 @@ type embedResponse struct {
 	} `json:"error,omitempty"`
 }
 
+// multimodalEmbedResponse 多模态 embedding 响应（data 为单个对象）
+type multimodalEmbedResponse struct {
+	Data struct {
+		Embedding []float64 `json:"embedding"`
+	} `json:"data"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
 // Embed 调用 Embedding API 将文本转为向量；失败时返回 nil
+// 自动检测多模态 embedding 端点并适配请求格式
 func (c *Client) Embed(text string) ([]float64, error) {
+	return c.EmbedContext(context.Background(), text)
+}
+
+// EmbedContext 带 context 的 Embedding 请求，支持取消
+func (c *Client) EmbedContext(ctx context.Context, text string) ([]float64, error) {
 	if c.cfg.EmbeddingAPIUrl == "" || c.cfg.EmbeddingAPIKey == "" {
 		return nil, fmt.Errorf("embedding API 未配置")
 	}
-	body, err := json.Marshal(embedRequest{Model: c.cfg.EmbeddingModel, Input: text})
+
+	// 多模态 embedding 使用 /multimodal_embeddings 端点，input 为结构化数组
+	var input interface{}
+	apiURL := c.cfg.EmbeddingAPIUrl
+	if strings.Contains(apiURL, "/embeddings/multimodal") {
+		input = []map[string]string{{"type": "text", "text": text}}
+	} else {
+		input = text
+	}
+
+	body, err := json.Marshal(embedRequest{Model: c.cfg.EmbeddingModel, Input: input})
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.cfg.EmbeddingAPIUrl, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -145,6 +188,9 @@ func (c *Client) Embed(text string) ([]float64, error) {
 	req.Header.Set("Authorization", "Bearer "+c.cfg.EmbeddingAPIKey)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -152,17 +198,37 @@ func (c *Client) Embed(text string) ([]float64, error) {
 	if err != nil {
 		return nil, err
 	}
-	var result embedResponse
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, fmt.Errorf("解析 embedding 响应失败: %w, body: %s", err, string(data))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("embedding API 返回错误状态 %d, body: %s", resp.StatusCode, string(data))
 	}
-	if result.Error != nil {
-		return nil, fmt.Errorf("embedding API 错误: %s", result.Error.Message)
+	isMultimodal := strings.Contains(apiURL, "/embeddings/multimodal")
+	var embedding []float64
+	if isMultimodal {
+		var result multimodalEmbedResponse
+		if err := json.Unmarshal(data, &result); err != nil {
+			return nil, fmt.Errorf("解析 embedding 响应失败: %w, body: %s", err, string(data))
+		}
+		if result.Error != nil {
+			return nil, fmt.Errorf("embedding API 错误: %s", result.Error.Message)
+		}
+		embedding = result.Data.Embedding
+	} else {
+		var result embedResponse
+		if err := json.Unmarshal(data, &result); err != nil {
+			return nil, fmt.Errorf("解析 embedding 响应失败: %w, body: %s", err, string(data))
+		}
+		if result.Error != nil {
+			return nil, fmt.Errorf("embedding API 错误: %s", result.Error.Message)
+		}
+		if len(result.Data) == 0 {
+			return nil, fmt.Errorf("embedding 返回空结果")
+		}
+		embedding = result.Data[0].Embedding
 	}
-	if len(result.Data) == 0 {
-		return nil, fmt.Errorf("embedding 返回空结果")
+	if len(embedding) == 0 {
+		return nil, fmt.Errorf("embedding 返回空向量")
 	}
-	return result.Data[0].Embedding, nil
+	return embedding, nil
 }
 
 // ── LLM-based Preference Extraction ────────────────────────────────────

@@ -15,10 +15,10 @@
 package main
 
 import (
-	"final/config"
-	"final/internal/agent"
-	"final/internal/handler"
-	"final/internal/infra"
+	"agi-ai-assitant/config"
+	"agi-ai-assitant/internal/agent"
+	"agi-ai-assitant/internal/handler"
+	"agi-ai-assitant/internal/infra"
 	"fmt"
 	"log"
 	"net/http"

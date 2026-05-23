@@ -7,7 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"final/config"
+	"agi-ai-assitant/config"
 	"fmt"
 	"log"
 	"strings"

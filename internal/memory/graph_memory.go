@@ -14,7 +14,7 @@
 package memory
 
 import (
-	"final/internal/graph"
+	"agi-ai-assitant/internal/graph"
 	"log"
 	"time"
 )

@@ -4,9 +4,9 @@ package rag
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"final/config"
-	"final/internal/graph"
-	"final/internal/infra"
+	"agi-ai-assitant/config"
+	"agi-ai-assitant/internal/graph"
+	"agi-ai-assitant/internal/infra"
 	"fmt"
 	"log"
 	"sort"

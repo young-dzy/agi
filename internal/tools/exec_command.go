@@ -2,7 +2,7 @@ package tools
 
 import (
 	"context"
-	"final/internal/sandbox"
+	"agi-ai-assitant/internal/sandbox"
 	"fmt"
 	"strings"
 	"time"

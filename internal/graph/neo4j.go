@@ -2,7 +2,7 @@ package graph
 
 import (
 	"context"
-	"final/config"
+	"agi-ai-assitant/config"
 	"log"
 	"time"
 

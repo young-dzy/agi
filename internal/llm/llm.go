@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"final/config"
+	"agi-ai-assitant/config"
 	"fmt"
 	"io"
 	"log"

@@ -14,10 +14,12 @@ import (
 	"context"
 	"encoding/json"
 	"final/config"
+	"final/internal/graph"
 	"final/internal/infra"
 	"final/internal/llm"
 	"final/internal/memory"
 	"final/internal/rag"
+	"final/internal/sandbox"
 	"final/internal/tools"
 	"fmt"
 	"log"
@@ -111,32 +113,37 @@ type Response struct {
 
 // UnifiedAgent 整合全部能力，是系统的核心调度入口
 type UnifiedAgent struct {
-	cfg       *config.APIConfig
-	llm       *llm.Client
-	rag       *rag.Engine
-	tools     map[string]tools.Tool
-	stm       *memory.ShortTerm
-	ltm       *memory.LongTerm
-	pref      *memory.Preference
+	cfg      *config.APIConfig
+	llm      *llm.Client
+	rag      *rag.Engine
+	tools    map[string]tools.Tool
+	stm      *memory.ShortTerm
+	ltm      *memory.LongTerm      // 保留直接引用，供 handler 暴露
+	graphMem *memory.GraphMemory   // 图增强记忆层（包装 ltm）
+	pref     *memory.Preference
+	sandbox  *sandbox.Sandbox
+	kg       *graph.KGStore // 知识图谱（RAG + 记忆图共享）
 	snapshots []Snapshot
-	task      *TaskState
-	inf       *infra.Infrastructure
-	cancelFn  context.CancelFunc // 当前任务的取消函数
+	task     *TaskState
+	inf      *infra.Infrastructure
+	cancelFn context.CancelFunc // 当前任务的取消函数
 }
 
 // New 创建并初始化 UnifiedAgent
 func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	llmClient := llm.New(cfg)
 	ragEngine := rag.NewEngine(cfg, inf)
+	ltm := memory.NewLongTerm()
 	a := &UnifiedAgent{
 		cfg:   cfg,
 		llm:   llmClient,
 		rag:   ragEngine,
 		tools: tools.DefaultTools(),
 		stm:   memory.NewShortTerm(cfg.ShortTermMaxTurns),
-		ltm:   memory.NewLongTerm(),
-		pref:  memory.NewPreference(),
-		inf:   inf,
+		ltm:   ltm,
+		// graphMem 在 initKnowledgeGraph 中创建（需要 kg 先就绪）
+		pref: memory.NewPreference(),
+		inf:  inf,
 	}
 	// 配置长期记忆合并
 	a.ltm.SetConsolidationConfig(&memory.ConsolidationConfig{
@@ -211,6 +218,10 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	a.restoreFromDB()
 	// 从 PostgreSQL 恢复 RAG chunks
 	a.restoreRAGFromDB()
+	// 初始化知识图谱（Neo4j），注入到 RAG 引擎
+	a.initKnowledgeGraph()
+	// 初始化沙箱并注册 exec_command 工具
+	a.initSandbox()
 	return a
 }
 
@@ -295,10 +306,10 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 				a.inf.SavePreference("default", k, v)
 				content := fmt.Sprintf("用户%s: %s", k, v)
 				emb, _ := a.llm.Embed(content)
-				if a.ltm.Store(content, 0.8, emb) {
+				if added, _ := a.graphMem.Store(content, 0.8, emb); added {
 					embJSON, _ := json.Marshal(emb)
 					pgID := a.inf.SaveLongTermItem(content, 0.8, embJSON)
-					a.ltm.SyncLastItemPGID(pgID)
+					a.graphMem.SyncLastItemPGID(pgID)
 				}
 			}
 		}
@@ -375,10 +386,15 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 	// 从 assistant 回答中提取可记忆信息
 	go a.extractMemoryFromReply(resp.Answer)
 
-	// 异步触发记忆合并（去重+合并+衰减+过期）
+	// 异步触发记忆合并（去重+合并+衰减+过期；有图层时使用图感知合并以保护高中心度节点）
 	go func() {
 		if a.ltm.NeedConsolidation() {
-			result := a.ltm.Consolidate()
+			var result memory.ConsolidationResult
+			if a.graphMem != nil {
+				result = a.graphMem.GraphAwareConsolidate()
+			} else {
+				result = a.ltm.Consolidate()
+			}
 			a.syncConsolidationToDB(result)
 		}
 	}()
@@ -999,7 +1015,13 @@ func (a *UnifiedAgent) buildMemorySystemPrefixWithCtx(ctx context.Context, query
 		// context 取消，返回已有偏好部分
 		return strings.Join(parts, "\n\n")
 	}
-	ltmItems := a.ltm.Recall(query, a.cfg.LongTermTopK, queryEmb)
+	// 优先用图记忆做关联召回，没有图则降级到纯 LTM
+	var ltmItems []memory.Item
+	if a.graphMem != nil {
+		ltmItems = a.graphMem.Recall(query, a.cfg.LongTermTopK, queryEmb)
+	} else {
+		ltmItems = a.ltm.Recall(query, a.cfg.LongTermTopK, queryEmb)
+	}
 	if len(ltmItems) > 0 {
 		var items []string
 		for _, item := range ltmItems {
@@ -1070,7 +1092,13 @@ func (a *UnifiedAgent) extractMemoryFromReply(answer string) {
 		a.inf.SavePreference("default", k, v)
 		content := fmt.Sprintf("用户%s: %s", k, v)
 		emb, _ := a.llm.Embed(content)
-		if a.ltm.Store(content, 0.7, emb) {
+		if a.graphMem != nil {
+			if added, _ := a.graphMem.Store(content, 0.7, emb); added {
+				embJSON, _ := json.Marshal(emb)
+				pgID := a.inf.SaveLongTermItem(content, 0.7, embJSON)
+				a.graphMem.SyncLastItemPGID(pgID)
+			}
+		} else if a.ltm.Store(content, 0.7, emb) {
 			embJSON, _ := json.Marshal(emb)
 			pgID := a.inf.SaveLongTermItem(content, 0.7, embJSON)
 			a.ltm.SyncLastItemPGID(pgID)
@@ -1137,3 +1165,74 @@ func (a *UnifiedAgent) restoreRAGFromDB() {
 	a.rag.RestoreChunks(chunks)
 	log.Printf("✅ RAG chunks 恢复：%d 条", len(chunks))
 }
+
+// initKnowledgeGraph 初始化 Neo4j 知识图谱存储，并注入到 RAG 引擎 + GraphMemory
+func (a *UnifiedAgent) initKnowledgeGraph() {
+	kg := graph.NewKGStore(a.cfg, func(systemPrompt, userMsg string) string {
+		return a.llm.Chat(systemPrompt, []llm.Message{{Role: "user", Content: userMsg}})
+	})
+	a.kg = kg
+	a.rag.SetKGStore(kg)
+
+	// 构建图记忆层（包装现有 ltm）
+	a.graphMem = memory.NewGraphMemory(a.ltm, kg, a.cfg.MemoryConsolidationSimilarity)
+	a.graphMem.SyncPrevID() // 从 DB 恢复后对齐 prevID
+
+	if kg.Available() {
+		log.Printf("🕸️  知识图谱已就绪（Neo4j），RAG 升级为三路混合检索，记忆系统已接入图层")
+	} else {
+		log.Printf("ℹ️  Neo4j 不可用，RAG 保持双路检索，记忆系统退化为纯向量模式")
+	}
+}
+
+// KG 暴露知识图谱实例，供 HTTP handler 或记忆模块使用
+func (a *UnifiedAgent) KG() *graph.KGStore { return a.kg }
+
+// initSandbox 初始化命令执行沙箱并注册 exec_command 工具
+func (a *UnifiedAgent) initSandbox() {
+	if !a.cfg.SandboxEnabled {
+		log.Printf("ℹ️  沙箱未启用（config.sandbox.enabled=false），跳过 exec_command 工具")
+		return
+	}
+
+	sbCfg := sandbox.SandboxConfig{
+		Image:           a.cfg.SandboxImage,
+		Timeout:         time.Duration(a.cfg.SandboxTimeoutMs) * time.Millisecond,
+		MaxOutputBytes:  a.cfg.SandboxMaxOutput,
+		MemoryLimitMB:   a.cfg.SandboxMemoryMB,
+		CPUPercent:      a.cfg.SandboxCPUPercent,
+		MaxPIDs:         a.cfg.SandboxMaxPIDs,
+		NetworkDisabled: a.cfg.SandboxNetDisabled,
+		ReadOnlyRootfs:  a.cfg.SandboxReadOnly,
+	}
+	secCfg := sandbox.SecurityConfig{
+		MaxCommandLength: a.cfg.SecMaxCmdLength,
+		AllowlistMode:    a.cfg.SecAllowlistMode,
+		Allowlist:        a.cfg.SecAllowlist,
+	}
+
+	sb := sandbox.NewSandbox(a.cfg.SandboxBackend, sbCfg, secCfg)
+
+	// 注入审计回调：将每条命令执行结果发送到 Kafka
+	sb.SetAuditFn(func(r sandbox.ExecResult) {
+		event, _ := json.Marshal(map[string]interface{}{
+			"command":     r.Command,
+			"level":       string(r.Validation.Level),
+			"exit_code":   r.ExitCode,
+			"duration_ms": r.Duration.Milliseconds(),
+			"backend":     r.Backend,
+			"killed":      r.Killed,
+			"truncated":   r.Truncated,
+			"reason":      r.Validation.Reason,
+			"violations":  r.Validation.Violations,
+		})
+		a.inf.PublishEvent("sandbox.exec", string(event))
+	})
+
+	a.sandbox = sb
+	a.tools["exec_command"] = tools.ExecCommandTool(sb)
+	log.Printf("🛡️  沙箱已就绪，后端=%s，exec_command 工具已注册", sb.Backend())
+}
+
+// Sandbox 暴露沙箱实例，供 HTTP handler 或前端查询状态
+func (a *UnifiedAgent) Sandbox() *sandbox.Sandbox { return a.sandbox }

@@ -65,8 +65,43 @@ harness:
 server:
   port: "8090"
 
-# 可选：接入 Tavily 搜索 API（https://tavily.com 免费额度 1000次/月）
-# 未填写时自动降级为 LLM 知识库回答
 search:
   api_key: "your-key"               # 请填入你的 Tavily API Key（可选）
   api_url: "https://tavily.com"
+
+# ===== 知识图谱（Neo4j，可选，不可用时跳过图检索）=====
+neo4j:
+  uri: "bolt://localhost:7687"
+  user: "neo4j"
+  password: "password123"
+  max_hops: 2        # 图遍历最大跳数
+  weight: 0.3        # 图检索在 RRF 融合中的权重
+  enabled: true      # false 时完全跳过知识图谱
+
+# ===== 沙箱执行（用于终端命令工具）=====
+sandbox:
+  enabled: true
+  backend: "docker"     # "docker" | "local" | "mock"
+  image: "alpine:3.19"
+  timeout_ms: 30000
+  max_output_bytes: 65536
+  memory_limit_mb: 256
+  cpu_percent: 50
+  max_pids: 64
+  network_disabled: true
+  readonly_rootfs: true
+
+# ===== 命令安全校验 =====
+security:
+  max_command_length: 500
+  allowlist_mode: false  # true = 白名单模式，只允许明确列出的命令
+  allowlist:
+    - "ls"
+    - "cat"
+    - "echo"
+    - "pwd"
+    - "date"
+    - "python3"
+    - "node"
+    - "go"
+    - "java"

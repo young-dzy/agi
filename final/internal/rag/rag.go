@@ -1,9 +1,10 @@
 // Package rag 实现检索增强生成（Retrieval-Augmented Generation）。
-// 包含：文本分割器、混合检索存储（Milvus 语义 + ES BM25 + RRF 融合）、RAG 引擎。
+// 包含：文本分割器、混合检索存储（Milvus 语义 + ES BM25 + Neo4j 知识图谱 + RRF 融合）、RAG 引擎。
 package rag
 
 import (
 	"final/config"
+	"final/internal/graph"
 	"final/internal/infra"
 	"fmt"
 	"strings"
@@ -66,6 +67,7 @@ type Engine struct {
 	cfg        *config.APIConfig
 	store      *HybridStore
 	splitter   *TextSplitter
+	kg         *graph.KGStore // 知识图谱，nil 时禁用
 	Loaded     bool
 	inf        *infra.Infrastructure
 	generateFn func(systemPrompt string, userMsg string) string // LLM 回调，由 agent 注入
@@ -79,6 +81,12 @@ func NewEngine(cfg *config.APIConfig, inf *infra.Infrastructure) *Engine {
 		splitter: NewTextSplitter(cfg.ChunkSize, cfg.ChunkOverlap),
 		inf:      inf,
 	}
+}
+
+// SetKGStore 注入知识图谱存储（由 agent.New 在基础设施就绪后调用）
+func (e *Engine) SetKGStore(kg *graph.KGStore) {
+	e.kg = kg
+	e.store.SetKGStore(kg)
 }
 
 // SetGenerateFn 注入 LLM 调用回调，供 Query 合成答案
@@ -97,17 +105,32 @@ func (e *Engine) Mode() string {
 }
 
 // Ingest 将文档切分并建立混合检索索引，返回 (chunk数量, docHash)
+// 知识图谱索引异步执行，不阻塞返回
 func (e *Engine) Ingest(doc string) (int, string) {
 	chunks := e.splitter.Split(doc)
 	docHash := e.store.Index(chunks, doc)
 	e.Loaded = true
 	e.inf.PublishEvent("rag.ingest", fmt.Sprintf(`{"chunk_count":%d,"mode":"%s","doc_hash":"%s"}`, len(chunks), e.store.Mode(), docHash))
+
+	// 异步建图：实体关系抽取耗时较长，不阻塞主流程
+	if e.kg != nil && e.kg.Available() {
+		refs := make([]graph.ChunkRef, len(chunks))
+		for i, c := range chunks {
+			refs[i] = graph.ChunkRef{ID: c.ID, Content: c.Content}
+		}
+		go e.kg.IndexDocument(docHash, refs)
+	}
+
 	return len(chunks), docHash
 }
 
-// Delete 按 docHash 删除文档的所有 chunks（PG + ES + Milvus）
+// Delete 按 docHash 删除文档的所有 chunks（PG + ES + Milvus + Neo4j KG）
 func (e *Engine) Delete(docHash string) error {
 	err := e.store.Delete(docHash)
+	// 同步删除知识图谱节点
+	if e.kg != nil && e.kg.Available() {
+		e.kg.DeleteDocument(docHash)
+	}
 	// 删除后检查是否还有 chunks
 	rows, _ := e.inf.LoadAllRAGChunks()
 	e.Loaded = len(rows) > 0

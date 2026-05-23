@@ -70,6 +70,31 @@ type APIConfig struct {
 	SearchAPIKey string
 	SearchAPIURL string
 
+	// ===== Neo4j 图数据库（知识图谱 + 图记忆共享）=====
+	Neo4jURI      string
+	Neo4jUser     string
+	Neo4jPassword string
+	KGMaxHops     int     // 图遍历最大跳数
+	KGWeight      float64 // 图检索在 RRF 中的权重
+	KGEnabled     bool    // 是否启用知识图谱
+
+	// ===== 沙箱执行 =====
+	SandboxEnabled     bool
+	SandboxBackend     string // "docker" | "local" | "mock"
+	SandboxImage       string
+	SandboxTimeoutMs   int
+	SandboxMaxOutput   int
+	SandboxMemoryMB    int
+	SandboxCPUPercent  int
+	SandboxMaxPIDs     int
+	SandboxNetDisabled bool
+	SandboxReadOnly    bool
+
+	// ===== 命令安全校验 =====
+	SecMaxCmdLength  int
+	SecAllowlistMode bool
+	SecAllowlist     []string
+
 	// ===== 通用配置 =====
 	ServerPort string
 }
@@ -141,6 +166,31 @@ type yamlFile struct {
 		APIKey string `yaml:"api_key"`
 		APIURL string `yaml:"api_url"`
 	} `yaml:"search"`
+	Neo4j struct {
+		URI       string  `yaml:"uri"`
+		User      string  `yaml:"user"`
+		Password  string  `yaml:"password"`
+		MaxHops   int     `yaml:"max_hops"`
+		Weight    float64 `yaml:"weight"`
+		Enabled   bool    `yaml:"enabled"`
+	} `yaml:"neo4j"`
+	Sandbox struct {
+		Enabled         bool   `yaml:"enabled"`
+		Backend         string `yaml:"backend"`
+		Image           string `yaml:"image"`
+		TimeoutMs       int    `yaml:"timeout_ms"`
+		MaxOutputBytes  int    `yaml:"max_output_bytes"`
+		MemoryLimitMB   int    `yaml:"memory_limit_mb"`
+		CPUPercent      int    `yaml:"cpu_percent"`
+		MaxPIDs         int    `yaml:"max_pids"`
+		NetworkDisabled bool   `yaml:"network_disabled"`
+		ReadOnlyRootfs  bool   `yaml:"readonly_rootfs"`
+	} `yaml:"sandbox"`
+	Security struct {
+		MaxCommandLength int      `yaml:"max_command_length"`
+		AllowlistMode    bool     `yaml:"allowlist_mode"`
+		Allowlist        []string `yaml:"allowlist"`
+	} `yaml:"security"`
 }
 
 // DefaultConfig 从 config/config.yaml 加载配置
@@ -207,6 +257,28 @@ func DefaultConfig() *APIConfig {
 		SearchAPIKey: y.Search.APIKey,
 		SearchAPIURL: y.Search.APIURL,
 
+		Neo4jURI:      y.Neo4j.URI,
+		Neo4jUser:     y.Neo4j.User,
+		Neo4jPassword: y.Neo4j.Password,
+		KGMaxHops:     y.Neo4j.MaxHops,
+		KGWeight:      y.Neo4j.Weight,
+		KGEnabled:     y.Neo4j.Enabled,
+
+		SandboxEnabled:     y.Sandbox.Enabled,
+		SandboxBackend:     y.Sandbox.Backend,
+		SandboxImage:       y.Sandbox.Image,
+		SandboxTimeoutMs:   y.Sandbox.TimeoutMs,
+		SandboxMaxOutput:   y.Sandbox.MaxOutputBytes,
+		SandboxMemoryMB:    y.Sandbox.MemoryLimitMB,
+		SandboxCPUPercent:  y.Sandbox.CPUPercent,
+		SandboxMaxPIDs:     y.Sandbox.MaxPIDs,
+		SandboxNetDisabled: y.Sandbox.NetworkDisabled,
+		SandboxReadOnly:    y.Sandbox.ReadOnlyRootfs,
+
+		SecMaxCmdLength:  y.Security.MaxCommandLength,
+		SecAllowlistMode: y.Security.AllowlistMode,
+		SecAllowlist:     y.Security.Allowlist,
+
 		ServerPort: y.Server.Port,
 	}
 
@@ -239,6 +311,42 @@ func DefaultConfig() *APIConfig {
 	}
 	if c.MemoryConsolidationTrigger <= 0 {
 		c.MemoryConsolidationTrigger = 5
+	}
+
+	// Neo4j 默认值
+	if c.KGMaxHops <= 0 {
+		c.KGMaxHops = 2
+	}
+	if c.KGWeight <= 0 {
+		c.KGWeight = 0.3
+	}
+
+	// 沙箱默认值
+	if c.SandboxBackend == "" {
+		c.SandboxBackend = "docker"
+	}
+	if c.SandboxImage == "" {
+		c.SandboxImage = "alpine:3.19"
+	}
+	if c.SandboxTimeoutMs <= 0 {
+		c.SandboxTimeoutMs = 30000
+	}
+	if c.SandboxMaxOutput <= 0 {
+		c.SandboxMaxOutput = 65536
+	}
+	if c.SandboxMemoryMB <= 0 {
+		c.SandboxMemoryMB = 256
+	}
+	if c.SandboxCPUPercent <= 0 {
+		c.SandboxCPUPercent = 50
+	}
+	if c.SandboxMaxPIDs <= 0 {
+		c.SandboxMaxPIDs = 64
+	}
+
+	// 安全校验默认值
+	if c.SecMaxCmdLength <= 0 {
+		c.SecMaxCmdLength = 500
 	}
 
 	return c

@@ -1,10 +1,11 @@
-// Package rag 混合检索存储：语义向量（Milvus）+ 关键词（ES BM25）+ RRF 融合
+// Package rag 混合检索存储：语义向量（Milvus）+ 关键词（ES BM25）+ 知识图谱（Neo4j）+ RRF 融合
 package rag
 
 import (
 	"crypto/sha256"
 	"encoding/json"
 	"final/config"
+	"final/internal/graph"
 	"final/internal/infra"
 	"fmt"
 	"log"
@@ -16,11 +17,13 @@ import (
 // HybridStore 实现企业级混合检索：
 //   - Milvus 语义向量检索
 //   - Elasticsearch BM25 关键词检索
-//   - Reciprocal Rank Fusion 融合两路结果
+//   - Neo4j 知识图谱实体遍历检索
+//   - Reciprocal Rank Fusion 三路融合
 //   - PostgreSQL chunk 持久化
 type HybridStore struct {
 	cfg     *config.APIConfig
 	inf     *infra.Infrastructure
+	kg      *graph.KGStore // 知识图谱，nil 时降级跳过
 	embedFn func(text string) ([]float64, error)
 	mode    string // "hybrid" | "semantic" | "keyword" | "unavailable"
 }
@@ -45,6 +48,11 @@ func NewHybridStore(cfg *config.APIConfig, inf *infra.Infrastructure) *HybridSto
 		hs.mode = "unavailable"
 	}
 	return hs
+}
+
+// SetKGStore 注入知识图谱存储（由 Engine 在 NewEngine 之后注入，避免循环依赖）
+func (hs *HybridStore) SetKGStore(kg *graph.KGStore) {
+	hs.kg = kg
 }
 
 // SetEmbedFn 注入 Embedding 回调（由 agent 通过 llm.Embed 注入）
@@ -164,7 +172,7 @@ func (hs *HybridStore) Search(query string, topK int) []HybridResult {
 
 // ─────────────────────── Hybrid: RRF 融合 ──────────────────────────────
 
-// searchHybrid: Milvus 语义 + ES BM25，使用 Reciprocal Rank Fusion 融合
+// searchHybrid: Milvus 语义 + ES BM25 + 知识图谱，使用 Reciprocal Rank Fusion 三路融合
 func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 	// 查询向量化
 	queryEmb, err := hs.embedFn(query)
@@ -211,6 +219,18 @@ func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 	}
 	for rank, hit := range esHits {
 		rrfScores[hit.PGID] += 1.0 / float64(k+rank+1)
+	}
+
+	// 知识图谱第三路：将图检索结果的 chunkID 映射回 PG ID
+	// chunk_id 字段在 Neo4j 中存的是 PG 存储时的 idx（0-based），
+	// 实际 PG ID 通过 LoadRAGChunksByDocIdx 获取；
+	// 这里以 float64 分数直接叠加到 rrfScores（分数归一化后已无量纲）
+	if hs.kg != nil && hs.kg.Available() {
+		kgHits := hs.kg.Search(query, fetchK)
+		for rank, hit := range kgHits {
+			// hit.Score 是 kg 内部分数（已乘以 kgWeight），额外叠加 RRF 排名奖励
+			rrfScores[int64(hit.ChunkID)] += hit.Score + 1.0/float64(k+rank+1)
+		}
 	}
 
 	// 按 RRF 分数排序

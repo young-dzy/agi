@@ -18,6 +18,8 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
     restart: unless-stopped
 
   # ===== Milvus 向量数据库 =====
@@ -147,6 +149,27 @@ services:
       retries: 10
       start_period: 30s
 
+  # ===== Neo4j 图数据库（知识图谱 + 图记忆共享）=====
+  neo4j:
+    container_name: neo4j
+    image: neo4j:5.15-community
+    ports:
+      - "7474:7474"   # Web UI
+      - "7687:7687"   # Bolt 协议
+    environment:
+      NEO4J_AUTH: neo4j/password123
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
 volumes:
   etcd_data:
   minio_data:
@@ -154,3 +177,5 @@ volumes:
   pg_data:
   es_data:
   kafka_data:
+  neo4j_data:
+  neo4j_logs:

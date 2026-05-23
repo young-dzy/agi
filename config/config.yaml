@@ -1,14 +1,14 @@
 # 对话模型配置
 llm:
   api_url: https://ark.cn-beijing.volces.com/api/v3/chat/completions
-  api_key: "97443eb3-4d60-4738-bf9d-e7bf364566d2"               #  API Key
+  api_key: "your"               #  API Key
   model: ep-20260430233018-tqktj
   temperature: 0.7
 
 # 向量模型配置
 embedding:
   api_url: https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal
-  api_key: "97443eb3-4d60-4738-bf9d-e7bf364566d2"               # API Key
+  api_key: "your"               # API Key
   model: ep-20260119190844-zzrq7
 
 # 向量数据库配置
@@ -66,7 +66,7 @@ server:
   port: "8090"
 
 search:
-  api_key: "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"               # 请填入你的 Tavily API Key（可选）
+  api_key: "your"               # 请填入你的 Tavily API Key（可选）
   api_url: "https://tavily.com"
 
 # ===== 知识图谱（Neo4j，可选，不可用时跳过图检索）=====

@@ -61,6 +61,19 @@ type Item struct {
 	Score        float64   `json:"score,omitempty"` // 召回时的综合得分（不持久化）
 	CreatedAt    time.Time `json:"created_at"`
 	LastAccessed time.Time `json:"last_accessed"`
+	// Schema-driven 装配字段（runtime 包按这些字段过滤）
+	Category string   `json:"category,omitempty"`  // 主类别：identity / preference / fact / episodic / tool_failure / policy / general
+	Tags     []string `json:"tags,omitempty"`      // 自由标签
+	SlotHint string   `json:"slot_hint,omitempty"` // 建议归属的 SlotKind 字符串
+}
+
+// RecallFilter 控制 RecallByFilter 的语义召回约束（与 runtime.SlotFilter 同构）
+type RecallFilter struct {
+	Categories  []string
+	RequireTags []string
+	MinScore    float64
+	TopK        int
+	MaxAgeHours int
 }
 
 // ConsolidationConfig 记忆合并配置
@@ -136,6 +149,13 @@ func (m *LongTerm) textToVector(text string) []float64 {
 // Store 将内容存入长期记忆（embedding 可选，传 nil 则使用 TF 降级）
 // 返回 true 表示新增成功，false 表示因去重而跳过
 func (m *LongTerm) Store(content string, importance float64, embedding []float64) bool {
+	return m.StoreClassified(content, importance, embedding, "general", nil, "")
+}
+
+// StoreClassified 与 Store 行为相同，但额外记录 category/tags/slot_hint
+// 用于 Schema-driven 槽位装配过滤
+func (m *LongTerm) StoreClassified(content string, importance float64, embedding []float64,
+	category string, tags []string, slotHint string) bool {
 	// 去重检测：与已有条目相似度过高时跳过，但更新已有条目的访问时间和重要性
 	if m.consolidationCfg != nil && len(m.Items) > 0 && len(embedding) > 0 {
 		for i := range m.Items {
@@ -146,6 +166,16 @@ func (m *LongTerm) Store(content string, importance float64, embedding []float64
 						m.Items[i].Importance = importance
 					}
 					m.Items[i].LastAccessed = time.Now()
+					// 命中已有条目：若新分类更具体则覆盖（general 视为最弱）
+					if category != "" && (m.Items[i].Category == "" || m.Items[i].Category == "general") {
+						m.Items[i].Category = category
+					}
+					if slotHint != "" && m.Items[i].SlotHint == "" {
+						m.Items[i].SlotHint = slotHint
+					}
+					if len(tags) > 0 {
+						m.Items[i].Tags = mergeTags(m.Items[i].Tags, tags)
+					}
 					return false
 				}
 			}
@@ -157,6 +187,9 @@ func (m *LongTerm) Store(content string, importance float64, embedding []float64
 	}
 	m.buildVocab(content)
 	now := time.Now()
+	if category == "" {
+		category = "general"
+	}
 	m.Items = append(m.Items, Item{
 		ID:           m.nextID,
 		Content:      content,
@@ -164,10 +197,27 @@ func (m *LongTerm) Store(content string, importance float64, embedding []float64
 		Embedding:    embedding,
 		CreatedAt:    now,
 		LastAccessed: now,
+		Category:     category,
+		Tags:         tags,
+		SlotHint:     slotHint,
 	})
 	m.nextID++
 	m.storeCount++
 	return true
+}
+
+// mergeTags 合并两个标签列表去重，保持顺序
+func mergeTags(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, t := range append(a, b...) {
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	return out
 }
 
 // StoreItem 直接插入已有 Item（用于从 DB 恢复数据）
@@ -207,21 +257,50 @@ func (m *LongTerm) NeedConsolidation() bool {
 // 优先使用 embedding 余弦相似度，若无 embedding 则退回 TF
 // 只返回综合得分超过 threshold 的条目，避免注入噪声
 func (m *LongTerm) Recall(query string, topK int, queryEmbedding []float64) []Item {
+	return m.RecallByFilter(query, queryEmbedding, RecallFilter{TopK: topK, MinScore: 0.4})
+}
+
+// RecallByFilter 按 Schema-driven 过滤条件做语义召回
+//   - filter.Categories 非空时，只返回 Category 命中其一的条目
+//   - filter.RequireTags 非空时，条目必须包含全部标签
+//   - filter.MaxAgeHours > 0 时，超龄条目被过滤
+//   - filter.MinScore 控制综合分阈值（默认 0.4）
+//   - filter.TopK 控制返回数量（0 表示不截断）
+func (m *LongTerm) RecallByFilter(query string, queryEmbedding []float64, filter RecallFilter) []Item {
 	if len(m.Items) == 0 {
 		return nil
 	}
-	const threshold = 0.4 // 综合得分阈值：sim*0.7 + importance*0.3
+	threshold := filter.MinScore
+	if threshold <= 0 {
+		threshold = 0.4
+	}
+	now := time.Now()
+
 	type scored struct {
 		item Item
 		s    float64
 	}
 	var items []scored
 	for i := range m.Items {
+		// 类别过滤
+		if len(filter.Categories) > 0 && !containsString(filter.Categories, m.Items[i].Category) {
+			continue
+		}
+		// 标签过滤
+		if len(filter.RequireTags) > 0 && !containsAllTags(m.Items[i].Tags, filter.RequireTags) {
+			continue
+		}
+		// 年龄过滤
+		if filter.MaxAgeHours > 0 {
+			if now.Sub(m.Items[i].CreatedAt).Hours() > float64(filter.MaxAgeHours) {
+				continue
+			}
+		}
+
 		var sim float64
 		if len(queryEmbedding) > 0 && len(m.Items[i].Embedding) == len(queryEmbedding) {
 			sim = cosine(queryEmbedding, m.Items[i].Embedding)
 		} else {
-			// TF 降级
 			m.buildVocab(query)
 			qv := m.textToVector(query)
 			iv := m.textToVector(m.Items[i].Content)
@@ -234,7 +313,7 @@ func (m *LongTerm) Recall(query string, topK int, queryEmbedding []float64) []It
 		}
 		s := sim*0.7 + m.Items[i].Importance*0.3
 		if s >= threshold {
-			m.Items[i].LastAccessed = time.Now()
+			m.Items[i].LastAccessed = now
 			items = append(items, scored{item: m.Items[i], s: s})
 		}
 	}
@@ -248,13 +327,52 @@ func (m *LongTerm) Recall(query string, topK int, queryEmbedding []float64) []It
 			}
 		}
 	}
-	if topK > len(items) {
-		topK = len(items)
+	topK := filter.TopK
+	if topK > 0 && topK < len(items) {
+		items = items[:topK]
 	}
-	result := make([]Item, topK)
+	result := make([]Item, len(items))
 	for i := range result {
 		result[i] = items[i].item
 		result[i].Score = items[i].s
+	}
+	return result
+}
+
+// containsString 简单 slice 包含检查
+func containsString(slice []string, target string) bool {
+	for _, s := range slice {
+		if s == target {
+			return true
+		}
+	}
+	return false
+}
+
+// containsAllTags 检查 item 是否包含所有要求的标签
+func containsAllTags(itemTags, required []string) bool {
+	for _, r := range required {
+		if !containsString(itemTags, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// FilterByCategory 直接返回属于指定 category 的全部条目（不做语义召回）
+// 用于 Profile 等结构化槽位的稳定枚举
+func (m *LongTerm) FilterByCategory(categories []string, limit int) []Item {
+	if len(m.Items) == 0 || len(categories) == 0 {
+		return nil
+	}
+	var result []Item
+	for i := range m.Items {
+		if containsString(categories, m.Items[i].Category) {
+			result = append(result, m.Items[i])
+			if limit > 0 && len(result) >= limit {
+				break
+			}
+		}
 	}
 	return result
 }

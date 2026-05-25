@@ -19,6 +19,7 @@ import (
 	"agi-ai-assitant/internal/llm"
 	"agi-ai-assitant/internal/memory"
 	"agi-ai-assitant/internal/rag"
+	"agi-ai-assitant/internal/runtime"
 	"agi-ai-assitant/internal/sandbox"
 	"agi-ai-assitant/internal/tools"
 	"fmt"
@@ -127,6 +128,11 @@ type UnifiedAgent struct {
 	task     *TaskState
 	inf      *infra.Infrastructure
 	cancelFn context.CancelFunc // 当前任务的取消函数
+
+	// Schema-driven Runtime Context Assembly
+	assembler   *runtime.ContextAssembler
+	taskMem     *runtime.TaskMemBuffer
+	toolTracker *runtime.ToolStateTracker
 }
 
 // New 创建并初始化 UnifiedAgent
@@ -156,8 +162,9 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	})
 	// 注入 RAG 的 LLM 合成回调（携带记忆上下文）
 	a.rag.SetGenerateFn(func(systemPrompt, userMsg string) string {
-		// 在 RAG 合成时注入偏好和长期记忆
-		memPrefix := a.buildMemorySystemPrefix()
+		// RAG 模式下用 schema-driven 装配（assembler 在 New 末尾才构造，此回调
+		// 在运行期才会被触发，因此 a.assembler 一定已就绪）
+		memPrefix := a.buildContextPrefix(context.Background(), userMsg, "rag")
 		fullSystem := systemPrompt
 		if memPrefix != "" {
 			fullSystem = memPrefix + "\n\n" + systemPrompt + "\n结合用户偏好和记忆，用用户熟悉的方式回答。"
@@ -222,6 +229,48 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	a.initKnowledgeGraph()
 	// 初始化沙箱并注册 exec_command 工具
 	a.initSandbox()
+
+	// ── Schema-driven Runtime Context Assembly ──
+	a.taskMem = runtime.NewTaskMemBuffer(20)
+	a.toolTracker = runtime.NewToolStateTracker(10)
+
+	reg := runtime.NewSourceRegistry()
+	reg.Register(runtime.NewProfileSource(a.pref, a.ltm))
+	reg.Register(runtime.NewPlannerSource(func() *runtime.PlannerSnapshot {
+		t := a.task
+		if t == nil {
+			return nil
+		}
+		snap := &runtime.PlannerSnapshot{
+			TaskID:        t.TaskID,
+			Query:         t.Query,
+			Status:        t.Status,
+			Phase:         t.Phase,
+			TotalSteps:    len(t.Steps),
+			CurrentStep:   t.CurrentStep,
+			InterruptedAt: t.InterruptedAt,
+		}
+		if t.CurrentStep+1 < len(t.Steps) {
+			next := t.Steps[t.CurrentStep+1]
+			snap.NextStepName = next.Name
+			snap.NextStepTool = next.ToolName
+		}
+		return snap
+	}))
+	reg.Register(runtime.NewTaskMemSource(a.taskMem))
+	reg.Register(runtime.NewToolStateSource(
+		func() map[string]tools.Tool { return a.tools },
+		a.toolTracker,
+	))
+	reg.Register(runtime.NewConstraintsSource(sandbox.PolicySnapshot()))
+	// RecallSource 优先用图记忆；graphMem 在 initKnowledgeGraph 中就绪
+	if a.graphMem != nil {
+		reg.Register(runtime.NewRecallSource(a.graphMem))
+	} else {
+		reg.Register(runtime.NewRecallSource(a.ltm))
+	}
+	a.assembler = runtime.NewAssembler(runtime.DefaultSchemas(), reg)
+
 	return a
 }
 
@@ -320,8 +369,41 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 		resp.ExtractedInfo = fmt.Sprintf("已记住：%s = %s", key, value)
 	}
 
-	// ── 构建所有模式共享的记忆增强层 ──
-	memPrefix := a.buildMemorySystemPrefixWithCtx(ctx, query)
+	// ── 路由决策（mode 在装配前确定，让 schema 选取正确）──
+	var mode string
+	var routeTools map[string]tools.Tool
+	if opts.Explicit {
+		switch {
+		case len(opts.SelectedTools) > 0:
+			routeTools = a.filterTools(opts.SelectedTools)
+			if a.needReActFromTools(query, routeTools) {
+				mode = "react"
+			} else {
+				mode = "tool"
+			}
+		case opts.UseRAG && a.rag.Loaded:
+			mode = "rag"
+		default:
+			mode = "chat"
+		}
+	} else {
+		switch {
+		case a.needReAct(query):
+			mode = "react"
+			routeTools = a.tools
+		case a.needTool(query):
+			mode = "tool"
+			routeTools = a.tools
+		case a.needRAG(query):
+			mode = "rag"
+		default:
+			mode = "chat"
+		}
+	}
+	resp.Mode = mode
+
+	// ── 装配 Schema-driven 上下文前缀 ──
+	memPrefix := a.buildContextPrefix(ctx, query, mode)
 	histMsgs := a.buildHistoryMessages(query)
 
 	// 检查 context 是否已取消
@@ -331,48 +413,20 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 		return resp
 	}
 
-	// ── 路由（记忆已注入，不再是独立分支）──
-	if opts.Explicit {
-		switch {
-		case len(opts.SelectedTools) > 0:
-			filtered := a.filterTools(opts.SelectedTools)
-			if a.needReActFromTools(query, filtered) {
-				resp.Mode = "react"
-				answer, steps, task := a.runReActWithTools(ctx, query, filtered, memPrefix, histMsgs)
-				resp.Answer, resp.Steps, resp.Task = answer, steps, task
-			} else {
-				resp.Mode = "tool"
-				answer, tc := a.runToolFromSet(ctx, query, filtered, memPrefix, histMsgs)
-				resp.Answer, resp.ToolCall = answer, tc
-			}
-		case opts.UseRAG && a.rag.Loaded:
-			resp.Mode = "rag"
-			answer, results := a.rag.Query(query)
-			resp.Answer, resp.SearchResults = answer, results
-		default:
-			resp.Mode = "chat"
-			systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
-			resp.Answer = a.llm.ChatContext(ctx, systemPrompt, histMsgs)
-		}
-	} else {
-		switch {
-		case a.needReAct(query):
-			resp.Mode = "react"
-			answer, steps, task := a.runReActWithTools(ctx, query, a.tools, memPrefix, histMsgs)
-			resp.Answer, resp.Steps, resp.Task = answer, steps, task
-		case a.needTool(query):
-			resp.Mode = "tool"
-			answer, tc := a.runToolFromSet(ctx, query, a.tools, memPrefix, histMsgs)
-			resp.Answer, resp.ToolCall = answer, tc
-		case a.needRAG(query):
-			resp.Mode = "rag"
-			answer, results := a.rag.Query(query)
-			resp.Answer, resp.SearchResults = answer, results
-		default:
-			resp.Mode = "chat"
-			systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
-			resp.Answer = a.llm.ChatContext(ctx, systemPrompt, histMsgs)
-		}
+	// ── 分发执行（mode 已确定）──
+	switch mode {
+	case "react":
+		answer, steps, task := a.runReActWithTools(ctx, query, routeTools, memPrefix, histMsgs)
+		resp.Answer, resp.Steps, resp.Task = answer, steps, task
+	case "tool":
+		answer, tc := a.runToolFromSet(ctx, query, routeTools, memPrefix, histMsgs)
+		resp.Answer, resp.ToolCall = answer, tc
+	case "rag":
+		answer, results := a.rag.Query(query)
+		resp.Answer, resp.SearchResults = answer, results
+	default:
+		systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
+		resp.Answer = a.llm.ChatContext(ctx, systemPrompt, histMsgs)
 	}
 
 	// 检查是否被中断
@@ -406,6 +460,25 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 	resp.LongTermCount = len(a.ltm.Items)
 	resp.Preferences = a.pref.Data
 	return resp
+}
+
+// buildContextPrefix 调用 Schema-driven ContextAssembler，返回当次推理的系统提示前缀
+func (a *UnifiedAgent) buildContextPrefix(ctx context.Context, query string, mode string) string {
+	if a.assembler == nil {
+		return ""
+	}
+	emb, _ := a.llm.EmbedContext(ctx, query)
+	taskID := ""
+	if a.task != nil {
+		taskID = a.task.TaskID
+	}
+	rc := a.assembler.Assemble(ctx, runtime.Query{
+		Text:      query,
+		Embedding: emb,
+		TaskID:    taskID,
+		Mode:      mode,
+	})
+	return rc.Render()
 }
 
 // buildSystemPrompt 构建带记忆前缀的 system prompt
@@ -559,9 +632,19 @@ func (a *UnifiedAgent) runToolFromSet(ctx context.Context, query string, ts map[
 		if ctx.Err() != nil {
 			return "[已中断]", tc
 		}
+		if a.toolTracker != nil {
+			a.toolTracker.Record(runtime.ToolCallTrace{
+				ToolName: tc.ToolName, Success: false, Summary: err.Error(),
+			})
+		}
 		return fmt.Sprintf("工具执行失败: %v", err), tc
 	}
 	tc.ToolResult = result
+	if a.toolTracker != nil {
+		a.toolTracker.Record(runtime.ToolCallTrace{
+			ToolName: tc.ToolName, Success: true, Summary: result,
+		})
+	}
 
 	// 用带记忆的 system prompt 生成自然语言回复
 	systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个善于综合信息的AI助手。结合你掌握的用户信息，使回答更个性化。")
@@ -605,6 +688,9 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 		Query:  query, Status: "running", Phase: "executing", Steps: taskSteps,
 	}
 	a.snapshots = nil
+	if a.taskMem != nil {
+		a.taskMem.Reset()
+	}
 	a.saveSnapshot()
 
 	// ── Step 2: 按 Planner 计划逐步执行工具 ───────────────────────────────
@@ -651,6 +737,17 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 			ts2.Status = StepDone
 			reactSteps = append(reactSteps, ReActStep{Type: StepObservation, Content: ts2.Result})
 			observations = append(observations, fmt.Sprintf("[%s] %s", ts2.ToolName, ts2.Result))
+			if a.taskMem != nil {
+				a.taskMem.Push(runtime.StepObservation{
+					StepID: ts2.ID, ToolName: ts2.ToolName,
+					Result: ts2.Result, Success: true,
+				})
+			}
+			if a.toolTracker != nil {
+				a.toolTracker.Record(runtime.ToolCallTrace{
+					ToolName: ts2.ToolName, Success: true, Summary: ts2.Result,
+				})
+			}
 		} else {
 			if ctx.Err() != nil {
 				ts2.Status = StepInterrupted
@@ -658,6 +755,17 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 			} else {
 				ts2.Status = StepFailed
 				reactSteps = append(reactSteps, ReActStep{Type: StepObservation, Content: fmt.Sprintf("执行失败: %s", ts2.Error)})
+				if a.taskMem != nil {
+					a.taskMem.Push(runtime.StepObservation{
+						StepID: ts2.ID, ToolName: ts2.ToolName,
+						Error: ts2.Error, Success: false,
+					})
+				}
+				if a.toolTracker != nil {
+					a.toolTracker.Record(runtime.ToolCallTrace{
+						ToolName: ts2.ToolName, Success: false, Summary: ts2.Error,
+					})
+				}
 			}
 		}
 		a.saveSnapshot()
@@ -982,58 +1090,9 @@ func (a *UnifiedAgent) saveSnapshot() {
 }
 
 // ─────────────────────────────── Stage 5：Memory（基础层，注入所有模式）────────
-
-// buildMemorySystemPrefix 构建包含偏好和长期记忆的 System Prompt 前缀
-// 不依赖 context，仅使用当前已加载的偏好和长期记忆（无需实时 embedding）
-func (a *UnifiedAgent) buildMemorySystemPrefix() string {
-	var parts []string
-	if prefCtx := a.pref.BuildContext(); prefCtx != "" {
-		parts = append(parts, prefCtx)
-	}
-	if len(a.ltm.Items) > 0 {
-		var items []string
-		for _, item := range a.ltm.Items {
-			items = append(items, item.Content)
-		}
-		parts = append(parts, "【长期记忆】\n"+strings.Join(items, "\n"))
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return strings.Join(parts, "\n\n")
-}
-
-// buildMemorySystemPrefixWithCtx 构建带语义召回的记忆 System Prompt 前缀
-// 使用 embedding 做精准召回，只注入相关度超过阈值的长期记忆
-func (a *UnifiedAgent) buildMemorySystemPrefixWithCtx(ctx context.Context, query string) string {
-	var parts []string
-	if prefCtx := a.pref.BuildContext(); prefCtx != "" {
-		parts = append(parts, prefCtx)
-	}
-	queryEmb, _ := a.llm.EmbedContext(ctx, query)
-	if ctx.Err() != nil {
-		// context 取消，返回已有偏好部分
-		return strings.Join(parts, "\n\n")
-	}
-	// 优先用图记忆做关联召回，没有图则降级到纯 LTM
-	var ltmItems []memory.Item
-	if a.graphMem != nil {
-		ltmItems = a.graphMem.Recall(query, a.cfg.LongTermTopK, queryEmb)
-	} else {
-		ltmItems = a.ltm.Recall(query, a.cfg.LongTermTopK, queryEmb)
-	}
-	if len(ltmItems) > 0 {
-		var items []string
-		for _, item := range ltmItems {
-			items = append(items, item.Content)
-		}
-		parts = append(parts, "【相关记忆】\n"+strings.Join(items, "\n"))
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return strings.Join(parts, "\n\n")
-}
+//
+// 旧的 buildMemorySystemPrefix / buildMemorySystemPrefixWithCtx 已删除，
+// 由 buildContextPrefix → runtime.ContextAssembler 取代（Schema-driven 装配）。
 
 // fillParamsFromPreference 用用户偏好自动补全工具调用参数中缺失的值
 // 例如：偏好中有 "城市:北京"，则当工具参数含 city 但为空时自动填入
@@ -1062,12 +1121,14 @@ func (a *UnifiedAgent) fillParamsFromPreference(tc *tools.CallResult) {
 	}
 }
 
-// extractMemoryFromReply 从 assistant 回复中提取值得记忆的信息并存入长期记忆
+// extractMemoryFromReply 从 assistant 回复中提取值得记忆的信息并存入长期记忆。
+// 写入前用规则层 + LLM 兜底对内容分类（category/tags/slot_hint），
+// 使 Schema-driven 装配机制能按槽位过滤召回。
 func (a *UnifiedAgent) extractMemoryFromReply(answer string) {
 	if answer == "" || !a.cfg.IsRealLLM() {
 		return
 	}
-	// 用 LLM 判断回复中是否包含值得记忆的信息
+	// 用 LLM 提取 k-v 事实
 	prompt := `从下面这段AI回复中，提取值得长期记住的客观事实或用户偏好信息。
 只提取明确的、非临时性的信息，忽略对话上下文和临时细节。
 输出 JSON 对象（key为中文名称，value为具体值），如果没有值得记忆的信息则输出 {}。
@@ -1091,20 +1152,77 @@ func (a *UnifiedAgent) extractMemoryFromReply(answer string) {
 		a.pref.Save(k, v)
 		a.inf.SavePreference("default", k, v)
 		content := fmt.Sprintf("用户%s: %s", k, v)
+
+		// ── 分类管线：规则优先，LLM 兜底 ──
+		category, tags, slotHint := classifyMemoryContent(k, v)
+		if category == "" {
+			category, tags, slotHint = a.llmClassifyMemory(content)
+		}
+
 		emb, _ := a.llm.Embed(content)
 		if a.graphMem != nil {
-			if added, _ := a.graphMem.Store(content, 0.7, emb); added {
+			if added, _ := a.graphMem.StoreClassified(content, 0.7, emb, category, tags, slotHint); added {
 				embJSON, _ := json.Marshal(emb)
-				pgID := a.inf.SaveLongTermItem(content, 0.7, embJSON)
+				pgID := a.inf.SaveLongTermItemClassified(content, 0.7, embJSON, category, tags, slotHint)
 				a.graphMem.SyncLastItemPGID(pgID)
 			}
-		} else if a.ltm.Store(content, 0.7, emb) {
+		} else if a.ltm.StoreClassified(content, 0.7, emb, category, tags, slotHint) {
 			embJSON, _ := json.Marshal(emb)
-			pgID := a.inf.SaveLongTermItem(content, 0.7, embJSON)
+			pgID := a.inf.SaveLongTermItemClassified(content, 0.7, embJSON, category, tags, slotHint)
 			a.ltm.SyncLastItemPGID(pgID)
 		}
-		log.Printf("🧠 从回复中提取记忆：%s = %s", k, v)
+		log.Printf("🧠 从回复中提取记忆：%s = %s（类别=%s）", k, v, category)
 	}
+}
+
+// classifyMemoryContent 用正则规则快速分类；返回空字符串表示规则未命中，由 LLM 兜底
+func classifyMemoryContent(key, value string) (category string, tags []string, slotHint string) {
+	combined := key + value
+	switch {
+	case containsAny(combined, "叫", "名字", "姓名", "是我", "我是"):
+		return "identity", []string{"name"}, "profile"
+	case containsAny(combined, "喜欢", "偏好", "习惯", "爱好", "讨厌", "不喜欢"):
+		return "preference", []string{"preference"}, "profile"
+	case containsAny(combined, "工具", "失败", "错误", "报错", "异常"):
+		return "tool_failure", []string{"tool", "error"}, "tool_state"
+	case containsAny(combined, "禁止", "不要", "不能", "必须", "强制"):
+		return "policy", []string{"constraint"}, "constraints"
+	default:
+		return "", nil, ""
+	}
+}
+
+// containsAny 检查 s 是否包含 subs 中任意子串
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// llmClassifyMemory 调用一次 LLM 对记忆内容做 JSON 分类，
+// 返回 category / tags / slotHint；失败时回退到 "general"
+func (a *UnifiedAgent) llmClassifyMemory(content string) (category string, tags []string, slotHint string) {
+	if !a.cfg.IsRealLLM() {
+		return "general", nil, ""
+	}
+	prompt := `请对以下记忆内容进行分类，只输出 JSON，格式如下：
+{"category":"identity|preference|fact|episodic|tool_failure|policy|general","tags":["tag1"],"slot_hint":"profile|planner|task_memory|tool_state|constraints|recall_memory"}
+
+记忆内容：` + content
+	raw := a.llm.Chat("", []llm.Message{{Role: "user", Content: prompt}})
+	raw = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(raw), "```json"), "```"))
+	var result struct {
+		Category string   `json:"category"`
+		Tags     []string `json:"tags"`
+		SlotHint string   `json:"slot_hint"`
+	}
+	if err := json.Unmarshal([]byte(raw), &result); err != nil || result.Category == "" {
+		return "general", nil, ""
+	}
+	return result.Category, result.Tags, result.SlotHint
 }
 
 // syncConsolidationToDB 将记忆合并结果同步到 PostgreSQL

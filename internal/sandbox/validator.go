@@ -142,3 +142,26 @@ func (v *Validator) Validate(command string) ValidationResult {
 
 	return ValidationResult{Level: RiskSafe}
 }
+
+// ─────────────────────────────── 政策快照 ─────────────────────────────────
+
+// Policy 是单条静态安全政策的描述（用于 runtime 装配 Constraints 槽位）
+type Policy struct {
+	Level   RiskLevel `json:"level"`
+	Pattern string    `json:"pattern"` // 原始正则字面量（仅用于展示）
+	Reason  string    `json:"reason"`  // 中文说明
+}
+
+// PolicySnapshot 返回当前所有静态安全政策（Block + Warn）的只读快照，
+// 供 Schema-driven 装配机制在 Constraints 槽位中向 LLM 描述硬性约束。
+// 规则定义在本文件 blockRules / warnRules 中。
+func PolicySnapshot() []Policy {
+	out := make([]Policy, 0, len(blockRules)+len(warnRules))
+	for _, r := range blockRules {
+		out = append(out, Policy{Level: RiskBlock, Pattern: r.pattern.String(), Reason: r.reason})
+	}
+	for _, r := range warnRules {
+		out = append(out, Policy{Level: RiskWarn, Pattern: r.pattern.String(), Reason: r.violation})
+	}
+	return out
+}

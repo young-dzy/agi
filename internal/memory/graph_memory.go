@@ -50,31 +50,29 @@ func (gm *GraphMemory) LTM() *LongTerm { return gm.ltm }
 //   - newItem=false 表示因去重被跳过
 //   - itemID 是写入的条目 ID（新增或已有更新后的 ID）
 func (gm *GraphMemory) Store(content string, importance float64, embedding []float64) (bool, int) {
-	added := gm.ltm.Store(content, importance, embedding)
+	return gm.StoreClassified(content, importance, embedding, "general", nil, "")
+}
+
+// StoreClassified 带 Schema-driven 分类信息的写入
+func (gm *GraphMemory) StoreClassified(content string, importance float64, embedding []float64,
+	category string, tags []string, slotHint string) (bool, int) {
+	added := gm.ltm.StoreClassified(content, importance, embedding, category, tags, slotHint)
 	if !added {
-		// 去重跳过：返回最相似的已有条目 ID
 		return false, gm.findMostSimilarID(embedding)
 	}
 
-	// 获取刚加入的条目 ID
 	if len(gm.ltm.Items) == 0 {
 		return true, -1
 	}
 	newItem := gm.ltm.Items[len(gm.ltm.Items)-1]
 	newID := newItem.ID
 
-	// 图操作（异步，不阻塞主流程）
 	if gm.kg != nil && gm.kg.Available() {
 		go func() {
-			// 1. 创建/更新节点
 			gm.kg.UpsertMemoryNode(newID, content, importance)
-
-			// 2. FOLLOWS 边：与上一条记忆建立时序关系
 			if gm.prevID >= 0 {
 				gm.kg.AddMemoryEdge(gm.prevID, newID, "FOLLOWS", 1.0)
 			}
-
-			// 3. SIMILAR_TO 边：遍历最近 N 条，与相似度超阈值的记忆建边
 			gm.linkSimilarEdges(newItem, newID)
 		}()
 	}
@@ -127,14 +125,17 @@ func (gm *GraphMemory) findMostSimilarID(embedding []float64) int {
 
 // Recall 先做向量/TF召回，再用图扩展发现关联但不直接相似的记忆
 func (gm *GraphMemory) Recall(query string, topK int, queryEmbedding []float64) []Item {
-	// Step 1: 向量 / TF 召回种子
-	seedItems := gm.ltm.Recall(query, topK, queryEmbedding)
+	return gm.RecallByFilter(query, queryEmbedding, RecallFilter{TopK: topK, MinScore: 0.4})
+}
+
+// RecallByFilter Schema-driven 召回：先按过滤条件做语义召回，再图扩展兜底
+func (gm *GraphMemory) RecallByFilter(query string, queryEmbedding []float64, filter RecallFilter) []Item {
+	seedItems := gm.ltm.RecallByFilter(query, queryEmbedding, filter)
 
 	if gm.kg == nil || !gm.kg.Available() || len(seedItems) == 0 {
 		return seedItems
 	}
 
-	// Step 2: 图扩展 — 1跳邻居
 	seedIDs := make([]int, len(seedItems))
 	for i, item := range seedItems {
 		seedIDs[i] = item.ID
@@ -144,7 +145,6 @@ func (gm *GraphMemory) Recall(query string, topK int, queryEmbedding []float64) 
 		return seedItems
 	}
 
-	// Step 3: 加载扩展节点，去重后合并
 	idSet := make(map[int]bool)
 	for _, id := range seedIDs {
 		idSet[id] = true
@@ -156,7 +156,10 @@ func (gm *GraphMemory) Recall(query string, topK int, queryEmbedding []float64) 
 		}
 		for _, item := range gm.ltm.Items {
 			if item.ID == id {
-				// 图扩展得到的条目给一个基础分（避免 0 分被过滤）
+				// 图扩展条目同样需通过 category 过滤（如果有限制）
+				if len(filter.Categories) > 0 && !containsString(filter.Categories, item.Category) {
+					continue
+				}
 				item.Score = 0.45
 				expanded = append(expanded, item)
 				idSet[id] = true
@@ -165,7 +168,6 @@ func (gm *GraphMemory) Recall(query string, topK int, queryEmbedding []float64) 
 		}
 	}
 
-	// Step 4: 合并，以 Score 降序保留 topK
 	all := append(seedItems, expanded...)
 	for i := 0; i < len(all); i++ {
 		for j := i + 1; j < len(all); j++ {
@@ -174,8 +176,8 @@ func (gm *GraphMemory) Recall(query string, topK int, queryEmbedding []float64) 
 			}
 		}
 	}
-	if len(all) > topK {
-		all = all[:topK]
+	if filter.TopK > 0 && len(all) > filter.TopK {
+		all = all[:filter.TopK]
 	}
 	return all
 }

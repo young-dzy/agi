@@ -161,6 +161,12 @@ func (inf *Infrastructure) initPGSchema() {
 			last_accessed TIMESTAMP DEFAULT NOW()
 		)`,
 		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS last_accessed TIMESTAMP DEFAULT NOW()`,
+		// Schema-driven 装配支持：分类 / 标签 / 槽位提示
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS category  TEXT NOT NULL DEFAULT 'general'`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS tags      TEXT[] NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS slot_hint TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_lti_category ON long_term_memory(category)`,
+		`CREATE INDEX IF NOT EXISTS idx_lti_tags     ON long_term_memory USING GIN(tags)`,
 		`CREATE TABLE IF NOT EXISTS rag_chunks (
 			id          BIGSERIAL PRIMARY KEY,
 			doc_hash    TEXT NOT NULL,
@@ -238,17 +244,34 @@ type LongTermRow struct {
 	Embedding    []float64
 	CreatedAt    time.Time
 	LastAccessed time.Time
+	Category     string
+	Tags         []string
+	SlotHint     string
 }
 
 // SaveLongTermItem 将一条长期记忆持久化到 PostgreSQL，返回数据库自增 ID
+// category 为空时落库为 "general"
 func (inf *Infrastructure) SaveLongTermItem(content string, importance float64, embeddingJSON []byte) int {
+	return inf.SaveLongTermItemClassified(content, importance, embeddingJSON, "general", nil, "")
+}
+
+// SaveLongTermItemClassified 带分类信息写入长期记忆
+func (inf *Infrastructure) SaveLongTermItemClassified(content string, importance float64, embeddingJSON []byte,
+	category string, tags []string, slotHint string) int {
 	if inf.pg == nil {
 		return -1
 	}
+	if category == "" {
+		category = "general"
+	}
+	if tags == nil {
+		tags = []string{}
+	}
 	var id int
 	err := inf.pg.QueryRow(
-		`INSERT INTO long_term_memory (content, importance, embedding) VALUES ($1, $2, $3) RETURNING id`,
-		content, importance, embeddingJSON,
+		`INSERT INTO long_term_memory (content, importance, embedding, category, tags, slot_hint)
+		 VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')) RETURNING id`,
+		content, importance, embeddingJSON, category, pgStringArray(tags), slotHint,
 	).Scan(&id)
 	if err != nil {
 		log.Printf("⚠️  长期记忆保存失败: %v", err)
@@ -263,7 +286,8 @@ func (inf *Infrastructure) LoadLongTermItems() []LongTermRow {
 		return nil
 	}
 	rows, err := inf.pg.Query(`SELECT id, content, importance, embedding,
-		COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW())
+		COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW()),
+		COALESCE(category, 'general'), COALESCE(tags, '{}'::TEXT[]), COALESCE(slot_hint, '')
 		FROM long_term_memory ORDER BY id`)
 	if err != nil {
 		log.Printf("⚠️  加载长期记忆失败: %v", err)
@@ -274,12 +298,15 @@ func (inf *Infrastructure) LoadLongTermItems() []LongTermRow {
 	for rows.Next() {
 		var row LongTermRow
 		var embJSON []byte
-		if err := rows.Scan(&row.ID, &row.Content, &row.Importance, &embJSON, &row.CreatedAt, &row.LastAccessed); err != nil {
+		var tags pgTextArray
+		if err := rows.Scan(&row.ID, &row.Content, &row.Importance, &embJSON,
+			&row.CreatedAt, &row.LastAccessed, &row.Category, &tags, &row.SlotHint); err != nil {
 			continue
 		}
 		if len(embJSON) > 0 {
 			json.Unmarshal(embJSON, &row.Embedding)
 		}
+		row.Tags = []string(tags)
 		items = append(items, row)
 	}
 	return items
@@ -801,4 +828,47 @@ func (inf *Infrastructure) Close() {
 	if inf.kafkaW != nil {
 		inf.kafkaW.Close()
 	}
+}
+
+// ─────────────────────────────── PG 辅助 ────────────────────────────────
+
+// pgTextArray 是 PostgreSQL TEXT[] 的可扫描类型
+type pgTextArray []string
+
+func (a *pgTextArray) Scan(src interface{}) error {
+	if src == nil {
+		*a = nil
+		return nil
+	}
+	var b []byte
+	switch v := src.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
+		return fmt.Errorf("pgTextArray: unsupported type %T", src)
+	}
+	s := strings.TrimSpace(string(b))
+	s = strings.TrimPrefix(s, "{")
+	s = strings.TrimSuffix(s, "}")
+	if s == "" {
+		*a = []string{}
+		return nil
+	}
+	*a = strings.Split(s, ",")
+	return nil
+}
+
+// pgStringArray 将 Go []string 转换为 PostgreSQL TEXT[] 字面量
+func pgStringArray(ss []string) string {
+	if len(ss) == 0 {
+		return "{}"
+	}
+	quoted := make([]string, len(ss))
+	for i, s := range ss {
+		s = strings.ReplaceAll(s, `"`, `\"`)
+		quoted[i] = `"` + s + `"`
+	}
+	return "{" + strings.Join(quoted, ",") + "}"
 }

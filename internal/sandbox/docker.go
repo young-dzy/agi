@@ -142,7 +142,7 @@ func (d *DockerSandbox) buildDockerArgs(command string) []string {
 
 	image := d.cfg.Image
 	if image == "" {
-		image = "alpine:3.19"
+		image = "ubuntu:22.04"
 	}
 	args = append(args, image, "sh", "-c", command)
 	return args

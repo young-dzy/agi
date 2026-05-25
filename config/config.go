@@ -326,7 +326,7 @@ func DefaultConfig() *APIConfig {
 		c.SandboxBackend = "docker"
 	}
 	if c.SandboxImage == "" {
-		c.SandboxImage = "alpine:3.19"
+		c.SandboxImage = "ubuntu:22.04"
 	}
 	if c.SandboxTimeoutMs <= 0 {
 		c.SandboxTimeoutMs = 30000

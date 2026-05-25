@@ -94,7 +94,6 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 
 	flusher, canFlush := w.(http.Flusher)
 
-	// send SSE helper
 	sendSSE := func(event string, data interface{}) {
 		jsonData, _ := json.Marshal(data)
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, jsonData)
@@ -103,30 +102,26 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Send step progress events via a callback
 	opts := agent.ChatOptions{
 		UseRAG:        req.UseRAG,
 		SelectedTools: req.SelectedTools,
 		Explicit:      req.Explicit,
 	}
 
-	// Notify client that processing has started
 	sendSSE("start", map[string]interface{}{"message": req.Message})
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	// Monitor client disconnect: if client closes connection, cancel context
 	notify := r.Context().Done()
 	go func() {
 		<-notify
 		cancel()
 	}()
 
-	resp := s.agent.ProcessContext(ctx, req.Message, opts)
-
-	// Send final response
-	sendSSE("done", resp)
+	s.agent.ProcessStream(ctx, req.Message, opts, func(evt agent.StreamEvent) {
+		sendSSE(evt.Type, evt.Data)
+	})
 }
 
 // POST /api/chat/cancel — 取消当前正在执行的对话任务

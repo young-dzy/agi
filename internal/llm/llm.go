@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -55,12 +56,34 @@ func (c *Client) ChatContext(ctx context.Context, systemPrompt string, messages 
 	return c.mock(messages)
 }
 
+// ChatStreamContext 流式对话请求，每收到一个 token 片段调用 onToken 回调。
+// 返回聚合的完整回复文本。若 API 不可用则降级为同步调用。
+func (c *Client) ChatStreamContext(ctx context.Context, systemPrompt string, messages []Message, onToken func(string)) string {
+	if !c.cfg.IsRealLLM() {
+		reply := c.mock(messages)
+		if onToken != nil {
+			onToken(reply)
+		}
+		return reply
+	}
+	reply, err := c.callAPIStream(ctx, systemPrompt, messages, onToken)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "[已中断]"
+		}
+		log.Printf("LLM 流式调用失败: %v，回退到同步", err)
+		return c.ChatContext(ctx, systemPrompt, messages)
+	}
+	return reply
+}
+
 // ── OpenAI 兼容接口调用 ──────────────────────────────────────────────────
 
 type apiRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
 	Temperature float64   `json:"temperature"`
+	Stream      bool      `json:"stream,omitempty"`
 }
 
 type apiResponse struct {
@@ -68,6 +91,19 @@ type apiResponse struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type streamDelta struct {
+	Content string `json:"content"`
+}
+
+type streamChunk struct {
+	Choices []struct {
+		Delta streamDelta `json:"delta"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
@@ -126,6 +162,78 @@ func (c *Client) callAPIWithContext(ctx context.Context, systemPrompt string, me
 		return "", fmt.Errorf("API 返回空结果, body: %s", string(data))
 	}
 	return result.Choices[0].Message.Content, nil
+}
+
+// callAPIStream 流式调用 OpenAI 兼容接口，逐 token 回调，返回聚合的完整回复
+func (c *Client) callAPIStream(ctx context.Context, systemPrompt string, messages []Message, onToken func(string)) (string, error) {
+	var msgs []Message
+	if systemPrompt != "" {
+		msgs = append(msgs, Message{Role: "system", Content: systemPrompt})
+	}
+	msgs = append(msgs, messages...)
+
+	body, err := json.Marshal(apiRequest{
+		Model:       c.cfg.LLMModel,
+		Messages:    msgs,
+		Temperature: c.cfg.Temperature,
+		Stream:      true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("序列化请求失败: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.LLMAPIUrl, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("构建请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.LLMAPIKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("HTTP 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API 返回错误状态 %d, body: %s", resp.StatusCode, string(data))
+	}
+
+	var fullReply strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if strings.TrimSpace(data) == "[DONE]" {
+			break
+		}
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if chunk.Error != nil {
+			return "", fmt.Errorf("API 流式错误: %s", chunk.Error.Message)
+		}
+		if len(chunk.Choices) > 0 {
+			content := chunk.Choices[0].Delta.Content
+			if content != "" {
+				fullReply.WriteString(content)
+				if onToken != nil {
+					onToken(content)
+				}
+			}
+		}
+	}
+	return fullReply.String(), nil
 }
 
 // ── Embedding API ──────────────────────────────────────────────────────

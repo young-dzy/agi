@@ -110,6 +110,19 @@ type Response struct {
 	Interrupted    bool                   `json:"interrupted,omitempty"`
 }
 
+// ─────────────────────────────── SSE 流式事件 ────────────────────────────────
+
+// StreamEvent 是 SSE 流式推送的事件，handler 逐条写入 EventStream
+type StreamEvent struct {
+	Type string      `json:"type"` // route / step / token / tool_call / rag_result / memory / done
+	Data interface{} `json:"data"`
+}
+
+// NewStreamEvent 创建一个 SSE 事件
+func NewStreamEvent(eventType string, data interface{}) StreamEvent {
+	return StreamEvent{Type: eventType, Data: data}
+}
+
 // ─────────────────────────────── Unified Agent ───────────────────────────
 
 // UnifiedAgent 整合全部能力，是系统的核心调度入口
@@ -330,6 +343,15 @@ func (a *UnifiedAgent) ProcessContext(ctx context.Context, query string, opts Ch
 	return a.process(ctx, query, opts)
 }
 
+// ProcessStream 流式处理入口，在关键节点通过 onEvent 回调推送 SSE 事件。
+// 返回完整的 Response（与 Process 一致），同时通过回调实时推送中间事件。
+func (a *UnifiedAgent) ProcessStream(ctx context.Context, query string, opts ChatOptions, onEvent func(StreamEvent)) *Response {
+	ctx, cancel := context.WithCancel(ctx)
+	a.cancelFn = cancel
+	defer cancel()
+	return a.processStream(ctx, query, opts, onEvent)
+}
+
 // Cancel 取消当前正在执行的任务
 func (a *UnifiedAgent) Cancel() {
 	if a.cancelFn != nil {
@@ -459,6 +481,136 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 	resp.ShortTermCount = len(a.stm.Messages)
 	resp.LongTermCount = len(a.ltm.Items)
 	resp.Preferences = a.pref.Data
+	return resp
+}
+
+// processStream 与 process 逻辑一致，但在关键节点通过 onEvent 推送 SSE 事件
+func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts ChatOptions, onEvent func(StreamEvent)) *Response {
+	if onEvent == nil {
+		return a.process(ctx, query, opts)
+	}
+
+	resp := &Response{Query: query, Mode: "chat"}
+
+	a.stm.Add("user", query)
+	a.inf.SaveChatHistory("user", query)
+
+	// 偏好提取（异步，与 process 一致）
+	go func() {
+		kvs := a.llm.ExtractPreferences(query)
+		if len(kvs) > 0 {
+			a.pref.SaveBatch(kvs)
+			for k, v := range kvs {
+				a.inf.SavePreference("default", k, v)
+				content := fmt.Sprintf("用户%s: %s", k, v)
+				emb, _ := a.llm.Embed(content)
+				if added, _ := a.graphMem.Store(content, 0.8, emb); added {
+					embJSON, _ := json.Marshal(emb)
+					pgID := a.inf.SaveLongTermItem(content, 0.8, embJSON)
+					a.graphMem.SyncLastItemPGID(pgID)
+				}
+			}
+		}
+	}()
+
+	// 同步规则提取
+	if key, value, ok := a.pref.ExtractAndSave(query); ok {
+		resp.ExtractedInfo = fmt.Sprintf("已记住：%s = %s", key, value)
+		onEvent(NewStreamEvent("memory", map[string]string{"extracted_info": resp.ExtractedInfo}))
+	}
+
+	// ── 路由决策 ──
+	var mode string
+	var routeTools map[string]tools.Tool
+	if opts.Explicit {
+		switch {
+		case len(opts.SelectedTools) > 0:
+			routeTools = a.filterTools(opts.SelectedTools)
+			if a.needReActFromTools(query, routeTools) {
+				mode = "react"
+			} else {
+				mode = "tool"
+			}
+		case opts.UseRAG && a.rag.Loaded:
+			mode = "rag"
+		default:
+			mode = "chat"
+		}
+	} else {
+		switch {
+		case a.needReAct(query):
+			mode = "react"
+			routeTools = a.tools
+		case a.needTool(query):
+			mode = "tool"
+			routeTools = a.tools
+		case a.needRAG(query):
+			mode = "rag"
+		default:
+			mode = "chat"
+		}
+	}
+	resp.Mode = mode
+	onEvent(NewStreamEvent("route", map[string]string{"mode": mode}))
+
+	memPrefix := a.buildContextPrefix(ctx, query, mode)
+	histMsgs := a.buildHistoryMessages(query)
+
+	if ctx.Err() != nil {
+		resp.Interrupted = true
+		resp.Answer = "[已中断] 请求在开始前被取消"
+		onEvent(NewStreamEvent("done", resp))
+		return resp
+	}
+
+	// ── 分发执行（流式版） ──
+	switch mode {
+	case "react":
+		answer, steps, task := a.runReActStream(ctx, query, routeTools, memPrefix, histMsgs, onEvent)
+		resp.Answer, resp.Steps, resp.Task = answer, steps, task
+	case "tool":
+		answer, tc := a.runToolStream(ctx, query, routeTools, memPrefix, histMsgs, onEvent)
+		resp.Answer, resp.ToolCall = answer, tc
+	case "rag":
+		answer, results := a.rag.Query(query)
+		resp.Answer, resp.SearchResults = answer, results
+		onEvent(NewStreamEvent("rag_result", map[string]interface{}{"search_results": results}))
+		onEvent(NewStreamEvent("token", map[string]string{"content": answer}))
+	default:
+		systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
+		resp.Answer = a.llm.ChatStreamContext(ctx, systemPrompt, histMsgs, func(token string) {
+			onEvent(NewStreamEvent("token", map[string]string{"content": token}))
+		})
+	}
+
+	if ctx.Err() != nil {
+		resp.Interrupted = true
+	}
+
+	a.stm.Add("assistant", resp.Answer)
+	a.inf.SaveChatHistory("assistant", resp.Answer)
+
+	go a.extractMemoryFromReply(resp.Answer)
+
+	go func() {
+		if a.ltm.NeedConsolidation() {
+			var result memory.ConsolidationResult
+			if a.graphMem != nil {
+				result = a.graphMem.GraphAwareConsolidate()
+			} else {
+				result = a.ltm.Consolidate()
+			}
+			a.syncConsolidationToDB(result)
+		}
+	}()
+
+	eventData, _ := json.Marshal(map[string]interface{}{"query": query, "mode": resp.Mode})
+	a.inf.PublishEvent("agent.chat", string(eventData))
+
+	resp.ShortTermCount = len(a.stm.Messages)
+	resp.LongTermCount = len(a.ltm.Items)
+	resp.Preferences = a.pref.Data
+	onEvent(NewStreamEvent("done", resp))
 	return resp
 }
 
@@ -788,6 +940,205 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 	return answer, reactSteps, a.task
 }
 
+// runToolStream 流式版本的单工具调用：推送 tool_call 和 token 事件
+func (a *UnifiedAgent) runToolStream(ctx context.Context, query string, ts map[string]tools.Tool, memPrefix string, histMsgs []llm.Message, onEvent func(StreamEvent)) (string, *tools.CallResult) {
+	tc := tools.Decide(query, ts)
+	if tc == nil {
+		return "我无法处理这个请求。", nil
+	}
+	tool, ok := ts[tc.ToolName]
+	if !ok {
+		return fmt.Sprintf("工具 %s 不存在", tc.ToolName), tc
+	}
+
+	a.fillParamsFromPreference(tc)
+
+	result, err := tool.Execute(tc.Params)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "[已中断]", tc
+		}
+		if a.toolTracker != nil {
+			a.toolTracker.Record(runtime.ToolCallTrace{ToolName: tc.ToolName, Success: false, Summary: err.Error()})
+		}
+		return fmt.Sprintf("工具执行失败: %v", err), tc
+	}
+	tc.ToolResult = result
+	if a.toolTracker != nil {
+		a.toolTracker.Record(runtime.ToolCallTrace{ToolName: tc.ToolName, Success: true, Summary: result})
+	}
+
+	onEvent(NewStreamEvent("tool_call", map[string]interface{}{
+		"tool_name":   tc.ToolName,
+		"params":      tc.Params,
+		"tool_result": result,
+	}))
+
+	systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个善于综合信息的AI助手。结合你掌握的用户信息，使回答更个性化。")
+	userMsg := fmt.Sprintf("用户问：%s\n工具 %s 返回结果：%s\n请根据结果自然地回答用户。", query, tc.ToolName, result)
+	answer := a.llm.ChatStreamContext(ctx, systemPrompt, []llm.Message{{Role: "user", Content: userMsg}}, func(token string) {
+		onEvent(NewStreamEvent("token", map[string]string{"content": token}))
+	})
+	return answer, tc
+}
+
+// runReActStream 流式版本的 ReAct 循环：逐步推送 step 和 token 事件
+func (a *UnifiedAgent) runReActStream(ctx context.Context, query string, ts map[string]tools.Tool, memPrefix string, histMsgs []llm.Message, onEvent func(StreamEvent)) (string, []ReActStep, *TaskState) {
+	var reactSteps []ReActStep
+	var observations []string
+
+	planItems := a.llmPlanSteps(ctx, query, ts, memPrefix)
+
+	if len(planItems) == 0 {
+		systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
+		reactSteps = append(reactSteps, ReActStep{Type: StepThought, Content: "分析后无需调用工具，直接回答"})
+		onEvent(NewStreamEvent("step", ReActStep{Type: StepThought, Content: "分析后无需调用工具，直接回答"}))
+		answer := a.llm.ChatStreamContext(ctx, systemPrompt, histMsgs, func(token string) {
+			onEvent(NewStreamEvent("token", map[string]string{"content": token}))
+		})
+		reactSteps = append(reactSteps, ReActStep{Type: StepFinalAnswer, Content: answer})
+		if ctx.Err() != nil {
+			return "[已中断] 规划完成但生成被中断", reactSteps, nil
+		}
+		return answer, reactSteps, nil
+	}
+
+	var taskSteps []TaskStep
+	for i, pi := range planItems {
+		taskSteps = append(taskSteps, TaskStep{
+			ID: i + 1, Name: pi.Reason, ToolName: pi.Tool,
+			Params: pi.Params, Status: StepPending,
+		})
+	}
+
+	a.task = &TaskState{
+		TaskID: fmt.Sprintf("task-%d", time.Now().UnixNano()),
+		Query:  query, Status: "running", Phase: "executing", Steps: taskSteps,
+	}
+	a.snapshots = nil
+	if a.taskMem != nil {
+		a.taskMem.Reset()
+	}
+	a.saveSnapshot()
+
+	for i := range a.task.Steps {
+		if ctx.Err() != nil {
+			a.task.Phase = "interrupted"
+			a.task.Status = "interrupted"
+			a.task.InterruptedAt = i
+			a.task.Steps[i].Status = StepInterrupted
+			interruptMsg := a.buildInterruptMessage(a.task)
+			reactSteps = append(reactSteps, ReActStep{Type: StepObservation, Content: "[已中断] " + interruptMsg})
+			onEvent(NewStreamEvent("step", ReActStep{Type: StepObservation, Content: "[已中断] " + interruptMsg}))
+			a.saveSnapshot()
+			return "[已中断] " + interruptMsg, reactSteps, a.task
+		}
+
+		ts2 := &a.task.Steps[i]
+		a.task.CurrentStep = i
+		ts2.Status = StepRunning
+
+		thoughtStep := ReActStep{Type: StepThought, Content: ts2.Name}
+		actionStep := ReActStep{Type: StepAction, Content: fmt.Sprintf("调用 %s", ts2.ToolName), Tool: ts2.ToolName, Params: ts2.Params}
+		reactSteps = append(reactSteps, thoughtStep, actionStep)
+		onEvent(NewStreamEvent("step", thoughtStep))
+		onEvent(NewStreamEvent("step", actionStep))
+
+		tool, ok := ts[ts2.ToolName]
+		if !ok {
+			ts2.Status = StepFailed
+			ts2.Error = fmt.Sprintf("工具 %s 不在允许列表中", ts2.ToolName)
+			obsStep := ReActStep{Type: StepObservation, Content: ts2.Error}
+			reactSteps = append(reactSteps, obsStep)
+			onEvent(NewStreamEvent("step", obsStep))
+			a.saveSnapshot()
+			continue
+		}
+		if a.executeStepWithRetryTool(ctx, ts2, tool) {
+			ts2.Status = StepDone
+			obsStep := ReActStep{Type: StepObservation, Content: ts2.Result}
+			reactSteps = append(reactSteps, obsStep)
+			onEvent(NewStreamEvent("step", obsStep))
+			observations = append(observations, fmt.Sprintf("[%s] %s", ts2.ToolName, ts2.Result))
+			if a.taskMem != nil {
+				a.taskMem.Push(runtime.StepObservation{StepID: ts2.ID, ToolName: ts2.ToolName, Result: ts2.Result, Success: true})
+			}
+			if a.toolTracker != nil {
+				a.toolTracker.Record(runtime.ToolCallTrace{ToolName: ts2.ToolName, Success: true, Summary: ts2.Result})
+			}
+		} else {
+			if ctx.Err() != nil {
+				ts2.Status = StepInterrupted
+				obsStep := ReActStep{Type: StepObservation, Content: "[已中断]"}
+				reactSteps = append(reactSteps, obsStep)
+				onEvent(NewStreamEvent("step", obsStep))
+			} else {
+				ts2.Status = StepFailed
+				obsStep := ReActStep{Type: StepObservation, Content: fmt.Sprintf("执行失败: %s", ts2.Error)}
+				reactSteps = append(reactSteps, obsStep)
+				onEvent(NewStreamEvent("step", obsStep))
+				if a.taskMem != nil {
+					a.taskMem.Push(runtime.StepObservation{StepID: ts2.ID, ToolName: ts2.ToolName, Error: ts2.Error, Success: false})
+				}
+				if a.toolTracker != nil {
+					a.toolTracker.Record(runtime.ToolCallTrace{ToolName: ts2.ToolName, Success: false, Summary: ts2.Error})
+				}
+			}
+		}
+		a.saveSnapshot()
+	}
+
+	if ctx.Err() != nil {
+		a.task.Phase = "interrupted"
+		a.task.Status = "interrupted"
+		interruptMsg := a.buildInterruptMessage(a.task)
+		return "[已中断] " + interruptMsg, reactSteps, a.task
+	}
+
+	a.task.Phase = "generating"
+	answer := a.llmGenerateStream(ctx, query, observations, memPrefix, histMsgs, onEvent)
+	reactSteps = append(reactSteps, ReActStep{Type: StepFinalAnswer, Content: answer})
+	a.task.Result = answer
+	a.task.Status = "completed"
+	a.task.Phase = "done"
+	return answer, reactSteps, a.task
+}
+
+// llmGenerateStream 流式版本的 Generator LLM，逐 token 回调
+func (a *UnifiedAgent) llmGenerateStream(ctx context.Context, query string, observations []string, memPrefix string, histMsgs []llm.Message, onEvent func(StreamEvent)) string {
+	if len(observations) == 0 {
+		systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
+		return a.llm.ChatStreamContext(ctx, systemPrompt, histMsgs, func(token string) {
+			onEvent(NewStreamEvent("token", map[string]string{"content": token}))
+		})
+	}
+	if !a.cfg.IsRealLLM() {
+		return "综合查询结果：" + strings.Join(observations, "；")
+	}
+
+	var obsBuilder strings.Builder
+	for i, obs := range observations {
+		obsBuilder.WriteString(fmt.Sprintf("%d. %s\n", i+1, obs))
+	}
+
+	genPrompt := fmt.Sprintf(`请根据以下工具执行结果，综合回答用户的问题。回答要自然流畅、重点突出，不要机械罗列原始数据，也不要重复问题本身。
+
+用户问题：%s
+
+工具执行结果：
+%s`, query, obsBuilder.String())
+
+	generatorBase := "你是一个善于综合信息的AI助手，能将多个工具的执行结果整合成清晰自然的回答。"
+	if memPrefix != "" {
+		generatorBase = memPrefix + "\n\n" + generatorBase + "\n结合用户偏好，使回答更个性化。"
+	}
+	return a.llm.ChatStreamContext(ctx, generatorBase,
+		[]llm.Message{{Role: "user", Content: genPrompt}},
+		func(token string) {
+			onEvent(NewStreamEvent("token", map[string]string{"content": token}))
+		})
+}
+
 // buildInterruptMessage 根据已完成的步骤生成中断摘要
 func (a *UnifiedAgent) buildInterruptMessage(task *TaskState) string {
 	doneSteps := 0
@@ -878,17 +1229,40 @@ func (a *UnifiedAgent) llmPlanSteps(ctx context.Context, query string, ts map[st
 		return a.rulePlanItems(ctx, query, ts, memPrefix)
 	}
 
-	// 清洗 LLM 输出（可能包含 markdown 代码块）
+	// 清洗 LLM 输出（可能包含 markdown 代码块或特殊 function-call 标记）
 	raw = strings.TrimSpace(raw)
+	// 剥离模型输出的 <|FunctionCallBegin|>...<|FunctionCallEnd|> 包装
+	if idx := strings.Index(raw, "<|FunctionCallBegin|>"); idx >= 0 {
+		raw = raw[idx+len("<|FunctionCallBegin|>"):]
+		if end := strings.Index(raw, "<|FunctionCallEnd|>"); end >= 0 {
+			raw = raw[:end]
+		}
+	}
 	raw = strings.TrimPrefix(raw, "```json")
 	raw = strings.TrimPrefix(raw, "```")
 	raw = strings.TrimSuffix(raw, "```")
 	raw = strings.TrimSpace(raw)
 
+	// 尝试解析为 [{"tool":...,"params":...}] 格式
 	var items []planItem
 	if err := json.Unmarshal([]byte(raw), &items); err != nil {
-		log.Printf("⚠️  Planner LLM 解析失败 (%v)，降级到规则规划。原始输出: %s", err, raw)
-		return a.rulePlanItems(ctx, query, ts, memPrefix)
+		// 降级：尝试解析为 [{"name":...,"parameters":...}] 格式（部分模型的 function-calling 格式）
+		var altItems []struct {
+			Name       string                 `json:"name"`
+			Parameters map[string]interface{} `json:"parameters"`
+		}
+		if altErr := json.Unmarshal([]byte(raw), &altItems); altErr == nil {
+			for _, ai := range altItems {
+				params := make(map[string]string, len(ai.Parameters))
+				for k, v := range ai.Parameters {
+					params[k] = fmt.Sprint(v)
+				}
+				items = append(items, planItem{Tool: ai.Name, Params: params, Reason: "LLM 规划调用"})
+			}
+		} else {
+			log.Printf("⚠️  Planner LLM 解析失败 (%v / %v)，降级到规则规划。原始输出: %s", err, altErr, raw)
+			return a.rulePlanItems(ctx, query, ts, memPrefix)
+		}
 	}
 
 	// 过滤：只保留工具集中实际存在的工具
@@ -936,11 +1310,19 @@ func (a *UnifiedAgent) rulePlanItems(ctx context.Context, query string, ts map[s
 			items = append(items, planItem{Tool: "search_web", Params: map[string]string{"query": query}, Reason: "搜索相关信息"})
 		}
 	}
+	if _, ok := ts["exec_command"]; ok {
+		if strings.Contains(q, "执行") || strings.Contains(q, "运行") || strings.Contains(q, "命令") ||
+			strings.Contains(q, "终端") || strings.Contains(q, "lscpu") || strings.Contains(q, "cpu") ||
+			strings.Contains(q, "磁盘") || strings.Contains(q, "内存") || strings.Contains(q, "系统信息") {
+			cmd := extractShellCommand(query)
+			items = append(items, planItem{Tool: "exec_command", Params: map[string]string{"command": cmd}, Reason: "执行终端命令"})
+		}
+	}
 	if _, ok := ts["rag_search"]; ok {
 		items = append(items, planItem{Tool: "rag_search", Params: map[string]string{"query": query}, Reason: "检索个人知识库"})
 	}
 	// MCP / 自定义工具
-	builtins := map[string]bool{"get_time": true, "get_weather": true, "search_web": true, "rag_search": true}
+	builtins := map[string]bool{"get_time": true, "get_weather": true, "search_web": true, "rag_search": true, "exec_command": true}
 	for name, t := range ts {
 		if builtins[name] {
 			continue
@@ -1354,3 +1736,27 @@ func (a *UnifiedAgent) initSandbox() {
 
 // Sandbox 暴露沙箱实例，供 HTTP handler 或前端查询状态
 func (a *UnifiedAgent) Sandbox() *sandbox.Sandbox { return a.sandbox }
+
+// extractShellCommand 从用户自然语言查询中提取实际的 shell 命令
+func extractShellCommand(query string) string {
+	// 简单提取：去掉常见中文前缀后，取第一个词作为命令
+	q := query
+	for _, prefix := range []string{"执行", "运行", "请执行", "请运行", "帮我执行", "帮我运行"} {
+		if strings.HasPrefix(q, prefix) {
+			q = strings.TrimPrefix(q, prefix)
+			break
+		}
+	}
+	// 去掉常见中文后缀
+	for _, suffix := range []string{"命令", "查看CPU信息", "查看内存信息", "查看磁盘信息", "查看系统信息", "查看信息"} {
+		if strings.HasSuffix(q, suffix) {
+			q = strings.TrimSuffix(q, suffix)
+			break
+		}
+	}
+	q = strings.TrimSpace(q)
+	if q != "" {
+		return q
+	}
+	return query
+}

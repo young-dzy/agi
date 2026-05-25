@@ -150,11 +150,23 @@ func Decide(query string, ts map[string]Tool) *CallResult {
 		}
 	}
 
-	// 无规则命中或命中工具不在集合中时，取集合中第一个工具兜底
-	for name, _ := range ts {
-		return &CallResult{ToolName: name, Params: map[string]interface{}{"query": query}}
-	}
-	return nil
+		if _, ok := ts["exec_command"]; ok {
+			return &CallResult{ToolName: "exec_command", Params: map[string]interface{}{"command": query}}
+		}
+
+		// 无规则命中或命中工具不在集合中时，取集合中第一个工具兜底
+		// 使用工具的首个必填参数名而非硬编码 "query"
+		for name, t := range ts {
+			paramName := "query"
+			for _, p := range t.Parameters {
+				if p.Required {
+					paramName = p.Name
+					break
+				}
+			}
+			return &CallResult{ToolName: name, Params: map[string]interface{}{paramName: query}}
+		}
+		return nil
 }
 
 // NewMCPTool 创建一个调用外部 HTTP 端点的 MCP 兼容工具。

@@ -1,21 +1,23 @@
 // Package memory — GraphMemory 在现有 LongTerm 基础上叠加 Neo4j 图层：
 //
-//   节点类型：(:Memory {mem_id, content, importance})
-//   边类型：
-//     FOLLOWS      — 时序相邻（上一条对话记忆 → 当前）
-//     SIMILAR_TO   — 语义相似度超阈值（Store 时自动连接）
-//     CAUSES       — 因果推断（LLM 提取，可选）
-//     BELONGS_TO   — 话题归属（暂用 TopK 聚类近似）
+//	节点类型：(:Memory {mem_id, content, importance})
+//	边类型：
+//	  FOLLOWS      — 时序相邻（上一条对话记忆 → 当前）
+//	  SIMILAR_TO   — 语义相似度超阈值（Store 时自动连接）
+//	  CAUSES       — 因果推断（LLM 提取，可选）
+//	  BELONGS_TO   — 话题归属（暂用 TopK 聚类近似）
 //
 // 核心能力：
-//   Store    — 写入 LTM 的同时在图中创建节点，并建立 FOLLOWS + SIMILAR_TO 边
-//   Recall   — 向量召回后沿图扩展，发现不直接相似但关联的历史记忆
-//   Consolidate — 结合图中心度保护关键节点，避免高价值记忆被错误淘汰
+//
+//	Store    — 写入 LTM 的同时在图中创建节点，并建立 FOLLOWS + SIMILAR_TO 边
+//	Recall   — 向量召回后沿图扩展，发现不直接相似但关联的历史记忆
+//	Consolidate — 结合图中心度保护关键节点，避免高价值记忆被错误淘汰
 package memory
 
 import (
 	"agi-ai-assitant/internal/graph"
 	"log"
+	"sort"
 	"time"
 )
 
@@ -61,10 +63,10 @@ func (gm *GraphMemory) StoreClassified(content string, importance float64, embed
 		return false, gm.findMostSimilarID(embedding)
 	}
 
-	if len(gm.ltm.Items) == 0 {
+	newItem, ok := gm.ltm.LastItem()
+	if !ok {
 		return true, -1
 	}
-	newItem := gm.ltm.Items[len(gm.ltm.Items)-1]
 	newID := newItem.ID
 
 	if gm.kg != nil && gm.kg.Available() {
@@ -83,8 +85,9 @@ func (gm *GraphMemory) StoreClassified(content string, importance float64, embed
 
 // linkSimilarEdges 找出与 newItem 语义相近的已有条目，建立 SIMILAR_TO 边
 func (gm *GraphMemory) linkSimilarEdges(newItem Item, newID int) {
-	// 扫描最近 50 条（避免全量扫描）
-	items := gm.ltm.Items
+	// 扫描最近 50 条（避免全量扫描）—— 通过 Snapshot 拿到一致性快照，
+	// 不再直接读 ltm.Items 字段（避免与 LTM 内部并发写产生数据竞争）
+	items := gm.ltm.Snapshot()
 	start := len(items) - 51
 	if start < 0 {
 		start = 0
@@ -106,11 +109,15 @@ func (gm *GraphMemory) linkSimilarEdges(newItem Item, newID int) {
 
 // findMostSimilarID 在 LTM 中查找与 embedding 最相似的条目 ID（用于去重返回）
 func (gm *GraphMemory) findMostSimilarID(embedding []float64) int {
-	if len(embedding) == 0 || len(gm.ltm.Items) == 0 {
+	if len(embedding) == 0 {
+		return -1
+	}
+	items := gm.ltm.Snapshot()
+	if len(items) == 0 {
 		return -1
 	}
 	bestID, bestSim := -1, 0.0
-	for _, item := range gm.ltm.Items {
+	for _, item := range items {
 		if len(item.Embedding) != len(embedding) {
 			continue
 		}
@@ -154,28 +161,20 @@ func (gm *GraphMemory) RecallByFilter(query string, queryEmbedding []float64, fi
 		if idSet[id] {
 			continue
 		}
-		for _, item := range gm.ltm.Items {
-			if item.ID == id {
-				// 图扩展条目同样需通过 category 过滤（如果有限制）
-				if len(filter.Categories) > 0 && !containsString(filter.Categories, item.Category) {
-					continue
-				}
-				item.Score = 0.45
-				expanded = append(expanded, item)
-				idSet[id] = true
-				break
+		// 通过 LTM 安全访问器查找条目（持读锁，避免直接遍历 .Items）
+		if item, ok := gm.ltm.FindByID(id); ok {
+			// 图扩展条目同样需通过 category 过滤（如果有限制）
+			if len(filter.Categories) > 0 && !containsString(filter.Categories, item.Category) {
+				continue
 			}
+			item.Score = 0.45
+			expanded = append(expanded, item)
+			idSet[id] = true
 		}
 	}
 
 	all := append(seedItems, expanded...)
-	for i := 0; i < len(all); i++ {
-		for j := i + 1; j < len(all); j++ {
-			if all[j].Score > all[i].Score {
-				all[i], all[j] = all[j], all[i]
-			}
-		}
-	}
+	sort.Slice(all, func(i, j int) bool { return all[i].Score > all[j].Score })
 	if filter.TopK > 0 && len(all) > filter.TopK {
 		all = all[:filter.TopK]
 	}
@@ -185,8 +184,8 @@ func (gm *GraphMemory) RecallByFilter(query string, queryEmbedding []float64, fi
 // ─────────────────────────────── Consolidate ─────────────────────────────────
 
 // GraphAwareConsolidate 在 LTM.Consolidate 基础上：
-//   1. 对图中入度高的节点提供保护（不轻易删除核心记忆）
-//   2. 删除 LTM 条目时同步删除 Neo4j 节点
+//  1. 对图中入度高的节点提供保护（不轻易删除核心记忆）
+//  2. 删除 LTM 条目时同步删除 Neo4j 节点
 func (gm *GraphMemory) GraphAwareConsolidate() ConsolidationResult {
 	result := gm.ltm.Consolidate()
 
@@ -223,8 +222,8 @@ func (gm *GraphMemory) GraphAwareConsolidate() ConsolidationResult {
 
 // SyncPrevID 在从 DB 恢复记忆后调用，将 prevID 对齐到最新条目
 func (gm *GraphMemory) SyncPrevID() {
-	if len(gm.ltm.Items) > 0 {
-		gm.prevID = gm.ltm.Items[len(gm.ltm.Items)-1].ID
+	if id := gm.ltm.LastID(); id >= 0 {
+		gm.prevID = id
 	}
 }
 
@@ -246,7 +245,7 @@ func (gm *GraphMemory) StoreItem(item Item) {
 }
 
 // Len 返回当前记忆条目数（等同 LTM）
-func (gm *GraphMemory) Len() int { return len(gm.ltm.Items) }
+func (gm *GraphMemory) Len() int { return gm.ltm.Count() }
 
 // SetConsolidationConfig 代理到 LTM
 func (gm *GraphMemory) SetConsolidationConfig(cfg *ConsolidationConfig) {
@@ -260,8 +259,7 @@ func (gm *GraphMemory) NeedConsolidation() bool { return gm.ltm.NeedConsolidatio
 func (gm *GraphMemory) SyncLastItemPGID(pgID int) {
 	gm.ltm.SyncLastItemPGID(pgID)
 	// 同步更新 prevID 到最新条目
-	if len(gm.ltm.Items) > 0 {
-		last := gm.ltm.Items[len(gm.ltm.Items)-1]
+	if last, ok := gm.ltm.LastItem(); ok {
 		gm.prevID = last.ID
 		// 更新 Neo4j 节点 ID（SyncLastItemPGID 会修改最后一条 Item.ID）
 		if gm.kg != nil && gm.kg.Available() {

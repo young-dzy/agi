@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -142,8 +143,8 @@ type yamlFile struct {
 		RAGMilvusDim       int     `yaml:"rag_milvus_dim"`
 	} `yaml:"rag"`
 	Memory struct {
-		ShortTermMaxTurns int     `yaml:"short_term_max_turns"`
-		LongTermTopK      int     `yaml:"long_term_top_k"`
+		ShortTermMaxTurns int `yaml:"short_term_max_turns"`
+		LongTermTopK      int `yaml:"long_term_top_k"`
 		Consolidation     struct {
 			SimilarityThreshold float64 `yaml:"similarity_threshold"`
 			DedupThreshold      float64 `yaml:"dedup_threshold"`
@@ -167,12 +168,12 @@ type yamlFile struct {
 		APIURL string `yaml:"api_url"`
 	} `yaml:"search"`
 	Neo4j struct {
-		URI       string  `yaml:"uri"`
-		User      string  `yaml:"user"`
-		Password  string  `yaml:"password"`
-		MaxHops   int     `yaml:"max_hops"`
-		Weight    float64 `yaml:"weight"`
-		Enabled   bool    `yaml:"enabled"`
+		URI      string  `yaml:"uri"`
+		User     string  `yaml:"user"`
+		Password string  `yaml:"password"`
+		MaxHops  int     `yaml:"max_hops"`
+		Weight   float64 `yaml:"weight"`
+		Enabled  bool    `yaml:"enabled"`
 	} `yaml:"neo4j"`
 	Sandbox struct {
 		Enabled         bool   `yaml:"enabled"`
@@ -200,8 +201,12 @@ func DefaultConfig() *APIConfig {
 		log.Fatalf("读取 config/config.yaml 失败: %v", err)
 	}
 
+	// 严格解析：未知字段直接报错，避免 yaml 键名拼错（如 api-key vs api_key）
+	// 时被静默忽略，运行时才发现 LLM/Embedding 走了 mock 模式。
 	var y yamlFile
-	if err := yaml.Unmarshal(data, &y); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&y); err != nil {
 		log.Fatalf("解析 config/config.yaml 失败: %v", err)
 	}
 
@@ -352,7 +357,7 @@ func DefaultConfig() *APIConfig {
 	return c
 }
 
-func (c *APIConfig) IsRealLLM() bool      { return c.LLMAPIKey != "" }
+func (c *APIConfig) IsRealLLM() bool       { return c.LLMAPIKey != "" }
 func (c *APIConfig) IsRealEmbedding() bool { return c.EmbeddingAPIKey != "" }
 
 // PGDSN 返回 PostgreSQL 连接串

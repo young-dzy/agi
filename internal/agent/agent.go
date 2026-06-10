@@ -21,7 +21,7 @@ import (
 	"agi-ai-assitant/internal/tools"
 	"bytes"
 	"context"
-	"enc
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -128,25 +128,34 @@ func NewStreamEvent(eventType string, data interface{}) StreamEvent {
 
 // UnifiedAgent 整合全部能力，是系统的核心调度入口
 type UnifiedAgent struct {
-	cfg       *config.APIConfig
-	llm       *llm.Client
-	rag       *rag.Engine
-	tools     map[string]tools.Tool
-	stm       *memory.ShortTerm
-	ltm       *memory.LongTerm    // 保留直接引用，供 handler 暴露
-	graphMem  *memory.GraphMemory // 图增强记忆层（包装 ltm）
-	pref      *memory.Preference
-	sandbox   *sandbox.Sandbox
-	kg        *graph.KGStore // 知识图谱（RAG + 记忆图共享）
-	snapshots []Snapshot
-	task      *TaskState
-	inf       *infra.Infrastructure
-	cancelFn  context.CancelFunc // 当前任务的取消函数
+	cfg      *config.APIConfig
+	llm      *llm.Client
+	rag      *rag.Engine
+	tools    map[string]tools.Tool
+	stm      *memory.ShortTerm
+	ltm      *memory.LongTerm    // 保留直接引用，供 handler 暴露
+	graphMem *memory.GraphMemory // 图增强记忆层（包装 ltm）
+	pref     *memory.Preference
+	sandbox  *sandbox.Sandbox
+	kg       *graph.KGStore // 知识图谱（RAG + 记忆图共享）
+	inf      *infra.Infrastructure
 
 	// Schema-driven Runtime Context Assembly
 	assembler   *runtime.ContextAssembler
 	taskMem     *runtime.TaskMemBuffer
 	toolTracker *runtime.ToolStateTracker
+
+	// per-request 共享状态：snapshots、当前任务、in-flight cancel funcs
+	//
+	// 并发：mu 串行化对 task/snapshots/cancelFns 的所有读写。
+	// 旧实现把这三个字段当无锁全局变量，多请求并发时数据竞争 + Cancel()
+	// 因 cancelFn 互相覆盖只能取消最近一次请求；这里改为 cancelFns map，
+	// 每个 in-flight 请求一个 token，Cancel() 触发全部。
+	mu           sync.Mutex
+	task         *TaskState
+	snapshots    []Snapshot
+	cancelFns    map[int64]context.CancelFunc
+	nextCancelID int64
 }
 
 // New 创建并初始化 UnifiedAgent
@@ -261,7 +270,7 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	reg := runtime.NewSourceRegistry()
 	reg.Register(runtime.NewProfileSource(a.pref, a.ltm))
 	reg.Register(runtime.NewPlannerSource(func() *runtime.PlannerSnapshot {
-		t := a.task
+		t := a.currentTask() // 持锁读取，避免与 ReAct 循环并发写打架
 		if t == nil {
 			return nil
 		}
@@ -318,8 +327,50 @@ func (a *UnifiedAgent) LongTerm() *memory.LongTerm { return a.ltm }
 // Preferences 暴露用户偏好，供 HTTP handler 查询
 func (a *UnifiedAgent) Preferences() *memory.Preference { return a.pref }
 
-// Snapshots 返回历史快照列表
-func (a *UnifiedAgent) Snapshots() []Snapshot { return a.snapshots }
+// Snapshots 返回历史快照列表（持锁拷贝）
+func (a *UnifiedAgent) Snapshots() []Snapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cp := make([]Snapshot, len(a.snapshots))
+	copy(cp, a.snapshots)
+	return cp
+}
+
+// ─────────────────────────────── 内部并发 helper ──────────────────────────────
+
+// registerCancel 把本次请求的 cancel 函数挂到 agent 上，返回反注册的函数。
+// 多请求并发时每个请求拿到独立 token；Cancel() 触发全部 in-flight 中断。
+func (a *UnifiedAgent) registerCancel(cancel context.CancelFunc) func() {
+	a.mu.Lock()
+	if a.cancelFns == nil {
+		a.cancelFns = make(map[int64]context.CancelFunc)
+	}
+	a.nextCancelID++
+	id := a.nextCancelID
+	a.cancelFns[id] = cancel
+	a.mu.Unlock()
+	return func() {
+		a.mu.Lock()
+		delete(a.cancelFns, id)
+		a.mu.Unlock()
+		cancel() // 幂等：context.CancelFunc 自带 once 保护
+	}
+}
+
+// currentTask 持锁返回当前 task 引用（可能为 nil）
+func (a *UnifiedAgent) currentTask() *TaskState {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.task
+}
+
+// setTask 持锁设置当前 task，并清空 snapshots（新任务开始）
+func (a *UnifiedAgent) setTask(t *TaskState) {
+	a.mu.Lock()
+	a.task = t
+	a.snapshots = nil
+	a.mu.Unlock()
+}
 
 // ─────────────────────────────── 主处理流程 ──────────────────────────────
 
@@ -333,24 +384,24 @@ type ChatOptions struct {
 // Process 是统一入口（自动路由，向后兼容）
 func (a *UnifiedAgent) Process(query string) *Response {
 	ctx, cancel := context.WithCancel(context.Background())
-	a.cancelFn = cancel
-	defer cancel()
+	unregister := a.registerCancel(cancel)
+	defer unregister()
 	return a.process(ctx, query, ChatOptions{Explicit: false})
 }
 
 // ProcessWithOptions 带显式选项的入口，供前端精确控制路由
 func (a *UnifiedAgent) ProcessWithOptions(query string, opts ChatOptions) *Response {
 	ctx, cancel := context.WithCancel(context.Background())
-	a.cancelFn = cancel
-	defer cancel()
+	unregister := a.registerCancel(cancel)
+	defer unregister()
 	return a.process(ctx, query, opts)
 }
 
 // ProcessContext 带 context 的入口，支持 SSE 流式和取消
 func (a *UnifiedAgent) ProcessContext(ctx context.Context, query string, opts ChatOptions) *Response {
 	ctx, cancel := context.WithCancel(ctx)
-	a.cancelFn = cancel
-	defer cancel()
+	unregister := a.registerCancel(cancel)
+	defer unregister()
 	return a.process(ctx, query, opts)
 }
 
@@ -358,15 +409,21 @@ func (a *UnifiedAgent) ProcessContext(ctx context.Context, query string, opts Ch
 // 返回完整的 Response（与 Process 一致），同时通过回调实时推送中间事件。
 func (a *UnifiedAgent) ProcessStream(ctx context.Context, query string, opts ChatOptions, onEvent func(StreamEvent)) *Response {
 	ctx, cancel := context.WithCancel(ctx)
-	a.cancelFn = cancel
-	defer cancel()
+	unregister := a.registerCancel(cancel)
+	defer unregister()
 	return a.processStream(ctx, query, opts, onEvent)
 }
 
-// Cancel 取消当前正在执行的任务
+// Cancel 取消所有当前正在执行的任务（每个 in-flight 请求都会收到取消信号）
 func (a *UnifiedAgent) Cancel() {
-	if a.cancelFn != nil {
-		a.cancelFn()
+	a.mu.Lock()
+	fns := make([]context.CancelFunc, 0, len(a.cancelFns))
+	for _, fn := range a.cancelFns {
+		fns = append(fns, fn)
+	}
+	a.mu.Unlock()
+	for _, fn := range fns {
+		fn()
 	}
 }
 
@@ -489,9 +546,9 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 	eventData, _ := json.Marshal(map[string]interface{}{"query": query, "mode": resp.Mode})
 	a.inf.PublishEvent("agent.chat", string(eventData))
 
-	resp.ShortTermCount = len(a.stm.Messages)
-	resp.LongTermCount = len(a.ltm.Items)
-	resp.Preferences = a.pref.Data
+	resp.ShortTermCount = a.stm.Count()
+	resp.LongTermCount = a.ltm.Count()
+	resp.Preferences = a.pref.Snapshot()
 	return resp
 }
 
@@ -618,9 +675,9 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 	eventData, _ := json.Marshal(map[string]interface{}{"query": query, "mode": resp.Mode})
 	a.inf.PublishEvent("agent.chat", string(eventData))
 
-	resp.ShortTermCount = len(a.stm.Messages)
-	resp.LongTermCount = len(a.ltm.Items)
-	resp.Preferences = a.pref.Data
+	resp.ShortTermCount = a.stm.Count()
+	resp.LongTermCount = a.ltm.Count()
+	resp.Preferences = a.pref.Snapshot()
 	onEvent(NewStreamEvent("done", resp))
 	return resp
 }
@@ -632,8 +689,8 @@ func (a *UnifiedAgent) buildContextPrefix(ctx context.Context, query string, mod
 	}
 	emb, _ := a.llm.EmbedContext(ctx, query)
 	taskID := ""
-	if a.task != nil {
-		taskID = a.task.TaskID
+	if t := a.currentTask(); t != nil {
+		taskID = t.TaskID
 	}
 	rc := a.assembler.Assemble(ctx, runtime.Query{
 		Text:      query,
@@ -656,7 +713,8 @@ func (a *UnifiedAgent) buildSystemPrompt(memPrefix, basePrompt string) string {
 func (a *UnifiedAgent) buildHistoryMessages(query string) []llm.Message {
 	var msgs []llm.Message
 	// STM 最后一条是刚加入的 user query，跳过重复
-	for _, m := range a.stm.Messages {
+	// 通过 Snapshot 拿到一致性副本，避免遍历期间 Add 并发改写底层切片
+	for _, m := range a.stm.Snapshot() {
 		if m.Role == "user" || m.Role == "assistant" {
 			msgs = append(msgs, llm.Message{Role: m.Role, Content: m.Content})
 		}
@@ -846,34 +904,37 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 		})
 	}
 
-	a.task = &TaskState{
+	// 把 task 持有为本地变量：ReAct 循环的所有读写都走本地，
+	// 多请求并发时彼此互不干扰。setTask 把它发布到 agent 共享状态供
+	// PlannerSource / Snapshots 等只读访问。
+	task := &TaskState{
 		TaskID: fmt.Sprintf("task-%d", time.Now().UnixNano()),
 		Query:  query, Status: "running", Phase: "executing", Steps: taskSteps,
 	}
-	a.snapshots = nil
+	a.setTask(task)
 	if a.taskMem != nil {
 		a.taskMem.Reset()
 	}
-	a.saveSnapshot()
+	a.saveSnapshot(task)
 
 	// ── Step 2: 按 Planner 计划逐步执行工具 ───────────────────────────────
-	for i := range a.task.Steps {
+	for i := range task.Steps {
 		// 每步开始前检查 context 是否已取消
 		if ctx.Err() != nil {
-			a.task.Phase = "interrupted"
-			a.task.Status = "interrupted"
-			a.task.InterruptedAt = i
+			task.Phase = "interrupted"
+			task.Status = "interrupted"
+			task.InterruptedAt = i
 			// 将当前步骤标记为中断
-			a.task.Steps[i].Status = StepInterrupted
+			task.Steps[i].Status = StepInterrupted
 			// 生成中断摘要
-			interruptMsg := a.buildInterruptMessage(a.task)
+			interruptMsg := a.buildInterruptMessage(task)
 			reactSteps = append(reactSteps, ReActStep{Type: StepObservation, Content: "[已中断] " + interruptMsg})
-			a.saveSnapshot()
-			return "[已中断] " + interruptMsg, reactSteps, a.task
+			a.saveSnapshot(task)
+			return "[已中断] " + interruptMsg, reactSteps, task
 		}
 
-		ts2 := &a.task.Steps[i]
-		a.task.CurrentStep = i
+		ts2 := &task.Steps[i]
+		task.CurrentStep = i
 		ts2.Status = StepRunning
 
 		// Thought：展示 Planner 给出的调用理由
@@ -893,7 +954,7 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 			ts2.Status = StepFailed
 			ts2.Error = fmt.Sprintf("工具 %s 不在允许列表中", ts2.ToolName)
 			reactSteps = append(reactSteps, ReActStep{Type: StepObservation, Content: ts2.Error})
-			a.saveSnapshot()
+			a.saveSnapshot(task)
 			continue
 		}
 		if a.executeStepWithRetryTool(ctx, ts2, tool) {
@@ -931,24 +992,24 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 				}
 			}
 		}
-		a.saveSnapshot()
+		a.saveSnapshot(task)
 	}
 
 	// ── Step 3: Generator LLM 综合所有观察结果生成最终答案 ────────────────
 	if ctx.Err() != nil {
-		a.task.Phase = "interrupted"
-		a.task.Status = "interrupted"
-		interruptMsg := a.buildInterruptMessage(a.task)
-		return "[已中断] " + interruptMsg, reactSteps, a.task
+		task.Phase = "interrupted"
+		task.Status = "interrupted"
+		interruptMsg := a.buildInterruptMessage(task)
+		return "[已中断] " + interruptMsg, reactSteps, task
 	}
 
-	a.task.Phase = "generating"
+	task.Phase = "generating"
 	answer := a.llmGenerate(ctx, query, observations, memPrefix, histMsgs)
 	reactSteps = append(reactSteps, ReActStep{Type: StepFinalAnswer, Content: answer})
-	a.task.Result = answer
-	a.task.Status = "completed"
-	a.task.Phase = "done"
-	return answer, reactSteps, a.task
+	task.Result = answer
+	task.Status = "completed"
+	task.Phase = "done"
+	return answer, reactSteps, task
 }
 
 // runToolStream 流式版本的单工具调用：推送 tool_call 和 token 事件
@@ -1022,31 +1083,31 @@ func (a *UnifiedAgent) runReActStream(ctx context.Context, query string, ts map[
 		})
 	}
 
-	a.task = &TaskState{
+	task := &TaskState{
 		TaskID: fmt.Sprintf("task-%d", time.Now().UnixNano()),
 		Query:  query, Status: "running", Phase: "executing", Steps: taskSteps,
 	}
-	a.snapshots = nil
+	a.setTask(task)
 	if a.taskMem != nil {
 		a.taskMem.Reset()
 	}
-	a.saveSnapshot()
+	a.saveSnapshot(task)
 
-	for i := range a.task.Steps {
+	for i := range task.Steps {
 		if ctx.Err() != nil {
-			a.task.Phase = "interrupted"
-			a.task.Status = "interrupted"
-			a.task.InterruptedAt = i
-			a.task.Steps[i].Status = StepInterrupted
-			interruptMsg := a.buildInterruptMessage(a.task)
+			task.Phase = "interrupted"
+			task.Status = "interrupted"
+			task.InterruptedAt = i
+			task.Steps[i].Status = StepInterrupted
+			interruptMsg := a.buildInterruptMessage(task)
 			reactSteps = append(reactSteps, ReActStep{Type: StepObservation, Content: "[已中断] " + interruptMsg})
 			onEvent(NewStreamEvent("step", ReActStep{Type: StepObservation, Content: "[已中断] " + interruptMsg}))
-			a.saveSnapshot()
-			return "[已中断] " + interruptMsg, reactSteps, a.task
+			a.saveSnapshot(task)
+			return "[已中断] " + interruptMsg, reactSteps, task
 		}
 
-		ts2 := &a.task.Steps[i]
-		a.task.CurrentStep = i
+		ts2 := &task.Steps[i]
+		task.CurrentStep = i
 		ts2.Status = StepRunning
 
 		thoughtStep := ReActStep{Type: StepThought, Content: ts2.Name}
@@ -1062,7 +1123,7 @@ func (a *UnifiedAgent) runReActStream(ctx context.Context, query string, ts map[
 			obsStep := ReActStep{Type: StepObservation, Content: ts2.Error}
 			reactSteps = append(reactSteps, obsStep)
 			onEvent(NewStreamEvent("step", obsStep))
-			a.saveSnapshot()
+			a.saveSnapshot(task)
 			continue
 		}
 		if a.executeStepWithRetryTool(ctx, ts2, tool) {
@@ -1096,23 +1157,23 @@ func (a *UnifiedAgent) runReActStream(ctx context.Context, query string, ts map[
 				}
 			}
 		}
-		a.saveSnapshot()
+		a.saveSnapshot(task)
 	}
 
 	if ctx.Err() != nil {
-		a.task.Phase = "interrupted"
-		a.task.Status = "interrupted"
-		interruptMsg := a.buildInterruptMessage(a.task)
-		return "[已中断] " + interruptMsg, reactSteps, a.task
+		task.Phase = "interrupted"
+		task.Status = "interrupted"
+		interruptMsg := a.buildInterruptMessage(task)
+		return "[已中断] " + interruptMsg, reactSteps, task
 	}
 
-	a.task.Phase = "generating"
+	task.Phase = "generating"
 	answer := a.llmGenerateStream(ctx, query, observations, memPrefix, histMsgs, onEvent)
 	reactSteps = append(reactSteps, ReActStep{Type: StepFinalAnswer, Content: answer})
-	a.task.Result = answer
-	a.task.Status = "completed"
-	a.task.Phase = "done"
-	return answer, reactSteps, a.task
+	task.Result = answer
+	task.Status = "completed"
+	task.Phase = "done"
+	return answer, reactSteps, task
 }
 
 // llmGenerateStream 流式版本的 Generator LLM，逐 token 回调
@@ -1449,37 +1510,27 @@ func (a *UnifiedAgent) executeStepWithRetryTool(ctx context.Context, step *TaskS
 	return false
 }
 
-// executeStepWithRetry 带重试的步骤执行，失败时按配置延迟后重试
-func (a *UnifiedAgent) executeStepWithRetry(step *TaskStep) bool {
-	tool, ok := a.tools[step.ToolName]
-	if !ok {
-		return false
-	}
-	params := make(map[string]interface{}, len(step.Params))
-	for k, v := range step.Params {
-		params[k] = v
-	}
-	for attempt := 0; attempt < a.cfg.MaxRetries; attempt++ {
-		result, err := tool.Execute(params)
-		if err == nil {
-			step.Result = result
-			return true
-		}
-		step.RetryCount = attempt + 1
-		step.Error = err.Error()
-		time.Sleep(time.Duration(a.cfg.RetryDelayMs) * time.Millisecond)
-	}
-	return false
-}
-
 // saveSnapshot 对当前 TaskState 做深拷贝快照并持久化到 PG
-func (a *UnifiedAgent) saveSnapshot() {
+//
+// 接受显式 task 参数（不再读 a.task），以支持多请求并发：每个请求把
+// 自己 ReAct 循环的 task 传进来，互不影响。a.snapshots 仍为全局历史，
+// 通过 a.mu 串行化 append。
+func (a *UnifiedAgent) saveSnapshot(task *TaskState) {
+	if task == nil {
+		return
+	}
 	var stateCopy TaskState
-	data, _ := json.Marshal(a.task)
-	json.Unmarshal(data, &stateCopy)
+	data, _ := json.Marshal(task)
+	if err := json.Unmarshal(data, &stateCopy); err != nil {
+		// 不应该发生（自序列化），但避免吃掉错误
+		log.Printf("⚠️  saveSnapshot 反序列化失败: %v", err)
+		return
+	}
 	snap := Snapshot{State: stateCopy, Timestamp: time.Now().Format("15:04:05")}
+	a.mu.Lock()
 	a.snapshots = append(a.snapshots, snap)
-	a.inf.SaveSnapshot(a.task.TaskID, data)
+	a.mu.Unlock()
+	a.inf.SaveSnapshot(task.TaskID, data)
 }
 
 // ─────────────────────────────── Stage 5：Memory（基础层，注入所有模式）────────
@@ -1490,7 +1541,11 @@ func (a *UnifiedAgent) saveSnapshot() {
 // fillParamsFromPreference 用用户偏好自动补全工具调用参数中缺失的值
 // 例如：偏好中有 "城市:北京"，则当工具参数含 city 但为空时自动填入
 func (a *UnifiedAgent) fillParamsFromPreference(tc *tools.CallResult) {
-	if tc == nil || len(a.pref.Data) == 0 {
+	if tc == nil {
+		return
+	}
+	prefs := a.pref.Snapshot() // 一次性快照，下方可无锁访问
+	if len(prefs) == 0 {
 		return
 	}
 	// 偏好 key → 工具参数名的映射
@@ -1502,7 +1557,7 @@ func (a *UnifiedAgent) fillParamsFromPreference(tc *tools.CallResult) {
 		"国家": {"country", "nation"},
 	}
 	for prefKey, paramNames := range prefToParam {
-		prefVal, ok := a.pref.Data[prefKey]
+		prefVal, ok := prefs[prefKey]
 		if !ok || prefVal == "" {
 			continue
 		}

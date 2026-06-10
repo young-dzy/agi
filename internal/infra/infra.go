@@ -3,7 +3,7 @@
 package infra
 
 import (
-	"agi-ai
+	"agi-ai-assitant/config"
 	"bytes"
 	"context"
 	"database/sql"

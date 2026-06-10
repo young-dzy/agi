@@ -13,7 +13,9 @@ package memory
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,7 +29,10 @@ type ConversationMessage struct {
 }
 
 // ShortTerm 维护最近 MaxTurns 轮的对话上下文
+//
+// 并发：所有公共方法持锁。直接读 .Messages 字段（旧代码 / JSON 序列化）请用 Snapshot()。
 type ShortTerm struct {
+	mu       sync.RWMutex
 	Messages []ConversationMessage `json:"messages"`
 	MaxTurns int                   `json:"max_turns"`
 }
@@ -39,6 +44,8 @@ func NewShortTerm(maxTurns int) *ShortTerm {
 
 // Add 追加一条消息，超出窗口时自动丢弃最早记录
 func (m *ShortTerm) Add(role, content string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.Messages = append(m.Messages, ConversationMessage{
 		Role:      role,
 		Content:   content,
@@ -48,6 +55,22 @@ func (m *ShortTerm) Add(role, content string) {
 	if len(m.Messages) > max {
 		m.Messages = m.Messages[len(m.Messages)-max:]
 	}
+}
+
+// Snapshot 返回当前 Messages 的副本（持读锁）
+func (m *ShortTerm) Snapshot() []ConversationMessage {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cp := make([]ConversationMessage, len(m.Messages))
+	copy(cp, m.Messages)
+	return cp
+}
+
+// Count 返回当前消息数（持读锁）
+func (m *ShortTerm) Count() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.Messages)
 }
 
 // ─────────────────────────────── 长期记忆 ────────────────────────────────
@@ -108,7 +131,12 @@ type ConsolidationResult struct {
 }
 
 // LongTerm 支持语义向量召回（embedding 优先）或 TF 词袋降级
+//
+// 并发：所有公共方法都通过内置 sync.RWMutex 串行化。读路径（Recall*/FilterByCategory/
+// Snapshot/Count）使用 RLock，可以并发；写路径（Store*/Consolidate/StoreItem/SyncLastItemPGID）
+// 使用 Lock。直接访问 .Items 字段（旧代码 / JSON 序列化）请改用 Snapshot()。
 type LongTerm struct {
+	mu               sync.RWMutex
 	Items            []Item
 	vocabID          map[string]int
 	vocab            []string
@@ -124,7 +152,57 @@ func NewLongTerm() *LongTerm {
 
 // SetConsolidationConfig 设置合并配置
 func (m *LongTerm) SetConsolidationConfig(cfg *ConsolidationConfig) {
+	m.mu.Lock()
 	m.consolidationCfg = cfg
+	m.mu.Unlock()
+}
+
+// Snapshot 返回 Items 的只读副本，调用方可安全遍历不被并发写入打断
+func (m *LongTerm) Snapshot() []Item {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cp := make([]Item, len(m.Items))
+	copy(cp, m.Items)
+	return cp
+}
+
+// Count 返回当前条目数（持锁读）
+func (m *LongTerm) Count() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.Items)
+}
+
+// LastID 返回最后一条记忆的 ID；空时返回 -1
+func (m *LongTerm) LastID() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.Items) == 0 {
+		return -1
+	}
+	return m.Items[len(m.Items)-1].ID
+}
+
+// LastItem 返回最后一条记忆的副本和 ok 标记
+func (m *LongTerm) LastItem() (Item, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.Items) == 0 {
+		return Item{}, false
+	}
+	return m.Items[len(m.Items)-1], true
+}
+
+// FindByID 按 ID 查找记忆，返回副本和 ok 标记（持读锁）
+func (m *LongTerm) FindByID(id int) (Item, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, it := range m.Items {
+		if it.ID == id {
+			return it, true
+		}
+	}
+	return Item{}, false
 }
 
 func (m *LongTerm) buildVocab(text string) {
@@ -156,6 +234,8 @@ func (m *LongTerm) Store(content string, importance float64, embedding []float64
 // 用于 Schema-driven 槽位装配过滤
 func (m *LongTerm) StoreClassified(content string, importance float64, embedding []float64,
 	category string, tags []string, slotHint string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	// 去重检测：与已有条目相似度过高时跳过，但更新已有条目的访问时间和重要性
 	if m.consolidationCfg != nil && len(m.Items) > 0 && len(embedding) > 0 {
 		for i := range m.Items {
@@ -182,9 +262,6 @@ func (m *LongTerm) StoreClassified(content string, importance float64, embedding
 		}
 	}
 
-	for _, item := range m.Items {
-		m.buildVocab(item.Content)
-	}
 	m.buildVocab(content)
 	now := time.Now()
 	if category == "" {
@@ -222,6 +299,8 @@ func mergeTags(a, b []string) []string {
 
 // StoreItem 直接插入已有 Item（用于从 DB 恢复数据）
 func (m *LongTerm) StoreItem(item Item) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.buildVocab(item.Content)
 	if item.ID >= m.nextID {
 		m.nextID = item.ID + 1
@@ -238,6 +317,8 @@ func (m *LongTerm) StoreItem(item Item) {
 // SyncLastItemPGID 将最后一条记忆的 ID 同步为 PG 自增 ID
 // 用于解决内存 ID 与 PG ID 不一致的问题
 func (m *LongTerm) SyncLastItemPGID(pgID int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if len(m.Items) > 0 && pgID > 0 {
 		m.Items[len(m.Items)-1].ID = pgID
 		if pgID >= m.nextID {
@@ -248,6 +329,8 @@ func (m *LongTerm) SyncLastItemPGID(pgID int) {
 
 // NeedConsolidation 检查是否需要触发记忆合并
 func (m *LongTerm) NeedConsolidation() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.consolidationCfg != nil &&
 		m.consolidationCfg.TriggerInterval > 0 &&
 		m.storeCount >= m.consolidationCfg.TriggerInterval
@@ -267,6 +350,10 @@ func (m *LongTerm) Recall(query string, topK int, queryEmbedding []float64) []It
 //   - filter.MinScore 控制综合分阈值（默认 0.4）
 //   - filter.TopK 控制返回数量（0 表示不截断）
 func (m *LongTerm) RecallByFilter(query string, queryEmbedding []float64, filter RecallFilter) []Item {
+	// 写路径：召回过程中会更新 LastAccessed + 在 TF 兜底时增量 buildVocab
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if len(m.Items) == 0 {
 		return nil
 	}
@@ -275,6 +362,12 @@ func (m *LongTerm) RecallByFilter(query string, queryEmbedding []float64, filter
 		threshold = 0.4
 	}
 	now := time.Now()
+
+	// 仅在确实走 TF 兜底时（query 没 embedding 或维度不匹配）才需要扩词表
+	useTF := len(queryEmbedding) == 0
+	if useTF {
+		m.buildVocab(query)
+	}
 
 	type scored struct {
 		item Item
@@ -298,10 +391,9 @@ func (m *LongTerm) RecallByFilter(query string, queryEmbedding []float64, filter
 		}
 
 		var sim float64
-		if len(queryEmbedding) > 0 && len(m.Items[i].Embedding) == len(queryEmbedding) {
+		if !useTF && len(m.Items[i].Embedding) == len(queryEmbedding) {
 			sim = cosine(queryEmbedding, m.Items[i].Embedding)
 		} else {
-			m.buildVocab(query)
 			qv := m.textToVector(query)
 			iv := m.textToVector(m.Items[i].Content)
 			if len(qv) < len(iv) {
@@ -320,13 +412,7 @@ func (m *LongTerm) RecallByFilter(query string, queryEmbedding []float64, filter
 	if len(items) == 0 {
 		return nil
 	}
-	for i := 0; i < len(items); i++ {
-		for j := i + 1; j < len(items); j++ {
-			if items[j].s > items[i].s {
-				items[i], items[j] = items[j], items[i]
-			}
-		}
-	}
+	sort.Slice(items, func(i, j int) bool { return items[i].s > items[j].s })
 	topK := filter.TopK
 	if topK > 0 && topK < len(items) {
 		items = items[:topK]
@@ -362,6 +448,8 @@ func containsAllTags(itemTags, required []string) bool {
 // FilterByCategory 直接返回属于指定 category 的全部条目（不做语义召回）
 // 用于 Profile 等结构化槽位的稳定枚举
 func (m *LongTerm) FilterByCategory(categories []string, limit int) []Item {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if len(m.Items) == 0 || len(categories) == 0 {
 		return nil
 	}
@@ -380,6 +468,8 @@ func (m *LongTerm) FilterByCategory(categories []string, limit int) []Item {
 // Consolidate 执行记忆合并：衰减 → 去重+合并 → 过期淘汰
 // 返回合并结果，调用方需根据结果同步 PG
 func (m *LongTerm) Consolidate() ConsolidationResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	result := ConsolidationResult{}
 	if m.consolidationCfg == nil || len(m.Items) <= 1 {
 		return result
@@ -525,7 +615,10 @@ func (m *LongTerm) rebuildVocab() {
 // ─────────────────────────────── 用户偏好 ────────────────────────────────
 
 // Preference 以键值对形式存储用户偏好信息
+//
+// 并发：所有公共方法持锁。直接读 .Data 字段（旧代码 / JSON 序列化）请用 Snapshot()。
 type Preference struct {
+	mu   sync.RWMutex
 	Data map[string]string `json:"data"`
 }
 
@@ -536,18 +629,42 @@ func NewPreference() *Preference {
 
 // Save 保存单条偏好
 func (p *Preference) Save(key, value string) {
-	if key != "" && value != "" {
-		p.Data[key] = value
+	if key == "" || value == "" {
+		return
 	}
+	p.mu.Lock()
+	p.Data[key] = value
+	p.mu.Unlock()
 }
 
 // SaveBatch 批量保存偏好（从 LLM 提取结果）
 func (p *Preference) SaveBatch(kvs map[string]string) {
+	p.mu.Lock()
 	for k, v := range kvs {
 		if k != "" && v != "" {
 			p.Data[k] = v
 		}
 	}
+	p.mu.Unlock()
+}
+
+// Get 安全读取单条偏好
+func (p *Preference) Get(key string) (string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	v, ok := p.Data[key]
+	return v, ok
+}
+
+// Snapshot 返回偏好数据的浅拷贝（持读锁）
+func (p *Preference) Snapshot() map[string]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	cp := make(map[string]string, len(p.Data))
+	for k, v := range p.Data {
+		cp[k] = v
+	}
+	return cp
 }
 
 // ExtractAndSave 从对话文本中用规则提取偏好（兜底，LLM 提取优先）
@@ -556,7 +673,9 @@ func (p *Preference) ExtractAndSave(msg string) (key, value string, ok bool) {
 		parts := strings.SplitN(msg, "喜欢", 2)
 		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
 			key, value = "喜好", strings.TrimSpace(parts[1])
+			p.mu.Lock()
 			p.Data[key] = value
+			p.mu.Unlock()
 			return key, value, true
 		}
 	}
@@ -564,7 +683,9 @@ func (p *Preference) ExtractAndSave(msg string) (key, value string, ok bool) {
 		parts := strings.SplitN(msg, "爱", 2)
 		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
 			key, value = "喜好", strings.TrimSpace(parts[1])
+			p.mu.Lock()
 			p.Data[key] = value
+			p.mu.Unlock()
 			return key, value, true
 		}
 	}
@@ -572,7 +693,9 @@ func (p *Preference) ExtractAndSave(msg string) (key, value string, ok bool) {
 		parts := strings.SplitN(msg, "叫", 2)
 		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
 			key, value = "姓名", strings.TrimSpace(parts[1])
+			p.mu.Lock()
 			p.Data[key] = value
+			p.mu.Unlock()
 			return key, value, true
 		}
 	}
@@ -581,10 +704,12 @@ func (p *Preference) ExtractAndSave(msg string) (key, value string, ok bool) {
 
 // BuildContext 将偏好数据格式化为给 LLM 的上下文字符串
 func (p *Preference) BuildContext() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if len(p.Data) == 0 {
 		return ""
 	}
-	var items []string
+	items := make([]string, 0, len(p.Data))
 	for k, v := range p.Data {
 		items = append(items, fmt.Sprintf("%s: %s", k, v))
 	}

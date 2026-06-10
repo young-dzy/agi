@@ -2,12 +2,12 @@
 package handler
 
 import (
-	"context"
-	"encoding/json"
 	"agi-ai-assitant/config"
 	"agi-ai-assitant/internal/agent"
 	"agi-ai-assitant/internal/infra"
 	"agi-ai-assitant/internal/tools"
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"unicode/utf8"
@@ -15,9 +15,9 @@ import (
 
 // Server 聚合 Agent 和基础设施引用，挂载所有 HTTP 路由
 type Server struct {
-	agent  *agent.UnifiedAgent
-	infra  *infra.Infrastructure
-	cfg    *config.APIConfig
+	agent *agent.UnifiedAgent
+	infra *infra.Infrastructure
+	cfg   *config.APIConfig
 }
 
 // New 创建 Server 并注册所有路由到 mux
@@ -28,16 +28,16 @@ func New(a *agent.UnifiedAgent, inf *infra.Infrastructure, cfg *config.APIConfig
 }
 
 func (s *Server) registerRoutes() {
-	http.HandleFunc("/api/chat",       s.chat)
+	http.HandleFunc("/api/chat", s.chat)
 	http.HandleFunc("/api/chat/stream", s.chatStream)
 	http.HandleFunc("/api/chat/cancel", s.chatCancel)
-	http.HandleFunc("/api/upload",     s.upload)
+	http.HandleFunc("/api/upload", s.upload)
 	http.HandleFunc("/api/docs/delete", s.docsDelete)
-	http.HandleFunc("/api/memory",     s.memory)
-	http.HandleFunc("/api/tools",      s.toolsList)
-	http.HandleFunc("/api/tools/mcp",  s.registerMCPTool)
-	http.HandleFunc("/api/snapshots",  s.snapshots)
-	http.HandleFunc("/api/status",     s.status)
+	http.HandleFunc("/api/memory", s.memory)
+	http.HandleFunc("/api/tools", s.toolsList)
+	http.HandleFunc("/api/tools/mcp", s.registerMCPTool)
+	http.HandleFunc("/api/snapshots", s.snapshots)
+	http.HandleFunc("/api/status", s.status)
 }
 
 // ─────────────────────────────── 路由处理 ────────────────────────────────
@@ -182,18 +182,18 @@ func (s *Server) docsDelete(w http.ResponseWriter, r *http.Request) {
 // GET /api/memory — 查看三层记忆状态
 func (s *Server) memory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
-		"short_term": s.agent.ShortTerm().Messages,
-		"long_term":  s.agent.LongTerm().Items,
-		"preference": s.agent.Preferences().Data,
+		"short_term": s.agent.ShortTerm().Snapshot(),
+		"long_term":  s.agent.LongTerm().Snapshot(),
+		"preference": s.agent.Preferences().Snapshot(),
 	})
 }
 
 // GET /api/tools — 列出所有可用工具
 func (s *Server) toolsList(w http.ResponseWriter, r *http.Request) {
 	type toolInfo struct {
-		Name  string       `json:"name"`
-		Desc  string       `json:"description"`
-		IsMCP bool         `json:"is_mcp,omitempty"`
+		Name   string        `json:"name"`
+		Desc   string        `json:"description"`
+		IsMCP  bool          `json:"is_mcp,omitempty"`
 		Params []tools.Param `json:"params,omitempty"`
 	}
 	var list []toolInfo
@@ -261,9 +261,9 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"rag_loaded":       s.agent.RAG().Loaded,
 		"rag_mode":         s.agent.RAG().Mode(),
 		"rag_chunks":       chunkPreviews,
-		"short_term_count": len(s.agent.ShortTerm().Messages),
-		"long_term_count":  len(s.agent.LongTerm().Items),
-		"preferences":      s.agent.Preferences().Data,
+		"short_term_count": s.agent.ShortTerm().Count(),
+		"long_term_count":  s.agent.LongTerm().Count(),
+		"preferences":      s.agent.Preferences().Snapshot(),
 		"tools_count":      len(s.agent.Tools()),
 		"llm_model":        s.cfg.LLMModel,
 		"embedding_model":  s.cfg.EmbeddingModel,

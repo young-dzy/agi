@@ -5,7 +5,8 @@ import (
 	"agi-ai-assitant/config"
 	"agi-ai-assitant/internal/graph"
 	"agi-ai-assitant/internal/infra"
-	"crypto/sha2
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sort"

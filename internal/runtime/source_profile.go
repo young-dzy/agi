@@ -30,18 +30,22 @@ func (s *ProfileSource) Supports(kind SlotKind) bool { return kind == SlotProfil
 func (s *ProfileSource) Fetch(ctx context.Context, slot Slot, q Query) ([]ContextItem, error) {
 	var items []ContextItem
 
-	if s.pref != nil && len(s.pref.Data) > 0 {
-		keys := make([]string, 0, len(s.pref.Data))
-		for k := range s.pref.Data {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys) // 稳定顺序，避免每轮 prompt 抖动
-		for _, k := range keys {
-			items = append(items, ContextItem{
-				Text:   fmt.Sprintf("%s: %s", k, s.pref.Data[k]),
-				Score:  1.0, // 偏好是确定性事实
-				Source: s.ID(),
-			})
+	if s.pref != nil {
+		// 拿一次性快照，避免遍历期间被并发写入打断
+		data := s.pref.Snapshot()
+		if len(data) > 0 {
+			keys := make([]string, 0, len(data))
+			for k := range data {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys) // 稳定顺序，避免每轮 prompt 抖动
+			for _, k := range keys {
+				items = append(items, ContextItem{
+					Text:   fmt.Sprintf("%s: %s", k, data[k]),
+					Score:  1.0, // 偏好是确定性事实
+					Source: s.ID(),
+				})
+			}
 		}
 	}
 

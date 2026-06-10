@@ -12,20 +12,22 @@ package agent
 import (
 	"agi-ai-assitant/config"
 	"agi-ai-assitant/internal/graph"
-	"agi-ai-assitant/internal/infra"
 	"agi-ai-assitant/internal/llm"
 	"agi-ai-assitant/internal/memory"
+	"agi-ai-assitant/internal/promptctx"
 	"agi-ai-assitant/internal/rag"
-	"agi-ai-assitant/internal/runtime"
+	"agi-ai-assitant/internal/repo/chathistory"
+	"agi-ai-assitant/internal/repo/eventbus"
+	"agi-ai-assitant/internal/repo/longterm"
+	"agi-ai-assitant/internal/repo/preference"
+	"agi-ai-assitant/internal/repo/ragchunk"
+	"agi-ai-assitant/internal/repo/snapshot"
 	"agi-ai-assitant/internal/sandbox"
 	"agi-ai-assitant/internal/tools"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -138,12 +140,27 @@ type UnifiedAgent struct {
 	pref     *memory.Preference
 	sandbox  *sandbox.Sandbox
 	kg       *graph.KGStore // 知识图谱（RAG + 记忆图共享）
-	inf      *infra.Infrastructure
+
+	// 数据访问层（每个 domain 用各自的 repo 接口）
+	chatRepo     chathistory.Repo
+	prefRepo     preference.Repo
+	snapRepo     snapshot.Repo
+	ltmRepo      longterm.Repo
+	ragChunkRepo ragchunk.Repo
+	events       eventbus.Publisher
+
+	// infraStatus 是 platform 层连接健康状态的快照（用于 status 端点）
+	// key: "milvus" | "pg" | "elasticsearch" | "kafka" | "neo4j"
+	// value: "connected" | "disconnected"
+	infraStatus map[string]string
+
+	// RAG 维度（启动期 ragchunk repo 初始化用）
+	ragMilvusDim int
 
 	// Schema-driven Runtime Context Assembly
-	assembler   *runtime.ContextAssembler
-	taskMem     *runtime.TaskMemBuffer
-	toolTracker *runtime.ToolStateTracker
+	assembler   *promptctx.ContextAssembler
+	taskMem     *promptctx.TaskMemBuffer
+	toolTracker *promptctx.ToolStateTracker
 
 	// 工具集：可被 RegisterTool（MCP 热插）并发写入，被 ReAct/Decide 并发读取。
 	// Go map 并发读写会直接 panic，必须串行化。toolsMu 独立于 mu 以避免锁粒度过大。
@@ -163,21 +180,39 @@ type UnifiedAgent struct {
 	nextCancelID int64
 }
 
+// Deps 是 UnifiedAgent 的依赖注入容器，由 main.go 在启动期组装。
+type Deps struct {
+	ChatRepo     chathistory.Repo
+	PrefRepo     preference.Repo
+	SnapRepo     snapshot.Repo
+	LTMRepo      longterm.Repo
+	RAGChunkRepo ragchunk.Repo
+	Events       eventbus.Publisher
+	// InfraStatus 平台层连接健康快照
+	InfraStatus map[string]string
+}
+
 // New 创建并初始化 UnifiedAgent
-func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
+func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
 	llmClient := llm.New(cfg)
-	ragEngine := rag.NewEngine(cfg, inf)
+	ragEngine := rag.NewEngine(cfg, deps.RAGChunkRepo, deps.Events)
 	ltm := memory.NewLongTerm()
 	a := &UnifiedAgent{
-		cfg:   cfg,
-		llm:   llmClient,
-		rag:   ragEngine,
-		tools: tools.DefaultTools(),
-		stm:   memory.NewShortTerm(cfg.ShortTermMaxTurns),
-		ltm:   ltm,
-		// graphMem 在 initKnowledgeGraph 中创建（需要 kg 先就绪）
-		pref: memory.NewPreference(),
-		inf:  inf,
+		cfg:          cfg,
+		llm:          llmClient,
+		rag:          ragEngine,
+		tools:        tools.DefaultTools(),
+		stm:          memory.NewShortTerm(cfg.ShortTermMaxTurns),
+		ltm:          ltm,
+		pref:         memory.NewPreference(),
+		chatRepo:     deps.ChatRepo,
+		prefRepo:     deps.PrefRepo,
+		snapRepo:     deps.SnapRepo,
+		ltmRepo:      deps.LTMRepo,
+		ragChunkRepo: deps.RAGChunkRepo,
+		events:       deps.Events,
+		infraStatus:  deps.InfraStatus,
+		ragMilvusDim: cfg.RAGMilvusDim,
 	}
 	// 配置长期记忆合并
 	a.ltm.SetConsolidationConfig(&memory.ConsolidationConfig{
@@ -215,7 +250,7 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	// 因此放在并发组之后单独执行。
 	var wg sync.WaitGroup
 	wg.Add(4)
-	go func() { defer wg.Done(); a.inf.InitRAGInfra(cfg.RAGMilvusDim) }()
+	go func() { defer wg.Done(); a.ragChunkRepo.Init(cfg.RAGMilvusDim) }()
 	go func() { defer wg.Done(); a.restoreFromDB() }()
 	go func() { defer wg.Done(); a.restoreRAGFromDB() }()
 	go func() { defer wg.Done(); a.initSandbox() }()
@@ -253,7 +288,7 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 			}
 			// 优先尝试 Tavily 真实搜索
 			if a.cfg.SearchAPIKey != "" {
-				if result, err := tavilySearch(q, a.cfg.SearchAPIKey, a.cfg.SearchAPIURL); err == nil {
+				if result, err := tools.TavilySearch(q, a.cfg.SearchAPIKey, a.cfg.SearchAPIURL); err == nil {
 					return result, nil
 				}
 			}
@@ -270,17 +305,17 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	a.initKnowledgeGraph()
 
 	// ── Schema-driven Runtime Context Assembly ──
-	a.taskMem = runtime.NewTaskMemBuffer(20)
-	a.toolTracker = runtime.NewToolStateTracker(10)
+	a.taskMem = promptctx.NewTaskMemBuffer(20)
+	a.toolTracker = promptctx.NewToolStateTracker(10)
 
-	reg := runtime.NewSourceRegistry()
-	reg.Register(runtime.NewProfileSource(a.pref, a.ltm))
-	reg.Register(runtime.NewPlannerSource(func() *runtime.PlannerSnapshot {
+	reg := promptctx.NewSourceRegistry()
+	reg.Register(promptctx.NewProfileSource(a.pref, a.ltm))
+	reg.Register(promptctx.NewPlannerSource(func() *promptctx.PlannerSnapshot {
 		t := a.currentTask() // 持锁读取，避免与 ReAct 循环并发写打架
 		if t == nil {
 			return nil
 		}
-		snap := &runtime.PlannerSnapshot{
+		snap := &promptctx.PlannerSnapshot{
 			TaskID:        t.TaskID,
 			Query:         t.Query,
 			Status:        t.Status,
@@ -296,20 +331,20 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 		}
 		return snap
 	}))
-	reg.Register(runtime.NewTaskMemSource(a.taskMem))
-	reg.Register(runtime.NewToolStateSource(
+	reg.Register(promptctx.NewTaskMemSource(a.taskMem))
+	reg.Register(promptctx.NewToolStateSource(
 		// 持读锁拷贝供 ToolStateSource 装配 prompt：每次调用都拿一致的工具集快照
 		a.toolsSnapshot,
 		a.toolTracker,
 	))
-	reg.Register(runtime.NewConstraintsSource(sandbox.PolicySnapshot()))
+	reg.Register(promptctx.NewConstraintsSource(sandbox.PolicySnapshot()))
 	// RecallSource 优先用图记忆；graphMem 在 initKnowledgeGraph 中就绪
 	if a.graphMem != nil {
-		reg.Register(runtime.NewRecallSource(a.graphMem))
+		reg.Register(promptctx.NewRecallSource(a.graphMem))
 	} else {
-		reg.Register(runtime.NewRecallSource(a.ltm))
+		reg.Register(promptctx.NewRecallSource(a.ltm))
 	}
-	a.assembler = runtime.NewAssembler(runtime.DefaultSchemas(), reg)
+	a.assembler = promptctx.NewAssembler(promptctx.DefaultSchemas(), reg)
 
 	return a
 }
@@ -364,63 +399,6 @@ func (a *UnifiedAgent) Snapshots() []Snapshot {
 	return cp
 }
 
-// ─────────────────────────────── 内部并发 helper ──────────────────────────────
-
-// registerCancel 把本次请求的 cancel 函数挂到 agent 上，返回反注册的函数。
-// 多请求并发时每个请求拿到独立 token；Cancel() 触发全部 in-flight 中断。
-func (a *UnifiedAgent) registerCancel(cancel context.CancelFunc) func() {
-	a.mu.Lock()
-	if a.cancelFns == nil {
-		a.cancelFns = make(map[int64]context.CancelFunc)
-	}
-	a.nextCancelID++
-	id := a.nextCancelID
-	a.cancelFns[id] = cancel
-	a.mu.Unlock()
-	return func() {
-		a.mu.Lock()
-		delete(a.cancelFns, id)
-		a.mu.Unlock()
-		cancel() // 幂等：context.CancelFunc 自带 once 保护
-	}
-}
-
-// currentTask 持锁返回当前 task 引用（可能为 nil）
-func (a *UnifiedAgent) currentTask() *TaskState {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.task
-}
-
-// setTask 持锁设置当前 task，并清空 snapshots（新任务开始）
-func (a *UnifiedAgent) setTask(t *TaskState) {
-	a.mu.Lock()
-	a.task = t
-	a.snapshots = nil
-	a.mu.Unlock()
-}
-
-// goSafe 启动一个带 panic recover 的后台 goroutine。
-//
-// agent 有大量 fire-and-forget 异步任务（偏好提取、记忆挖掘、记忆合并、
-// Neo4j 异步写、KG 索引等）。任意一处 panic（比如 Neo4j 突然断连后某处空指针）
-// 在裸 go func() 下会让整个进程崩溃，影响其他正常请求。
-//
-// 这个 helper 给所有异步任务统一兜底：
-//   - 捕获 panic 并打印 stack trace（便于事后排查）
-//   - name 标记任务来源，方便日志检索
-//   - 不影响业务返回值（任务失败时静默丢弃）
-func (a *UnifiedAgent) goSafe(name string, fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("⚠️  goroutine panic [%s]: %v\n%s", name, r, debug.Stack())
-			}
-		}()
-		fn()
-	}()
-}
-
 // ─────────────────────────────── 主处理流程 ──────────────────────────────
 
 // ChatOptions 控制本次对话的路由行为
@@ -464,18 +442,6 @@ func (a *UnifiedAgent) ProcessStream(ctx context.Context, query string, opts Cha
 }
 
 // Cancel 取消所有当前正在执行的任务（每个 in-flight 请求都会收到取消信号）
-func (a *UnifiedAgent) Cancel() {
-	a.mu.Lock()
-	fns := make([]context.CancelFunc, 0, len(a.cancelFns))
-	for _, fn := range a.cancelFns {
-		fns = append(fns, fn)
-	}
-	a.mu.Unlock()
-	for _, fn := range fns {
-		fn()
-	}
-}
-
 func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptions) *Response {
 	resp := &Response{Query: query, Mode: "chat"}
 
@@ -483,7 +449,7 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 	a.stm.Add("user", query)
 
 	// 持久化用户消息到 PG
-	a.inf.SaveChatHistory("user", query)
+	a.chatRepo.Save("user", query)
 
 	// 偏好提取：优先 LLM，降级规则
 	a.goSafe("process.preference-extract", func() {
@@ -491,12 +457,12 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 		if len(kvs) > 0 {
 			a.pref.SaveBatch(kvs)
 			for k, v := range kvs {
-				a.inf.SavePreference("default", k, v)
+				a.prefRepo.Save("default", k, v)
 				content := fmt.Sprintf("用户%s: %s", k, v)
 				emb, _ := a.llm.Embed(content)
 				if added, _ := a.graphMem.Store(content, 0.8, emb); added {
 					embJSON, _ := json.Marshal(emb)
-					pgID := a.inf.SaveLongTermItem(content, 0.8, embJSON)
+					pgID := a.ltmRepo.Save(content, 0.8, embJSON)
 					a.graphMem.SyncLastItemPGID(pgID)
 				}
 			}
@@ -574,7 +540,7 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 	}
 
 	a.stm.Add("assistant", resp.Answer)
-	a.inf.SaveChatHistory("assistant", resp.Answer)
+	a.chatRepo.Save("assistant", resp.Answer)
 
 	// 从 assistant 回答中提取可记忆信息
 	a.goSafe("process.memory-extract", func() { a.extractMemoryFromReply(resp.Answer) })
@@ -593,7 +559,7 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 	})
 
 	eventData, _ := json.Marshal(map[string]interface{}{"query": query, "mode": resp.Mode})
-	a.inf.PublishEvent("agent.chat", string(eventData))
+	a.events.Publish("agent.chat", string(eventData))
 
 	resp.ShortTermCount = a.stm.Count()
 	resp.LongTermCount = a.ltm.Count()
@@ -610,7 +576,7 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 	resp := &Response{Query: query, Mode: "chat"}
 
 	a.stm.Add("user", query)
-	a.inf.SaveChatHistory("user", query)
+	a.chatRepo.Save("user", query)
 
 	// 偏好提取（异步，与 process 一致）
 	a.goSafe("processStream.preference-extract", func() {
@@ -618,12 +584,12 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 		if len(kvs) > 0 {
 			a.pref.SaveBatch(kvs)
 			for k, v := range kvs {
-				a.inf.SavePreference("default", k, v)
+				a.prefRepo.Save("default", k, v)
 				content := fmt.Sprintf("用户%s: %s", k, v)
 				emb, _ := a.llm.Embed(content)
 				if added, _ := a.graphMem.Store(content, 0.8, emb); added {
 					embJSON, _ := json.Marshal(emb)
-					pgID := a.inf.SaveLongTermItem(content, 0.8, embJSON)
+					pgID := a.ltmRepo.Save(content, 0.8, embJSON)
 					a.graphMem.SyncLastItemPGID(pgID)
 				}
 			}
@@ -705,7 +671,7 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 	}
 
 	a.stm.Add("assistant", resp.Answer)
-	a.inf.SaveChatHistory("assistant", resp.Answer)
+	a.chatRepo.Save("assistant", resp.Answer)
 
 	a.goSafe("processStream.memory-extract", func() { a.extractMemoryFromReply(resp.Answer) })
 
@@ -722,7 +688,7 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 	})
 
 	eventData, _ := json.Marshal(map[string]interface{}{"query": query, "mode": resp.Mode})
-	a.inf.PublishEvent("agent.chat", string(eventData))
+	a.events.Publish("agent.chat", string(eventData))
 
 	resp.ShortTermCount = a.stm.Count()
 	resp.LongTermCount = a.ltm.Count()
@@ -741,7 +707,7 @@ func (a *UnifiedAgent) buildContextPrefix(ctx context.Context, query string, mod
 	if t := a.currentTask(); t != nil {
 		taskID = t.TaskID
 	}
-	rc := a.assembler.Assemble(ctx, runtime.Query{
+	rc := a.assembler.Assemble(ctx, promptctx.Query{
 		Text:      query,
 		Embedding: emb,
 		TaskID:    taskID,
@@ -789,101 +755,6 @@ func (a *UnifiedAgent) filterTools(names []string) map[string]tools.Tool {
 }
 
 // needReActFromTools — 只要工具集非空就走 ReAct，保证每次工具调用都有完整推理轨迹
-func (a *UnifiedAgent) needReActFromTools(query string, ts map[string]tools.Tool) bool {
-	return len(ts) > 0
-}
-
-// ─────────────────────────────── 路由判断 ────────────────────────────────
-
-func (a *UnifiedAgent) needTool(query string) bool {
-	q := strings.ToLower(query)
-	return strings.Contains(q, "几点") || strings.Contains(q, "时间") ||
-		strings.Contains(q, "天气") || strings.Contains(q, "查") ||
-		strings.Contains(q, "搜索") || strings.Contains(q, "是什么")
-}
-
-func (a *UnifiedAgent) needRAG(query string) bool {
-	return a.rag.Loaded && !a.needTool(query) && !a.needReAct(query)
-}
-
-// needReAct 当 query 涉及 2+ 个子需求时触发多步推理
-func (a *UnifiedAgent) needReAct(query string) bool {
-	q := strings.ToLower(query)
-	count := 0
-	if strings.Contains(q, "时间") || strings.Contains(q, "几点") {
-		count++
-	}
-	if strings.Contains(q, "天气") {
-		count++
-	}
-	if strings.Contains(q, "总结") || strings.Contains(q, "汇总") {
-		count++
-	}
-	if strings.Contains(q, "查") || strings.Contains(q, "搜索") {
-		count++
-	}
-	return count >= 2
-}
-
-// tavilySearch 调用 Tavily Search API，返回格式化的搜索结果摘要
-func tavilySearch(query, apiKey, apiURL string) (string, error) {
-	if apiURL == "" {
-		apiURL = "https://api.tavily.com/search"
-	}
-	body, _ := json.Marshal(map[string]interface{}{
-		"api_key":      apiKey,
-		"query":        query,
-		"search_depth": "basic",
-		"max_results":  5,
-	})
-	resp, err := http.Post(apiURL, "application/json", bytes.NewReader(body)) //nolint
-	if err != nil {
-		return "", fmt.Errorf("Tavily 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("Tavily 返回错误状态: %d", resp.StatusCode)
-	}
-	var result struct {
-		Answer  string `json:"answer"`
-		Results []struct {
-			Title   string `json:"title"`
-			URL     string `json:"url"`
-			Content string `json:"content"`
-		} `json:"results"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("解析 Tavily 响应失败: %w", err)
-	}
-	// 优先返回 Tavily 合成的 answer
-	if result.Answer != "" {
-		var sb strings.Builder
-		sb.WriteString(result.Answer)
-		if len(result.Results) > 0 {
-			sb.WriteString("\n\n**来源：**\n")
-			for i, r := range result.Results {
-				if i >= 3 {
-					break
-				}
-				sb.WriteString(fmt.Sprintf("- [%s](%s)\n", r.Title, r.URL))
-			}
-		}
-		return sb.String(), nil
-	}
-	// 无 answer 时拼接 top 结果摘要
-	if len(result.Results) == 0 {
-		return "", fmt.Errorf("Tavily 返回空结果")
-	}
-	var sb strings.Builder
-	for i, r := range result.Results {
-		if i >= 3 {
-			break
-		}
-		sb.WriteString(fmt.Sprintf("**%s**\n%s\n%s\n\n", r.Title, r.Content, r.URL))
-	}
-	return strings.TrimSpace(sb.String()), nil
-}
-
 // ─────────────────────────────── Stage 3：Tool Agent ─────────────────────
 
 func (a *UnifiedAgent) runToolFromSet(ctx context.Context, query string, ts map[string]tools.Tool, memPrefix string, histMsgs []llm.Message) (string, *tools.CallResult) {
@@ -905,7 +776,7 @@ func (a *UnifiedAgent) runToolFromSet(ctx context.Context, query string, ts map[
 			return "[已中断]", tc
 		}
 		if a.toolTracker != nil {
-			a.toolTracker.Record(runtime.ToolCallTrace{
+			a.toolTracker.Record(promptctx.ToolCallTrace{
 				ToolName: tc.ToolName, Success: false, Summary: err.Error(),
 			})
 		}
@@ -913,7 +784,7 @@ func (a *UnifiedAgent) runToolFromSet(ctx context.Context, query string, ts map[
 	}
 	tc.ToolResult = result
 	if a.toolTracker != nil {
-		a.toolTracker.Record(runtime.ToolCallTrace{
+		a.toolTracker.Record(promptctx.ToolCallTrace{
 			ToolName: tc.ToolName, Success: true, Summary: result,
 		})
 	}
@@ -1013,13 +884,13 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 			reactSteps = append(reactSteps, ReActStep{Type: StepObservation, Content: ts2.Result})
 			observations = append(observations, fmt.Sprintf("[%s] %s", ts2.ToolName, ts2.Result))
 			if a.taskMem != nil {
-				a.taskMem.Push(runtime.StepObservation{
+				a.taskMem.Push(promptctx.StepObservation{
 					StepID: ts2.ID, ToolName: ts2.ToolName,
 					Result: ts2.Result, Success: true,
 				})
 			}
 			if a.toolTracker != nil {
-				a.toolTracker.Record(runtime.ToolCallTrace{
+				a.toolTracker.Record(promptctx.ToolCallTrace{
 					ToolName: ts2.ToolName, Success: true, Summary: ts2.Result,
 				})
 			}
@@ -1031,13 +902,13 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 				ts2.Status = StepFailed
 				reactSteps = append(reactSteps, ReActStep{Type: StepObservation, Content: fmt.Sprintf("执行失败: %s", ts2.Error)})
 				if a.taskMem != nil {
-					a.taskMem.Push(runtime.StepObservation{
+					a.taskMem.Push(promptctx.StepObservation{
 						StepID: ts2.ID, ToolName: ts2.ToolName,
 						Error: ts2.Error, Success: false,
 					})
 				}
 				if a.toolTracker != nil {
-					a.toolTracker.Record(runtime.ToolCallTrace{
+					a.toolTracker.Record(promptctx.ToolCallTrace{
 						ToolName: ts2.ToolName, Success: false, Summary: ts2.Error,
 					})
 				}
@@ -1082,13 +953,13 @@ func (a *UnifiedAgent) runToolStream(ctx context.Context, query string, ts map[s
 			return "[已中断]", tc
 		}
 		if a.toolTracker != nil {
-			a.toolTracker.Record(runtime.ToolCallTrace{ToolName: tc.ToolName, Success: false, Summary: err.Error()})
+			a.toolTracker.Record(promptctx.ToolCallTrace{ToolName: tc.ToolName, Success: false, Summary: err.Error()})
 		}
 		return fmt.Sprintf("工具执行失败: %v", err), tc
 	}
 	tc.ToolResult = result
 	if a.toolTracker != nil {
-		a.toolTracker.Record(runtime.ToolCallTrace{ToolName: tc.ToolName, Success: true, Summary: result})
+		a.toolTracker.Record(promptctx.ToolCallTrace{ToolName: tc.ToolName, Success: true, Summary: result})
 	}
 
 	onEvent(NewStreamEvent("tool_call", map[string]interface{}{
@@ -1184,10 +1055,10 @@ func (a *UnifiedAgent) runReActStream(ctx context.Context, query string, ts map[
 			onEvent(NewStreamEvent("step", obsStep))
 			observations = append(observations, fmt.Sprintf("[%s] %s", ts2.ToolName, ts2.Result))
 			if a.taskMem != nil {
-				a.taskMem.Push(runtime.StepObservation{StepID: ts2.ID, ToolName: ts2.ToolName, Result: ts2.Result, Success: true})
+				a.taskMem.Push(promptctx.StepObservation{StepID: ts2.ID, ToolName: ts2.ToolName, Result: ts2.Result, Success: true})
 			}
 			if a.toolTracker != nil {
-				a.toolTracker.Record(runtime.ToolCallTrace{ToolName: ts2.ToolName, Success: true, Summary: ts2.Result})
+				a.toolTracker.Record(promptctx.ToolCallTrace{ToolName: ts2.ToolName, Success: true, Summary: ts2.Result})
 			}
 		} else {
 			if ctx.Err() != nil {
@@ -1201,10 +1072,10 @@ func (a *UnifiedAgent) runReActStream(ctx context.Context, query string, ts map[
 				reactSteps = append(reactSteps, obsStep)
 				onEvent(NewStreamEvent("step", obsStep))
 				if a.taskMem != nil {
-					a.taskMem.Push(runtime.StepObservation{StepID: ts2.ID, ToolName: ts2.ToolName, Error: ts2.Error, Success: false})
+					a.taskMem.Push(promptctx.StepObservation{StepID: ts2.ID, ToolName: ts2.ToolName, Error: ts2.Error, Success: false})
 				}
 				if a.toolTracker != nil {
-					a.toolTracker.Record(runtime.ToolCallTrace{ToolName: ts2.ToolName, Success: false, Summary: ts2.Error})
+					a.toolTracker.Record(promptctx.ToolCallTrace{ToolName: ts2.ToolName, Success: false, Summary: ts2.Error})
 				}
 			}
 		}
@@ -1292,168 +1163,6 @@ func truncateStr(s string, maxRunes int) string {
 		return s
 	}
 	return string(runes[:maxRunes]) + "…"
-}
-
-// ─────────────────────────── Planner LLM ─────────────────────────────────
-
-// planItem 是 Planner LLM 输出的单个工具调用计划
-type planItem struct {
-	Tool   string            `json:"tool"`
-	Params map[string]string `json:"params"`
-	Reason string            `json:"reason"`
-}
-
-// llmPlanSteps 调用 Planner LLM，从允许的工具集中智能选择需要调用的工具及参数。
-// 若 LLM 不可用或解析失败，降级为关键词规则。
-func (a *UnifiedAgent) llmPlanSteps(ctx context.Context, query string, ts map[string]tools.Tool, memPrefix string) []planItem {
-	if !a.cfg.IsRealLLM() {
-		return a.rulePlanItems(ctx, query, ts, memPrefix)
-	}
-
-	// 构造工具描述
-	var toolLines []string
-	for name, t := range ts {
-		var pDescs []string
-		for _, p := range t.Parameters {
-			req := ""
-			if p.Required {
-				req = "（必填）"
-			}
-			pDescs = append(pDescs, fmt.Sprintf("%s(%s)%s", p.Name, p.Type, req))
-		}
-		params := strings.Join(pDescs, ", ")
-		if params == "" {
-			params = "无参数"
-		}
-		toolLines = append(toolLines, fmt.Sprintf("- %s: %s [参数: %s]", name, t.Description, params))
-	}
-
-	planPrompt := fmt.Sprintf(`你是一个任务规划器。根据用户问题，从可用工具中选出真正需要调用的工具（不要为了用工具而用工具，按需选择）。
-
-用户问题：%s
-
-可用工具：
-%s
-
-请以 JSON 数组格式输出执行计划，格式如下：
-[{"tool":"工具名","params":{"参数名":"参数值"},"reason":"一句话说明为什么调用这个工具"}]
-
-如果无需工具直接回答，输出 []。只输出 JSON，不要其他内容。`,
-		query, strings.Join(toolLines, "\n"))
-
-	plannerBase := "你是一个精准的任务规划器，只在必要时才调用工具，不做无意义的调用。"
-	if memPrefix != "" {
-		plannerBase = memPrefix + "\n\n" + plannerBase + "\n注意：用户偏好可能影响工具参数选择（如城市、时区等），请在参数中体现。"
-	}
-	raw := a.llm.ChatContext(ctx, plannerBase,
-		[]llm.Message{{Role: "user", Content: planPrompt}})
-
-	if ctx.Err() != nil {
-		return a.rulePlanItems(ctx, query, ts, memPrefix)
-	}
-
-	// 清洗 LLM 输出（可能包含 markdown 代码块或特殊 function-call 标记）
-	raw = strings.TrimSpace(raw)
-	// 剥离模型输出的 <|FunctionCallBegin|>...<|FunctionCallEnd|> 包装
-	if idx := strings.Index(raw, "<|FunctionCallBegin|>"); idx >= 0 {
-		raw = raw[idx+len("<|FunctionCallBegin|>"):]
-		if end := strings.Index(raw, "<|FunctionCallEnd|>"); end >= 0 {
-			raw = raw[:end]
-		}
-	}
-	raw = strings.TrimPrefix(raw, "```json")
-	raw = strings.TrimPrefix(raw, "```")
-	raw = strings.TrimSuffix(raw, "```")
-	raw = strings.TrimSpace(raw)
-
-	// 尝试解析为 [{"tool":...,"params":...}] 格式
-	var items []planItem
-	if err := json.Unmarshal([]byte(raw), &items); err != nil {
-		// 降级：尝试解析为 [{"name":...,"parameters":...}] 格式（部分模型的 function-calling 格式）
-		var altItems []struct {
-			Name       string                 `json:"name"`
-			Parameters map[string]interface{} `json:"parameters"`
-		}
-		if altErr := json.Unmarshal([]byte(raw), &altItems); altErr == nil {
-			for _, ai := range altItems {
-				params := make(map[string]string, len(ai.Parameters))
-				for k, v := range ai.Parameters {
-					params[k] = fmt.Sprint(v)
-				}
-				items = append(items, planItem{Tool: ai.Name, Params: params, Reason: "LLM 规划调用"})
-			}
-		} else {
-			log.Printf("⚠️  Planner LLM 解析失败 (%v / %v)，降级到规则规划。原始输出: %s", err, altErr, raw)
-			return a.rulePlanItems(ctx, query, ts, memPrefix)
-		}
-	}
-
-	// 过滤：只保留工具集中实际存在的工具
-	var valid []planItem
-	for _, item := range items {
-		if _, ok := ts[item.Tool]; ok {
-			if item.Params == nil {
-				item.Params = map[string]string{}
-			}
-			valid = append(valid, item)
-		}
-	}
-	return valid
-}
-
-// rulePlanItems 关键词规则降级规划（无真实 LLM 时使用）
-func (a *UnifiedAgent) rulePlanItems(ctx context.Context, query string, ts map[string]tools.Tool, memPrefix string) []planItem {
-	q := strings.ToLower(query)
-	var items []planItem
-
-	if _, ok := ts["get_time"]; ok {
-		if strings.Contains(q, "时间") || strings.Contains(q, "几点") || strings.Contains(q, "现在") {
-			params := map[string]string{}
-			if strings.Contains(q, "东京") {
-				params["timezone"] = "Asia/Tokyo"
-			}
-			items = append(items, planItem{Tool: "get_time", Params: params, Reason: "查询当前时间"})
-		}
-	}
-	if _, ok := ts["get_weather"]; ok {
-		if strings.Contains(q, "天气") {
-			city := "北京"
-			for _, c := range []string{"东京", "北京", "上海", "广州", "深圳", "纽约", "伦敦"} {
-				if strings.Contains(q, c) {
-					city = c
-					break
-				}
-			}
-			items = append(items, planItem{Tool: "get_weather", Params: map[string]string{"city": city}, Reason: "查询" + city + "天气"})
-		}
-	}
-	if _, ok := ts["search_web"]; ok {
-		if strings.Contains(q, "搜索") || strings.Contains(q, "查询") || strings.Contains(q, "介绍") ||
-			strings.Contains(q, "是什么") || strings.Contains(q, "怎么") || strings.Contains(q, "如何") {
-			items = append(items, planItem{Tool: "search_web", Params: map[string]string{"query": query}, Reason: "搜索相关信息"})
-		}
-	}
-	if _, ok := ts["exec_command"]; ok {
-		if strings.Contains(q, "执行") || strings.Contains(q, "运行") || strings.Contains(q, "命令") ||
-			strings.Contains(q, "终端") || strings.Contains(q, "lscpu") || strings.Contains(q, "cpu") ||
-			strings.Contains(q, "磁盘") || strings.Contains(q, "内存") || strings.Contains(q, "系统信息") {
-			cmd := extractShellCommand(query)
-			items = append(items, planItem{Tool: "exec_command", Params: map[string]string{"command": cmd}, Reason: "执行终端命令"})
-		}
-	}
-	if _, ok := ts["rag_search"]; ok {
-		items = append(items, planItem{Tool: "rag_search", Params: map[string]string{"query": query}, Reason: "检索个人知识库"})
-	}
-	// MCP / 自定义工具
-	builtins := map[string]bool{"get_time": true, "get_weather": true, "search_web": true, "rag_search": true, "exec_command": true}
-	for name, t := range ts {
-		if builtins[name] {
-			continue
-		}
-		params := a.extractParamsForTool(ctx, query, t)
-		items = append(items, planItem{Tool: name, Params: params, Reason: "调用工具 " + name})
-	}
-	return items
 }
 
 // ─────────────────────────── Generator LLM ───────────────────────────────
@@ -1581,13 +1290,13 @@ func (a *UnifiedAgent) saveSnapshot(task *TaskState) {
 	a.mu.Lock()
 	a.snapshots = append(a.snapshots, snap)
 	a.mu.Unlock()
-	a.inf.SaveSnapshot(task.TaskID, data)
+	a.snapRepo.Save(task.TaskID, data)
 }
 
 // ─────────────────────────────── Stage 5：Memory（基础层，注入所有模式）────────
 //
 // 旧的 buildMemorySystemPrefix / buildMemorySystemPrefixWithCtx 已删除，
-// 由 buildContextPrefix → runtime.ContextAssembler 取代（Schema-driven 装配）。
+// 由 buildContextPrefix → promptctx.ContextAssembler 取代（Schema-driven 装配）。
 
 // fillParamsFromPreference 用用户偏好自动补全工具调用参数中缺失的值
 // 例如：偏好中有 "城市:北京"，则当工具参数含 city 但为空时自动填入
@@ -1618,264 +1327,4 @@ func (a *UnifiedAgent) fillParamsFromPreference(tc *tools.CallResult) {
 			}
 		}
 	}
-}
-
-// extractMemoryFromReply 从 assistant 回复中提取值得记忆的信息并存入长期记忆。
-// 写入前用规则层 + LLM 兜底对内容分类（category/tags/slot_hint），
-// 使 Schema-driven 装配机制能按槽位过滤召回。
-func (a *UnifiedAgent) extractMemoryFromReply(answer string) {
-	if answer == "" || !a.cfg.IsRealLLM() {
-		return
-	}
-	// 用 LLM 提取 k-v 事实
-	prompt := `从下面这段AI回复中，提取值得长期记住的客观事实或用户偏好信息。
-只提取明确的、非临时性的信息，忽略对话上下文和临时细节。
-输出 JSON 对象（key为中文名称，value为具体值），如果没有值得记忆的信息则输出 {}。
-只输出 JSON，不要有其他内容。
-
-回复：` + answer
-	raw := a.llm.Chat("", []llm.Message{{Role: "user", Content: prompt}})
-	raw = strings.TrimSpace(raw)
-	raw = strings.TrimPrefix(raw, "```json")
-	raw = strings.TrimPrefix(raw, "```")
-	raw = strings.TrimSuffix(raw, "```")
-	raw = strings.TrimSpace(raw)
-	var kvs map[string]string
-	if err := json.Unmarshal([]byte(raw), &kvs); err != nil || len(kvs) == 0 {
-		return
-	}
-	for k, v := range kvs {
-		if k == "" || v == "" {
-			continue
-		}
-		a.pref.Save(k, v)
-		a.inf.SavePreference("default", k, v)
-		content := fmt.Sprintf("用户%s: %s", k, v)
-
-		// ── 分类管线：规则优先，LLM 兜底 ──
-		category, tags, slotHint := classifyMemoryContent(k, v)
-		if category == "" {
-			category, tags, slotHint = a.llmClassifyMemory(content)
-		}
-
-		emb, _ := a.llm.Embed(content)
-		if a.graphMem != nil {
-			if added, _ := a.graphMem.StoreClassified(content, 0.7, emb, category, tags, slotHint); added {
-				embJSON, _ := json.Marshal(emb)
-				pgID := a.inf.SaveLongTermItemClassified(content, 0.7, embJSON, category, tags, slotHint)
-				a.graphMem.SyncLastItemPGID(pgID)
-			}
-		} else if a.ltm.StoreClassified(content, 0.7, emb, category, tags, slotHint) {
-			embJSON, _ := json.Marshal(emb)
-			pgID := a.inf.SaveLongTermItemClassified(content, 0.7, embJSON, category, tags, slotHint)
-			a.ltm.SyncLastItemPGID(pgID)
-		}
-		log.Printf("🧠 从回复中提取记忆：%s = %s（类别=%s）", k, v, category)
-	}
-}
-
-// classifyMemoryContent 用正则规则快速分类；返回空字符串表示规则未命中，由 LLM 兜底
-func classifyMemoryContent(key, value string) (category string, tags []string, slotHint string) {
-	combined := key + value
-	switch {
-	case containsAny(combined, "叫", "名字", "姓名", "是我", "我是"):
-		return "identity", []string{"name"}, "profile"
-	case containsAny(combined, "喜欢", "偏好", "习惯", "爱好", "讨厌", "不喜欢"):
-		return "preference", []string{"preference"}, "profile"
-	case containsAny(combined, "工具", "失败", "错误", "报错", "异常"):
-		return "tool_failure", []string{"tool", "error"}, "tool_state"
-	case containsAny(combined, "禁止", "不要", "不能", "必须", "强制"):
-		return "policy", []string{"constraint"}, "constraints"
-	default:
-		return "", nil, ""
-	}
-}
-
-// containsAny 检查 s 是否包含 subs 中任意子串
-func containsAny(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
-}
-
-// llmClassifyMemory 调用一次 LLM 对记忆内容做 JSON 分类，
-// 返回 category / tags / slotHint；失败时回退到 "general"
-func (a *UnifiedAgent) llmClassifyMemory(content string) (category string, tags []string, slotHint string) {
-	if !a.cfg.IsRealLLM() {
-		return "general", nil, ""
-	}
-	prompt := `请对以下记忆内容进行分类，只输出 JSON，格式如下：
-{"category":"identity|preference|fact|episodic|tool_failure|policy|general","tags":["tag1"],"slot_hint":"profile|planner|task_memory|tool_state|constraints|recall_memory"}
-
-记忆内容：` + content
-	raw := a.llm.Chat("", []llm.Message{{Role: "user", Content: prompt}})
-	raw = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(raw), "```json"), "```"))
-	var result struct {
-		Category string   `json:"category"`
-		Tags     []string `json:"tags"`
-		SlotHint string   `json:"slot_hint"`
-	}
-	if err := json.Unmarshal([]byte(raw), &result); err != nil || result.Category == "" {
-		return "general", nil, ""
-	}
-	return result.Category, result.Tags, result.SlotHint
-}
-
-// syncConsolidationToDB 将记忆合并结果同步到 PostgreSQL
-func (a *UnifiedAgent) syncConsolidationToDB(result memory.ConsolidationResult) {
-	if len(result.DeleteFromDB) > 0 {
-		a.inf.DeleteLongTermItems(result.DeleteFromDB)
-		log.Printf("🧹 记忆合并：删除 %d 条（去重=%d, 合并=%d, 过期=%d）",
-			result.Deduped+result.Merged+result.Expired, result.Deduped, result.Merged, result.Expired)
-	}
-	for _, item := range result.UpdateInDB {
-		embJSON, _ := json.Marshal(item.Embedding)
-		a.inf.UpdateLongTermItem(item.ID, item.Content, item.Importance, embJSON)
-		log.Printf("🔗 记忆合并：更新 id=%d", item.ID)
-	}
-}
-
-// restoreFromDB 启动时从 PostgreSQL 恢复跨会话偏好、长期记忆和聊天记录
-func (a *UnifiedAgent) restoreFromDB() {
-	// 恢复偏好
-	prefs := a.inf.LoadPreferences("default")
-	a.pref.SaveBatch(prefs)
-
-	// 恢复长期记忆
-	rows := a.inf.LoadLongTermItems()
-	for _, row := range rows {
-		a.ltm.StoreItem(memory.Item{
-			ID:           row.ID,
-			Content:      row.Content,
-			Importance:   row.Importance,
-			Embedding:    row.Embedding,
-			CreatedAt:    row.CreatedAt,
-			LastAccessed: row.LastAccessed,
-		})
-	}
-
-	// 恢复聊天记录到短期记忆（最近 N 条）
-	chatLimit := a.cfg.ShortTermMaxTurns * 2 // 每轮 = user + assistant
-	history := a.inf.LoadChatHistory(chatLimit)
-	for _, h := range history {
-		a.stm.Add(h.Role, h.Content)
-	}
-
-	if len(prefs) > 0 || len(rows) > 0 || len(history) > 0 {
-		log.Printf("✅ 记忆恢复：%d 条偏好，%d 条长期记忆，%d 条聊天记录", len(prefs), len(rows), len(history))
-	}
-}
-
-// restoreRAGFromDB 从 PostgreSQL 加载持久化的 RAG chunks 到 TF 兜底索引
-func (a *UnifiedAgent) restoreRAGFromDB() {
-	chunkRows, err := a.inf.LoadAllRAGChunks()
-	if err != nil || len(chunkRows) == 0 {
-		return
-	}
-	var chunks []rag.Chunk
-	for i, row := range chunkRows {
-		chunks = append(chunks, rag.Chunk{ID: i, Content: row.Content})
-	}
-	a.rag.RestoreChunks(chunks)
-	log.Printf("✅ RAG chunks 恢复：%d 条", len(chunks))
-}
-
-// initKnowledgeGraph 初始化 Neo4j 知识图谱存储，并注入到 RAG 引擎 + GraphMemory
-func (a *UnifiedAgent) initKnowledgeGraph() {
-	kg := graph.NewKGStore(a.cfg, func(systemPrompt, userMsg string) string {
-		return a.llm.Chat(systemPrompt, []llm.Message{{Role: "user", Content: userMsg}})
-	})
-	a.kg = kg
-	a.rag.SetKGStore(kg)
-
-	// 构建图记忆层（包装现有 ltm）
-	a.graphMem = memory.NewGraphMemory(a.ltm, kg, a.cfg.MemoryConsolidationSimilarity)
-	a.graphMem.SyncPrevID() // 从 DB 恢复后对齐 prevID
-
-	if kg.Available() {
-		log.Printf("🕸️  知识图谱已就绪（Neo4j），RAG 升级为三路混合检索，记忆系统已接入图层")
-	} else {
-		log.Printf("ℹ️  Neo4j 不可用，RAG 保持双路检索，记忆系统退化为纯向量模式")
-	}
-}
-
-// KG 暴露知识图谱实例，供 HTTP handler 或记忆模块使用
-func (a *UnifiedAgent) KG() *graph.KGStore { return a.kg }
-
-// initSandbox 初始化命令执行沙箱并注册 exec_command 工具
-func (a *UnifiedAgent) initSandbox() {
-	if !a.cfg.SandboxEnabled {
-		log.Printf("ℹ️  沙箱未启用（config.sandbox.enabled=false），跳过 exec_command 工具")
-		return
-	}
-
-	sbCfg := sandbox.SandboxConfig{
-		Image:           a.cfg.SandboxImage,
-		Timeout:         time.Duration(a.cfg.SandboxTimeoutMs) * time.Millisecond,
-		MaxOutputBytes:  a.cfg.SandboxMaxOutput,
-		MemoryLimitMB:   a.cfg.SandboxMemoryMB,
-		CPUPercent:      a.cfg.SandboxCPUPercent,
-		MaxPIDs:         a.cfg.SandboxMaxPIDs,
-		NetworkDisabled: a.cfg.SandboxNetDisabled,
-		ReadOnlyRootfs:  a.cfg.SandboxReadOnly,
-	}
-	secCfg := sandbox.SecurityConfig{
-		MaxCommandLength: a.cfg.SecMaxCmdLength,
-		AllowlistMode:    a.cfg.SecAllowlistMode,
-		Allowlist:        a.cfg.SecAllowlist,
-	}
-
-	sb := sandbox.NewSandbox(a.cfg.SandboxBackend, sbCfg, secCfg)
-
-	// 注入审计回调：将每条命令执行结果发送到 Kafka
-	sb.SetAuditFn(func(r sandbox.ExecResult) {
-		event, _ := json.Marshal(map[string]interface{}{
-			"command":     r.Command,
-			"level":       string(r.Validation.Level),
-			"exit_code":   r.ExitCode,
-			"duration_ms": r.Duration.Milliseconds(),
-			"backend":     r.Backend,
-			"killed":      r.Killed,
-			"truncated":   r.Truncated,
-			"reason":      r.Validation.Reason,
-			"violations":  r.Validation.Violations,
-		})
-		a.inf.PublishEvent("sandbox.exec", string(event))
-	})
-
-	a.sandbox = sb
-	// 走 RegisterTool 持锁写入：initSandbox 在 New 中以 goroutine 形式运行，
-	// 与同期的 RAG/search_web 注册存在并发，必须串行化。
-	a.RegisterTool(tools.ExecCommandTool(sb))
-	log.Printf("🛡️  沙箱已就绪，后端=%s，exec_command 工具已注册", sb.Backend())
-}
-
-// Sandbox 暴露沙箱实例，供 HTTP handler 或前端查询状态
-func (a *UnifiedAgent) Sandbox() *sandbox.Sandbox { return a.sandbox }
-
-// extractShellCommand 从用户自然语言查询中提取实际的 shell 命令
-func extractShellCommand(query string) string {
-	// 简单提取：去掉常见中文前缀后，取第一个词作为命令
-	q := query
-	for _, prefix := range []string{"执行", "运行", "请执行", "请运行", "帮我执行", "帮我运行"} {
-		if strings.HasPrefix(q, prefix) {
-			q = strings.TrimPrefix(q, prefix)
-			break
-		}
-	}
-	// 去掉常见中文后缀
-	for _, suffix := range []string{"命令", "查看CPU信息", "查看内存信息", "查看磁盘信息", "查看系统信息", "查看信息"} {
-		if strings.HasSuffix(q, suffix) {
-			q = strings.TrimSuffix(q, suffix)
-			break
-		}
-	}
-	q = strings.TrimSpace(q)
-	if q != "" {
-		return q
-	}
-	return query
 }

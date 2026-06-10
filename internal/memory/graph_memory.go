@@ -12,10 +12,15 @@
 //	Store    — 写入 LTM 的同时在图中创建节点，并建立 FOLLOWS + SIMILAR_TO 边
 //	Recall   — 向量召回后沿图扩展，发现不直接相似但关联的历史记忆
 //	Consolidate — 结合图中心度保护关键节点，避免高价值记忆被错误淘汰
+//
+// 注：本文件直接使用 platform/neo4j.Client，记忆图方法不再委托给 graph.KGStore。
+// graph 包只负责 RAG 文档知识图谱（实体/关系节点）。
 package memory
 
 import (
 	"agi-ai-assitant/internal/graph"
+	pneo4j "agi-ai-assitant/internal/platform/neo4j"
+	"context"
 	"log"
 	"runtime/debug"
 	"sort"
@@ -37,22 +42,27 @@ func goSafe(name string, fn func()) {
 	}()
 }
 
-// GraphMemory 是 LongTerm 的图增强包装层
+// GraphMemory 是 LongTerm 的图增强包装层。
+//
+// 它持有 platform/neo4j.Client 直接执行记忆图节点/边操作。kg 仅用于
+// 在 Consolidate / IndexDocument 等流程里联动文档图（目前未直接调用，预留接口）。
 type GraphMemory struct {
 	ltm       *LongTerm
-	kg        *graph.KGStore
-	simThresh float64 // 建立 SIMILAR_TO 边的相似度阈值
-	prevID    int     // 上一条存入记忆的 ID（用于 FOLLOWS 边）
+	kg        *graph.KGStore // 文档知识图谱（保留以便记忆联动文档实体）
+	neo       *pneo4j.Client // 直接驱动 Memory 节点/边
+	simThresh float64        // 建立 SIMILAR_TO 边的相似度阈值
+	prevID    int            // 上一条存入记忆的 ID（用于 FOLLOWS 边）
 }
 
-// NewGraphMemory 创建图记忆层；kg 为 nil 时退化为纯 LongTerm
-func NewGraphMemory(ltm *LongTerm, kg *graph.KGStore, simThreshold float64) *GraphMemory {
+// NewGraphMemory 创建图记忆层；neo 为 nil 或不可用时退化为纯 LongTerm
+func NewGraphMemory(ltm *LongTerm, kg *graph.KGStore, neo *pneo4j.Client, simThreshold float64) *GraphMemory {
 	if simThreshold <= 0 {
 		simThreshold = 0.7
 	}
 	return &GraphMemory{
 		ltm:       ltm,
 		kg:        kg,
+		neo:       neo,
 		simThresh: simThreshold,
 		prevID:    -1,
 	}
@@ -60,6 +70,163 @@ func NewGraphMemory(ltm *LongTerm, kg *graph.KGStore, simThreshold float64) *Gra
 
 // LTM 暴露底层 LongTerm，供 agent 直接读取 Items/NeedConsolidation 等
 func (gm *GraphMemory) LTM() *LongTerm { return gm.ltm }
+
+// neoAvailable 报告记忆图所需的 Neo4j 连接是否可用
+func (gm *GraphMemory) neoAvailable() bool {
+	return gm.neo != nil && gm.neo.Available()
+}
+
+// ─────────────────────────────── 记忆图原子操作 ──────────────────────────────
+// 这些方法原本在 graph.KGStore 上；记忆图属于 memory 域，下沉到这里。
+
+// upsertMemoryNode 插入或更新记忆节点
+func (gm *GraphMemory) upsertMemoryNode(memID int, content string, importance float64) {
+	if !gm.neoAvailable() {
+		return
+	}
+	ctx := context.Background()
+	sess := gm.neo.Session()
+	defer sess.Close(ctx)
+	_, err := sess.Run(ctx,
+		`MERGE (m:Memory {mem_id: $id})
+		 SET m.content = $content, m.importance = $importance`,
+		map[string]any{"id": int64(memID), "content": content, "importance": importance})
+	if err != nil {
+		log.Printf("⚠️  Neo4j upsertMemoryNode 失败 (id=%d): %v", memID, err)
+	}
+}
+
+// addMemoryEdge 在两条记忆之间添加关系边
+// edgeType: FOLLOWS | SIMILAR_TO | CAUSES | BELONGS_TO
+func (gm *GraphMemory) addMemoryEdge(fromID, toID int, edgeType string, weight float64) {
+	if !gm.neoAvailable() {
+		return
+	}
+	ctx := context.Background()
+	sess := gm.neo.Session()
+	defer sess.Close(ctx)
+	query := `MATCH (a:Memory {mem_id: $from}), (b:Memory {mem_id: $to})
+	          MERGE (a)-[r:` + edgeType + `]->(b)
+	          SET r.weight = $weight`
+	_, err := sess.Run(ctx, query, map[string]any{
+		"from": int64(fromID), "to": int64(toID), "weight": weight,
+	})
+	if err != nil {
+		log.Printf("⚠️  Neo4j addMemoryEdge 失败 (%d→%d): %v", fromID, toID, err)
+	}
+}
+
+// expandMemoryNeighbors 从种子记忆 ID 出发，按 hops 跳扩展邻居 ID
+func (gm *GraphMemory) expandMemoryNeighbors(seedIDs []int, hops int) []int {
+	if !gm.neoAvailable() || len(seedIDs) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+	sess := gm.neo.Session()
+	defer sess.Close(ctx)
+
+	int64Seeds := make([]int64, len(seedIDs))
+	for i, id := range seedIDs {
+		int64Seeds[i] = int64(id)
+	}
+	hopStr := "1"
+	if hops > 1 {
+		hopStr = "1.." + intStr(hops)
+	}
+	records, err := sess.Run(ctx,
+		`MATCH (m:Memory) WHERE m.mem_id IN $ids
+		 MATCH (m)-[:FOLLOWS|SIMILAR_TO|CAUSES|BELONGS_TO*`+hopStr+`]-(n:Memory)
+		 WHERE NOT n.mem_id IN $ids
+		 RETURN DISTINCT n.mem_id AS id`,
+		map[string]any{"ids": int64Seeds})
+	if err != nil {
+		return nil
+	}
+
+	var result []int
+	for records.Next(ctx) {
+		rec := records.Record()
+		result = append(result, toInt(rec.Values[0]))
+	}
+	return result
+}
+
+// deleteMemoryNode 删除一条记忆节点及其所有边
+func (gm *GraphMemory) deleteMemoryNode(memID int) {
+	if !gm.neoAvailable() {
+		return
+	}
+	ctx := context.Background()
+	sess := gm.neo.Session()
+	defer sess.Close(ctx)
+	_, err := sess.Run(ctx,
+		`MATCH (m:Memory {mem_id: $id}) DETACH DELETE m`,
+		map[string]any{"id": int64(memID)})
+	if err != nil {
+		log.Printf("⚠️  Neo4j deleteMemoryNode 失败 (id=%d): %v", memID, err)
+	}
+}
+
+// getHighCentralityMemoryIDs 在候选列表中找出图中入度 >= threshold 的节点
+func (gm *GraphMemory) getHighCentralityMemoryIDs(candidates []int, threshold int) []int {
+	if !gm.neoAvailable() || len(candidates) == 0 {
+		return nil
+	}
+	ctx := context.Background()
+	sess := gm.neo.Session()
+	defer sess.Close(ctx)
+
+	int64IDs := make([]int64, len(candidates))
+	for i, id := range candidates {
+		int64IDs[i] = int64(id)
+	}
+	records, err := sess.Run(ctx,
+		`MATCH (m:Memory) WHERE m.mem_id IN $ids
+		 WITH m, size([(m)<-[]-() | 1]) AS indegree
+		 WHERE indegree >= $threshold
+		 RETURN m.mem_id AS id`,
+		map[string]any{"ids": int64IDs, "threshold": int64(threshold)})
+	if err != nil {
+		return nil
+	}
+	var result []int
+	for records.Next(ctx) {
+		rec := records.Record()
+		result = append(result, toInt(rec.Values[0]))
+	}
+	return result
+}
+
+// 内部辅助 —— 与 graph 包同名工具的对应版本，仅 graph_memory 需要
+func toInt(v any) int {
+	switch x := v.(type) {
+	case int64:
+		return int(x)
+	case int:
+		return x
+	case float64:
+		return int(x)
+	}
+	return -1
+}
+
+func intStr(n int) string {
+	// 简单数字格式化；避免 fmt.Sprintf 的 import
+	if n == 0 {
+		return "0"
+	}
+	if n < 0 {
+		return "-" + intStr(-n)
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}
 
 // ─────────────────────────────── Store ───────────────────────────────────────
 
@@ -85,11 +252,11 @@ func (gm *GraphMemory) StoreClassified(content string, importance float64, embed
 	}
 	newID := newItem.ID
 
-	if gm.kg != nil && gm.kg.Available() {
+	if gm.neoAvailable() {
 		goSafe("graphmem.store-node", func() {
-			gm.kg.UpsertMemoryNode(newID, content, importance)
+			gm.upsertMemoryNode(newID, content, importance)
 			if gm.prevID >= 0 {
-				gm.kg.AddMemoryEdge(gm.prevID, newID, "FOLLOWS", 1.0)
+				gm.addMemoryEdge(gm.prevID, newID, "FOLLOWS", 1.0)
 			}
 			gm.linkSimilarEdges(newItem, newID)
 		})
@@ -118,7 +285,7 @@ func (gm *GraphMemory) linkSimilarEdges(newItem Item, newID int) {
 		}
 		sim := cosine(old.Embedding, newItem.Embedding)
 		if sim >= gm.simThresh {
-			gm.kg.AddMemoryEdge(old.ID, newID, "SIMILAR_TO", sim)
+			gm.addMemoryEdge(old.ID, newID, "SIMILAR_TO", sim)
 		}
 	}
 }
@@ -155,7 +322,7 @@ func (gm *GraphMemory) Recall(query string, topK int, queryEmbedding []float64) 
 func (gm *GraphMemory) RecallByFilter(query string, queryEmbedding []float64, filter RecallFilter) []Item {
 	seedItems := gm.ltm.RecallByFilter(query, queryEmbedding, filter)
 
-	if gm.kg == nil || !gm.kg.Available() || len(seedItems) == 0 {
+	if !gm.neoAvailable() || len(seedItems) == 0 {
 		return seedItems
 	}
 
@@ -163,7 +330,7 @@ func (gm *GraphMemory) RecallByFilter(query string, queryEmbedding []float64, fi
 	for i, item := range seedItems {
 		seedIDs[i] = item.ID
 	}
-	expandedIDs := gm.kg.ExpandMemoryNeighbors(seedIDs, 1)
+	expandedIDs := gm.expandMemoryNeighbors(seedIDs, 1)
 	if len(expandedIDs) == 0 {
 		return seedItems
 	}
@@ -205,12 +372,12 @@ func (gm *GraphMemory) RecallByFilter(query string, queryEmbedding []float64, fi
 func (gm *GraphMemory) GraphAwareConsolidate() ConsolidationResult {
 	result := gm.ltm.Consolidate()
 
-	if gm.kg == nil || !gm.kg.Available() {
+	if !gm.neoAvailable() {
 		return result
 	}
 
 	// 保护：图中入度 ≥ 3 的节点不在本次删除
-	protected := gm.kg.GetHighCentralityMemoryIDs(result.DeleteFromDB, 3)
+	protected := gm.getHighCentralityMemoryIDs(result.DeleteFromDB, 3)
 	if len(protected) > 0 {
 		protSet := make(map[int]bool)
 		for _, id := range protected {
@@ -229,7 +396,7 @@ func (gm *GraphMemory) GraphAwareConsolidate() ConsolidationResult {
 	// 同步删除 Neo4j 中对应节点
 	goSafe("graphmem.consolidate-delete", func() {
 		for _, id := range result.DeleteFromDB {
-			gm.kg.DeleteMemoryNode(id)
+			gm.deleteMemoryNode(id)
 		}
 	})
 
@@ -245,9 +412,9 @@ func (gm *GraphMemory) SyncPrevID() {
 
 // UpdateNodeAfterMerge 记忆合并后更新 Neo4j 节点内容
 func (gm *GraphMemory) UpdateNodeAfterMerge(item Item) {
-	if gm.kg != nil && gm.kg.Available() {
+	if gm.neoAvailable() {
 		goSafe("graphmem.update-after-merge", func() {
-			gm.kg.UpsertMemoryNode(item.ID, item.Content, item.Importance)
+			gm.upsertMemoryNode(item.ID, item.Content, item.Importance)
 		})
 	}
 }
@@ -255,9 +422,9 @@ func (gm *GraphMemory) UpdateNodeAfterMerge(item Item) {
 // StoreItem 直接插入（从 DB 恢复），同步图节点
 func (gm *GraphMemory) StoreItem(item Item) {
 	gm.ltm.StoreItem(item)
-	if gm.kg != nil && gm.kg.Available() {
+	if gm.neoAvailable() {
 		goSafe("graphmem.store-item", func() {
-			gm.kg.UpsertMemoryNode(item.ID, item.Content, item.Importance)
+			gm.upsertMemoryNode(item.ID, item.Content, item.Importance)
 		})
 	}
 }
@@ -280,11 +447,11 @@ func (gm *GraphMemory) SyncLastItemPGID(pgID int) {
 	if last, ok := gm.ltm.LastItem(); ok {
 		gm.prevID = last.ID
 		// 更新 Neo4j 节点 ID（SyncLastItemPGID 会修改最后一条 Item.ID）
-		if gm.kg != nil && gm.kg.Available() {
+		if gm.neoAvailable() {
 			goSafe("graphmem.sync-pgid", func() {
 				// 给 Neo4j 一点时间完成之前的异步操作
 				time.Sleep(50 * time.Millisecond)
-				gm.kg.UpsertMemoryNode(last.ID, last.Content, last.Importance)
+				gm.upsertMemoryNode(last.ID, last.Content, last.Importance)
 			})
 		}
 	}

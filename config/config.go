@@ -9,40 +9,91 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// APIConfig 整合所有阶段的 API + 基础设施配置
-type APIConfig struct {
-	// ===== LLM 聊天模型 API =====
+// 子结构按职责分组。所有子结构以 embedded 方式放进 APIConfig，
+// 让 cfg.LLMAPIUrl / cfg.PGHost 等老访问路径通过 Go 字段提升继续工作。
+
+// ServerConfig 服务端口与运行参数
+type ServerConfig struct {
+	ServerPort string
+}
+
+// LLMConfig 聊天模型 API
+type LLMConfig struct {
 	LLMAPIUrl   string
 	LLMAPIKey   string
 	LLMModel    string
 	Temperature float64
+}
 
-	// ===== Embedding 向量化模型 API =====
+func (c LLMConfig) IsRealLLM() bool { return c.LLMAPIKey != "" }
+
+// EmbeddingConfig 向量化模型 API
+type EmbeddingConfig struct {
 	EmbeddingAPIUrl string
 	EmbeddingAPIKey string
 	EmbeddingModel  string
+}
 
-	// ===== Milvus 向量数据库 =====
+func (c EmbeddingConfig) IsRealEmbedding() bool { return c.EmbeddingAPIKey != "" }
+
+// MilvusConfig 向量数据库连接
+type MilvusConfig struct {
 	MilvusHost string
 	MilvusPort int
+}
 
-	// ===== PostgreSQL 关系型数据库 =====
+func (c MilvusConfig) MilvusAddr() string {
+	return fmt.Sprintf("%s:%d", c.MilvusHost, c.MilvusPort)
+}
+
+// PostgresConfig 关系型数据库连接
+type PostgresConfig struct {
 	PGHost     string
 	PGPort     int
 	PGUser     string
 	PGPassword string
 	PGDatabase string
+}
 
-	// ===== Elasticsearch =====
+func (c PostgresConfig) PGDSN() string {
+	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		c.PGUser, c.PGPassword, c.PGHost, c.PGPort, c.PGDatabase)
+}
+
+// ESConfig Elasticsearch 连接
+type ESConfig struct {
 	ESAddresses []string
 	ESUsername  string
 	ESPassword  string
+}
 
-	// ===== Kafka =====
+// KafkaConfig 事件总线
+type KafkaConfig struct {
 	KafkaBrokers []string
 	KafkaTopic   string
+}
 
-	// ===== RAG 配置 =====
+// Neo4jConfig 知识图谱后端
+type Neo4jConfig struct {
+	Neo4jURI      string
+	Neo4jUser     string
+	Neo4jPassword string
+	KGMaxHops     int     // 图遍历最大跳数
+	KGWeight      float64 // 图检索在 RRF 中的权重
+	KGEnabled     bool    // 是否启用知识图谱
+}
+
+// StorageConfig 聚合所有外部存储/连接配置
+type StorageConfig struct {
+	MilvusConfig
+	PostgresConfig
+	ESConfig
+	KafkaConfig
+	Neo4jConfig
+}
+
+// RAGConfig 检索增强生成
+type RAGConfig struct {
 	ChunkSize          int
 	ChunkOverlap       int
 	TopK               int
@@ -50,8 +101,10 @@ type APIConfig struct {
 	SemanticWeight     float64
 	EnableHybridSearch bool
 	RAGMilvusDim       int
+}
 
-	// ===== Memory 配置 =====
+// MemoryConfig 三层记忆 + 长期记忆合并策略
+type MemoryConfig struct {
 	ShortTermMaxTurns             int
 	LongTermTopK                  int
 	MemoryConsolidationSimilarity float64
@@ -60,26 +113,24 @@ type APIConfig struct {
 	MemoryConsolidationDecayRate  float64
 	MemoryConsolidationMinImport  float64
 	MemoryConsolidationTrigger    int
+}
 
-	// ===== Harness 配置 =====
+// HarnessConfig 任务执行框架
+type HarnessConfig struct {
 	MaxRetries    int
 	RetryDelayMs  int
 	StepTimeoutMs int
 	MaxIterations int
+}
 
-	// ===== 搜索 API（可选，支持 Tavily 等）=====
+// SearchConfig 搜索 API（Tavily 等）
+type SearchConfig struct {
 	SearchAPIKey string
 	SearchAPIURL string
+}
 
-	// ===== Neo4j 图数据库（知识图谱 + 图记忆共享）=====
-	Neo4jURI      string
-	Neo4jUser     string
-	Neo4jPassword string
-	KGMaxHops     int     // 图遍历最大跳数
-	KGWeight      float64 // 图检索在 RRF 中的权重
-	KGEnabled     bool    // 是否启用知识图谱
-
-	// ===== 沙箱执行 =====
+// SandboxConfig 沙箱执行参数（注意：与 internal/sandbox.SandboxConfig 不是同一类型）
+type SandboxConfig struct {
 	SandboxEnabled     bool
 	SandboxBackend     string // "docker" | "local" | "mock"
 	SandboxImage       string
@@ -90,14 +141,30 @@ type APIConfig struct {
 	SandboxMaxPIDs     int
 	SandboxNetDisabled bool
 	SandboxReadOnly    bool
+}
 
-	// ===== 命令安全校验 =====
+// SecurityConfig 命令安全校验
+type SecurityConfig struct {
 	SecMaxCmdLength  int
 	SecAllowlistMode bool
 	SecAllowlist     []string
+}
 
-	// ===== 通用配置 =====
-	ServerPort string
+// APIConfig 整合所有阶段的 API + 基础设施配置。
+//
+// 所有子结构以 embedded 方式放进来，访问路径 cfg.LLMAPIUrl / cfg.PGHost
+// 等通过 Go 字段提升仍然有效——重构以分层为目标，不改动调用方。
+type APIConfig struct {
+	ServerConfig
+	LLMConfig
+	EmbeddingConfig
+	StorageConfig
+	RAGConfig
+	MemoryConfig
+	HarnessConfig
+	SearchConfig
+	SandboxConfig
+	SecurityConfig
 }
 
 // yamlFile 对应 config/config.yaml 的结构
@@ -211,82 +278,104 @@ func DefaultConfig() *APIConfig {
 	}
 
 	c := &APIConfig{
-		LLMAPIUrl:   y.LLM.APIUrl,
-		LLMAPIKey:   y.LLM.APIKey,
-		LLMModel:    y.LLM.Model,
-		Temperature: y.LLM.Temperature,
-
-		EmbeddingAPIUrl: y.Embedding.APIUrl,
-		EmbeddingAPIKey: y.Embedding.APIKey,
-		EmbeddingModel:  y.Embedding.Model,
-
-		MilvusHost: y.Milvus.Host,
-		MilvusPort: y.Milvus.Port,
-
-		PGHost:     y.Postgres.Host,
-		PGPort:     y.Postgres.Port,
-		PGUser:     y.Postgres.User,
-		PGPassword: y.Postgres.Password,
-		PGDatabase: y.Postgres.Database,
-
-		ESAddresses: y.Elasticsearch.Addresses,
-		ESUsername:  y.Elasticsearch.Username,
-		ESPassword:  y.Elasticsearch.Password,
-
-		KafkaBrokers: y.Kafka.Brokers,
-		KafkaTopic:   y.Kafka.Topic,
-
-		ChunkSize:          y.RAG.ChunkSize,
-		ChunkOverlap:       y.RAG.ChunkOverlap,
-		TopK:               y.RAG.TopK,
-		RRFConstantK:       y.RAG.RRFConstantK,
-		SemanticWeight:     y.RAG.SemanticWeight,
-		EnableHybridSearch: y.RAG.EnableHybridSearch,
-		RAGMilvusDim:       y.RAG.RAGMilvusDim,
-
-		ShortTermMaxTurns: y.Memory.ShortTermMaxTurns,
-		LongTermTopK:      y.Memory.LongTermTopK,
-
-		MemoryConsolidationSimilarity: y.Memory.Consolidation.SimilarityThreshold,
-		MemoryConsolidationDedup:      y.Memory.Consolidation.DedupThreshold,
-		MemoryConsolidationTTLDays:    y.Memory.Consolidation.TTLDays,
-		MemoryConsolidationDecayRate:  y.Memory.Consolidation.DecayRate,
-		MemoryConsolidationMinImport:  y.Memory.Consolidation.MinImportance,
-		MemoryConsolidationTrigger:    y.Memory.Consolidation.TriggerInterval,
-
-		MaxRetries:    y.Harness.MaxRetries,
-		RetryDelayMs:  y.Harness.RetryDelayMs,
-		StepTimeoutMs: y.Harness.StepTimeoutMs,
-		MaxIterations: y.Harness.MaxIterations,
-
-		SearchAPIKey: y.Search.APIKey,
-		SearchAPIURL: y.Search.APIURL,
-
-		Neo4jURI:      y.Neo4j.URI,
-		Neo4jUser:     y.Neo4j.User,
-		Neo4jPassword: y.Neo4j.Password,
-		KGMaxHops:     y.Neo4j.MaxHops,
-		KGWeight:      y.Neo4j.Weight,
-		KGEnabled:     y.Neo4j.Enabled,
-
-		SandboxEnabled:     y.Sandbox.Enabled,
-		SandboxBackend:     y.Sandbox.Backend,
-		SandboxImage:       y.Sandbox.Image,
-		SandboxTimeoutMs:   y.Sandbox.TimeoutMs,
-		SandboxMaxOutput:   y.Sandbox.MaxOutputBytes,
-		SandboxMemoryMB:    y.Sandbox.MemoryLimitMB,
-		SandboxCPUPercent:  y.Sandbox.CPUPercent,
-		SandboxMaxPIDs:     y.Sandbox.MaxPIDs,
-		SandboxNetDisabled: y.Sandbox.NetworkDisabled,
-		SandboxReadOnly:    y.Sandbox.ReadOnlyRootfs,
-
-		SecMaxCmdLength:  y.Security.MaxCommandLength,
-		SecAllowlistMode: y.Security.AllowlistMode,
-		SecAllowlist:     y.Security.Allowlist,
-
-		ServerPort: y.Server.Port,
+		ServerConfig: ServerConfig{
+			ServerPort: y.Server.Port,
+		},
+		LLMConfig: LLMConfig{
+			LLMAPIUrl:   y.LLM.APIUrl,
+			LLMAPIKey:   y.LLM.APIKey,
+			LLMModel:    y.LLM.Model,
+			Temperature: y.LLM.Temperature,
+		},
+		EmbeddingConfig: EmbeddingConfig{
+			EmbeddingAPIUrl: y.Embedding.APIUrl,
+			EmbeddingAPIKey: y.Embedding.APIKey,
+			EmbeddingModel:  y.Embedding.Model,
+		},
+		StorageConfig: StorageConfig{
+			MilvusConfig: MilvusConfig{
+				MilvusHost: y.Milvus.Host,
+				MilvusPort: y.Milvus.Port,
+			},
+			PostgresConfig: PostgresConfig{
+				PGHost:     y.Postgres.Host,
+				PGPort:     y.Postgres.Port,
+				PGUser:     y.Postgres.User,
+				PGPassword: y.Postgres.Password,
+				PGDatabase: y.Postgres.Database,
+			},
+			ESConfig: ESConfig{
+				ESAddresses: y.Elasticsearch.Addresses,
+				ESUsername:  y.Elasticsearch.Username,
+				ESPassword:  y.Elasticsearch.Password,
+			},
+			KafkaConfig: KafkaConfig{
+				KafkaBrokers: y.Kafka.Brokers,
+				KafkaTopic:   y.Kafka.Topic,
+			},
+			Neo4jConfig: Neo4jConfig{
+				Neo4jURI:      y.Neo4j.URI,
+				Neo4jUser:     y.Neo4j.User,
+				Neo4jPassword: y.Neo4j.Password,
+				KGMaxHops:     y.Neo4j.MaxHops,
+				KGWeight:      y.Neo4j.Weight,
+				KGEnabled:     y.Neo4j.Enabled,
+			},
+		},
+		RAGConfig: RAGConfig{
+			ChunkSize:          y.RAG.ChunkSize,
+			ChunkOverlap:       y.RAG.ChunkOverlap,
+			TopK:               y.RAG.TopK,
+			RRFConstantK:       y.RAG.RRFConstantK,
+			SemanticWeight:     y.RAG.SemanticWeight,
+			EnableHybridSearch: y.RAG.EnableHybridSearch,
+			RAGMilvusDim:       y.RAG.RAGMilvusDim,
+		},
+		MemoryConfig: MemoryConfig{
+			ShortTermMaxTurns:             y.Memory.ShortTermMaxTurns,
+			LongTermTopK:                  y.Memory.LongTermTopK,
+			MemoryConsolidationSimilarity: y.Memory.Consolidation.SimilarityThreshold,
+			MemoryConsolidationDedup:      y.Memory.Consolidation.DedupThreshold,
+			MemoryConsolidationTTLDays:    y.Memory.Consolidation.TTLDays,
+			MemoryConsolidationDecayRate:  y.Memory.Consolidation.DecayRate,
+			MemoryConsolidationMinImport:  y.Memory.Consolidation.MinImportance,
+			MemoryConsolidationTrigger:    y.Memory.Consolidation.TriggerInterval,
+		},
+		HarnessConfig: HarnessConfig{
+			MaxRetries:    y.Harness.MaxRetries,
+			RetryDelayMs:  y.Harness.RetryDelayMs,
+			StepTimeoutMs: y.Harness.StepTimeoutMs,
+			MaxIterations: y.Harness.MaxIterations,
+		},
+		SearchConfig: SearchConfig{
+			SearchAPIKey: y.Search.APIKey,
+			SearchAPIURL: y.Search.APIURL,
+		},
+		SandboxConfig: SandboxConfig{
+			SandboxEnabled:     y.Sandbox.Enabled,
+			SandboxBackend:     y.Sandbox.Backend,
+			SandboxImage:       y.Sandbox.Image,
+			SandboxTimeoutMs:   y.Sandbox.TimeoutMs,
+			SandboxMaxOutput:   y.Sandbox.MaxOutputBytes,
+			SandboxMemoryMB:    y.Sandbox.MemoryLimitMB,
+			SandboxCPUPercent:  y.Sandbox.CPUPercent,
+			SandboxMaxPIDs:     y.Sandbox.MaxPIDs,
+			SandboxNetDisabled: y.Sandbox.NetworkDisabled,
+			SandboxReadOnly:    y.Sandbox.ReadOnlyRootfs,
+		},
+		SecurityConfig: SecurityConfig{
+			SecMaxCmdLength:  y.Security.MaxCommandLength,
+			SecAllowlistMode: y.Security.AllowlistMode,
+			SecAllowlist:     y.Security.Allowlist,
+		},
 	}
 
+	applyDefaults(c)
+	return c
+}
+
+// applyDefaults 为零值字段填充合理默认值
+func applyDefaults(c *APIConfig) {
 	// RAG 混合检索默认值
 	if c.RRFConstantK <= 0 {
 		c.RRFConstantK = 60
@@ -353,20 +442,4 @@ func DefaultConfig() *APIConfig {
 	if c.SecMaxCmdLength <= 0 {
 		c.SecMaxCmdLength = 500
 	}
-
-	return c
-}
-
-func (c *APIConfig) IsRealLLM() bool       { return c.LLMAPIKey != "" }
-func (c *APIConfig) IsRealEmbedding() bool { return c.EmbeddingAPIKey != "" }
-
-// PGDSN 返回 PostgreSQL 连接串
-func (c *APIConfig) PGDSN() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		c.PGUser, c.PGPassword, c.PGHost, c.PGPort, c.PGDatabase)
-}
-
-// MilvusAddr 返回 Milvus 地址
-func (c *APIConfig) MilvusAddr() string {
-	return fmt.Sprintf("%s:%d", c.MilvusHost, c.MilvusPort)
 }

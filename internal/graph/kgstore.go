@@ -2,19 +2,20 @@ package graph
 
 import (
 	"agi-ai-assitant/config"
+	"agi-ai-assitant/internal/platform/neo4j"
 	"context"
 	"fmt"
 	"log"
 	"sort"
 )
 
-// KGStore 在 Neo4jStore 之上封装 RAG 专用的图操作：
+// KGStore 在 platform/neo4j.Client 之上封装 RAG 专用的图操作：
 //   - IndexDocument：文档摄入时写入实体节点和关系边
 //   - DeleteDocument：删除文档及其关联的孤立节点
 //   - Search：根据查询实体做 1~2 跳子图扩展，返回关联的 ChunkID 列表
 //   - ExpandMemoryNeighbors：记忆图扩展（供 memory 包复用）
 type KGStore struct {
-	neo4j     *Neo4jStore
+	neo4j     *neo4j.Client
 	maxHops   int
 	kgWeight  float64
 	extractor *Extractor
@@ -22,9 +23,9 @@ type KGStore struct {
 
 // NewKGStore 创建知识图谱存储
 func NewKGStore(cfg *config.APIConfig, llmFn func(systemPrompt, userMsg string) string) *KGStore {
-	neo := NewNeo4jStore(cfg)
+	c := neo4j.Connect(cfg.Neo4jConfig)
 	return &KGStore{
-		neo4j:     neo,
+		neo4j:     c,
 		maxHops:   cfg.KGMaxHops,
 		kgWeight:  cfg.KGWeight,
 		extractor: NewExtractor(llmFn),
@@ -36,6 +37,9 @@ func (ks *KGStore) Available() bool { return ks.neo4j.Available() }
 
 // Close 关闭底层连接
 func (ks *KGStore) Close() { ks.neo4j.Close() }
+
+// Client 暴露底层 Neo4j 客户端，供 memory 包共享同一连接驱动记忆图
+func (ks *KGStore) Client() *neo4j.Client { return ks.neo4j }
 
 // ─────────────────────────────── 文档摄入 ────────────────────────────────────
 
@@ -78,7 +82,7 @@ type ChunkRef struct {
 
 // upsertEntity MERGE 实体节点（幂等）
 func (ks *KGStore) upsertEntity(ctx context.Context, ent Entity) {
-	sess := ks.neo4j.session()
+	sess := ks.neo4j.Session()
 	defer sess.Close(ctx)
 	query := `MERGE (e:Entity {name: $name})
 	          SET e.type = $type, e.doc_hash = $doc_hash, e.chunk_id = $chunk_id, e.pg_id = $pg_id`
@@ -96,7 +100,7 @@ func (ks *KGStore) upsertEntity(ctx context.Context, ent Entity) {
 
 // upsertRelation MERGE 关系边（幂等）
 func (ks *KGStore) upsertRelation(ctx context.Context, rel Relation) {
-	sess := ks.neo4j.session()
+	sess := ks.neo4j.Session()
 	defer sess.Close(ctx)
 	// 动态关系类型无法用参数传递，必须拼入查询字符串
 	// 安全性由 isValidRelType 保证（extractor 已过滤非法类型）
@@ -124,7 +128,7 @@ func (ks *KGStore) DeleteDocument(docHash string) {
 		return
 	}
 	ctx := context.Background()
-	sess := ks.neo4j.session()
+	sess := ks.neo4j.Session()
 	defer sess.Close(ctx)
 
 	// 删除所有归属此文档的关系
@@ -158,7 +162,7 @@ func (ks *KGStore) Search(queryText string, topK int) []GraphSearchResult {
 	}
 
 	ctx := context.Background()
-	sess := ks.neo4j.session()
+	sess := ks.neo4j.Session()
 	defer sess.Close(ctx)
 
 	// 构建实体名列表
@@ -262,7 +266,7 @@ func (ks *KGStore) Search(queryText string, topK int) []GraphSearchResult {
 
 // searchDirect APOC 不可用时的降级版本：直接匹配实体所在 chunk
 func (ks *KGStore) searchDirect(ctx context.Context, names []string, topK int) []GraphSearchResult {
-	sess := ks.neo4j.session()
+	sess := ks.neo4j.Session()
 	defer sess.Close(ctx)
 
 	records, err := sess.Run(ctx,
@@ -292,122 +296,6 @@ func (ks *KGStore) searchDirect(ctx context.Context, names []string, topK int) [
 		})
 	}
 	return results
-}
-
-// ─────────────────────────────── 记忆图操作 ──────────────────────────────────
-
-// UpsertMemoryNode 插入或更新记忆节点（供 graph_memory 使用）
-func (ks *KGStore) UpsertMemoryNode(memID int, content string, importance float64) {
-	if !ks.neo4j.Available() {
-		return
-	}
-	ctx := context.Background()
-	sess := ks.neo4j.session()
-	defer sess.Close(ctx)
-	_, err := sess.Run(ctx,
-		`MERGE (m:Memory {mem_id: $id})
-		 SET m.content = $content, m.importance = $importance`,
-		map[string]any{"id": int64(memID), "content": content, "importance": importance})
-	if err != nil {
-		log.Printf("⚠️  Neo4j UpsertMemoryNode 失败 (id=%d): %v", memID, err)
-	}
-}
-
-// AddMemoryEdge 在两条记忆之间添加关系边（供 graph_memory 使用）
-// edgeType: FOLLOWS | SIMILAR_TO | CAUSES | BELONGS_TO
-func (ks *KGStore) AddMemoryEdge(fromID, toID int, edgeType string, weight float64) {
-	if !ks.neo4j.Available() {
-		return
-	}
-	ctx := context.Background()
-	sess := ks.neo4j.session()
-	defer sess.Close(ctx)
-	query := `MATCH (a:Memory {mem_id: $from}), (b:Memory {mem_id: $to})
-	          MERGE (a)-[r:` + edgeType + `]->(b)
-	          SET r.weight = $weight`
-	_, err := sess.Run(ctx, query, map[string]any{
-		"from": int64(fromID), "to": int64(toID), "weight": weight,
-	})
-	if err != nil {
-		log.Printf("⚠️  Neo4j AddMemoryEdge 失败 (%d→%d): %v", fromID, toID, err)
-	}
-}
-
-// ExpandMemoryNeighbors 从种子记忆 ID 出发，1跳扩展相邻记忆 ID
-func (ks *KGStore) ExpandMemoryNeighbors(seedIDs []int, hops int) []int {
-	if !ks.neo4j.Available() || len(seedIDs) == 0 {
-		return nil
-	}
-	ctx := context.Background()
-	sess := ks.neo4j.session()
-	defer sess.Close(ctx)
-
-	int64Seeds := make([]int64, len(seedIDs))
-	for i, id := range seedIDs {
-		int64Seeds[i] = int64(id)
-	}
-	records, err := sess.Run(ctx,
-		`MATCH (m:Memory) WHERE m.mem_id IN $ids
-		 MATCH (m)-[:FOLLOWS|SIMILAR_TO|CAUSES|BELONGS_TO*1..`+intStr(hops)+`]-(n:Memory)
-		 WHERE NOT n.mem_id IN $ids
-		 RETURN DISTINCT n.mem_id AS id`,
-		map[string]any{"ids": int64Seeds})
-	if err != nil {
-		return nil
-	}
-
-	var result []int
-	for records.Next(ctx) {
-		rec := records.Record()
-		result = append(result, toInt(rec.Values[0]))
-	}
-	return result
-}
-
-// DeleteMemoryNode 删除一条记忆节点及其所有边
-func (ks *KGStore) DeleteMemoryNode(memID int) {
-	if !ks.neo4j.Available() {
-		return
-	}
-	ctx := context.Background()
-	sess := ks.neo4j.session()
-	defer sess.Close(ctx)
-	_, err := sess.Run(ctx,
-		`MATCH (m:Memory {mem_id: $id}) DETACH DELETE m`,
-		map[string]any{"id": int64(memID)})
-	if err != nil {
-		log.Printf("⚠️  Neo4j DeleteMemoryNode 失败 (id=%d): %v", memID, err)
-	}
-}
-
-// GetHighCentralityMemoryIDs 在待删除列表中找出图中入度较高（受保护）的节点
-func (ks *KGStore) GetHighCentralityMemoryIDs(candidates []int, threshold int) []int {
-	if !ks.neo4j.Available() || len(candidates) == 0 {
-		return nil
-	}
-	ctx := context.Background()
-	sess := ks.neo4j.session()
-	defer sess.Close(ctx)
-
-	int64IDs := make([]int64, len(candidates))
-	for i, id := range candidates {
-		int64IDs[i] = int64(id)
-	}
-	records, err := sess.Run(ctx,
-		`MATCH (m:Memory) WHERE m.mem_id IN $ids
-		 WITH m, size([(m)<-[]-() | 1]) AS indegree
-		 WHERE indegree >= $threshold
-		 RETURN m.mem_id AS id`,
-		map[string]any{"ids": int64IDs, "threshold": int64(threshold)})
-	if err != nil {
-		return nil
-	}
-	var result []int
-	for records.Next(ctx) {
-		rec := records.Record()
-		result = append(result, toInt(rec.Values[0]))
-	}
-	return result
 }
 
 // ─────────────────────────────── 内部工具 ────────────────────────────────────

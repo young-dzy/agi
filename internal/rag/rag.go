@@ -5,7 +5,8 @@ package rag
 import (
 	"agi-ai-assitant/config"
 	"agi-ai-assitant/internal/graph"
-	"agi-ai-assitant/internal/infra"
+	"agi-ai-assitant/internal/repo/eventbus"
+	"agi-ai-assitant/internal/repo/ragchunk"
 	"fmt"
 	"log"
 	"runtime/debug"
@@ -84,17 +85,19 @@ type Engine struct {
 	splitter   *TextSplitter
 	kg         *graph.KGStore // 知识图谱，nil 时禁用
 	Loaded     bool
-	inf        *infra.Infrastructure
+	chunks     ragchunk.Repo
+	events     eventbus.Publisher
 	generateFn func(systemPrompt string, userMsg string) string // LLM 回调，由 agent 注入
 }
 
 // NewEngine 创建 RAG 引擎
-func NewEngine(cfg *config.APIConfig, inf *infra.Infrastructure) *Engine {
+func NewEngine(cfg *config.APIConfig, chunks ragchunk.Repo, events eventbus.Publisher) *Engine {
 	return &Engine{
 		cfg:      cfg,
-		store:    NewHybridStore(cfg, inf),
+		store:    NewHybridStore(cfg, chunks),
 		splitter: NewTextSplitter(cfg.ChunkSize, cfg.ChunkOverlap),
-		inf:      inf,
+		chunks:   chunks,
+		events:   events,
 	}
 }
 
@@ -125,7 +128,9 @@ func (e *Engine) Ingest(doc string) (int, string) {
 	chunks := e.splitter.Split(doc)
 	docHash, indexed := e.store.Index(chunks, doc)
 	e.Loaded = true
-	e.inf.PublishEvent("rag.ingest", fmt.Sprintf(`{"chunk_count":%d,"mode":"%s","doc_hash":"%s"}`, len(chunks), e.store.Mode(), docHash))
+	if e.events != nil {
+		e.events.Publish("rag.ingest", fmt.Sprintf(`{"chunk_count":%d,"mode":"%s","doc_hash":"%s"}`, len(chunks), e.store.Mode(), docHash))
+	}
 
 	// 异步建图：实体关系抽取耗时较长，不阻塞主流程
 	// 注意：使用 indexed（含真实 PGID）而非 chunks，否则 KG 节点上的 pg_id 缺失，
@@ -149,7 +154,7 @@ func (e *Engine) Delete(docHash string) error {
 		e.kg.DeleteDocument(docHash)
 	}
 	// 删除后检查是否还有 chunks
-	rows, _ := e.inf.LoadAllRAGChunks()
+	rows, _ := e.chunks.LoadAll()
 	e.Loaded = len(rows) > 0
 	return err
 }
@@ -196,7 +201,7 @@ func (e *Engine) Query(question string) (string, []SearchResult) {
 
 // Chunks 返回当前已持久化的切片预览（从 PG 加载，供状态接口使用）
 func (e *Engine) Chunks() []Chunk {
-	rows, err := e.inf.LoadAllRAGChunks()
+	rows, err := e.chunks.LoadAll()
 	if err != nil {
 		return nil
 	}

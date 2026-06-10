@@ -4,25 +4,22 @@ package handler
 import (
 	"agi-ai-assitant/config"
 	"agi-ai-assitant/internal/agent"
-	"agi-ai-assitant/internal/infra"
 	"agi-ai-assitant/internal/tools"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"unicode/utf8"
 )
 
-// Server 聚合 Agent 和基础设施引用，挂载所有 HTTP 路由
+// Server 聚合 Agent 引用，挂载所有 HTTP 路由
 type Server struct {
 	agent *agent.UnifiedAgent
-	infra *infra.Infrastructure
 	cfg   *config.APIConfig
 }
 
 // New 创建 Server 并注册所有路由到 mux
-func New(a *agent.UnifiedAgent, inf *infra.Infrastructure, cfg *config.APIConfig) *Server {
-	s := &Server{agent: a, infra: inf, cfg: cfg}
+func New(a *agent.UnifiedAgent, cfg *config.APIConfig) *Server {
+	s := &Server{agent: a, cfg: cfg}
 	s.registerRoutes()
 	return s
 }
@@ -244,32 +241,7 @@ func (s *Server) snapshots(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/status — 系统状态与配置摘要
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
-	// RAG chunk 预览（最多 60 字符）
-	var chunkPreviews []map[string]interface{}
-	for _, c := range s.agent.RAG().Chunks() {
-		preview := c.Content
-		if utf8.RuneCountInString(preview) > 60 {
-			runes := []rune(preview)
-			preview = string(runes[:60]) + "..."
-		}
-		chunkPreviews = append(chunkPreviews, map[string]interface{}{
-			"id":      c.ID,
-			"content": preview,
-		})
-	}
-	writeJSON(w, map[string]interface{}{
-		"rag_loaded":       s.agent.RAG().Loaded,
-		"rag_mode":         s.agent.RAG().Mode(),
-		"rag_chunks":       chunkPreviews,
-		"short_term_count": s.agent.ShortTerm().Count(),
-		"long_term_count":  s.agent.LongTerm().Count(),
-		"preferences":      s.agent.Preferences().Snapshot(),
-		"tools_count":      len(s.agent.Tools()),
-		"llm_model":        s.cfg.LLMModel,
-		"embedding_model":  s.cfg.EmbeddingModel,
-		"is_mock":          !s.cfg.IsRealLLM(),
-		"infrastructure":   s.infra.Ready,
-	})
+	writeJSON(w, s.agent.Status())
 }
 
 // ─────────────────────────────── 工具函数 ────────────────────────────────

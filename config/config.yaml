@@ -1,15 +1,13 @@
 # 对话模型配置
 llm:
-  api_url: https://ark.cn-beijing.volces.com/api/v3/chat/completions
-  api_key: "填入自己的api"               #  API Key
-  model: ep-20260430233018-tqktj
+  api-url: https://ark.cn-beijing.volces.com/api/v3/chat/completions
+  api-key: "ark-08c63f0b-3410-4f8b-9dd5-0114895fdf5f-7069c"
+  model: deepseek-v4-flash-260425
   temperature: 0.7
-
-# 向量模型配置
 embedding:
-  api_url: https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal
-  api_key: "填入自己的api"               # API Key
-  model: ep-20260119190844-zzrq7
+  api-url: https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal
+  api-key: "ark-08c63f0b-3410-4f8b-9dd5-0114895fdf5f-7069c"
+  model: doubao-embedding-vision-250615
 
 # 向量数据库配置
 milvus:

@@ -4,7 +4,7 @@ package rag
 import (
 	"agi-ai-assitant/config"
 	"agi-ai-assitant/internal/graph"
-	"agi-ai-assitant/internal/infra"
+	"agi-ai-assitant/internal/repo/ragchunk"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -22,21 +22,21 @@ import (
 //   - PostgreSQL chunk 持久化
 type HybridStore struct {
 	cfg     *config.APIConfig
-	inf     *infra.Infrastructure
+	chunks  ragchunk.Repo
 	kg      *graph.KGStore // 知识图谱，nil 时降级跳过
 	embedFn func(text string) ([]float64, error)
 	mode    string // "hybrid" | "semantic" | "keyword" | "unavailable"
 }
 
 // NewHybridStore 创建混合检索存储，根据基础设施可用性自动选择模式
-func NewHybridStore(cfg *config.APIConfig, inf *infra.Infrastructure) *HybridStore {
+func NewHybridStore(cfg *config.APIConfig, chunks ragchunk.Repo) *HybridStore {
 	hs := &HybridStore{
-		cfg:  cfg,
-		inf:  inf,
-		mode: "unavailable",
+		cfg:    cfg,
+		chunks: chunks,
+		mode:   "unavailable",
 	}
-	milvusOK := inf.Ready.Milvus == "connected"
-	esOK := inf.Ready.ES == "connected"
+	milvusOK := chunks.MilvusAvailable()
+	esOK := chunks.ESAvailable()
 	switch {
 	case milvusOK && esOK:
 		hs.mode = "hybrid"
@@ -93,7 +93,7 @@ func (hs *HybridStore) Index(chunks []Chunk, docContent string) (string, []Index
 		embJSON, _ := json.Marshal(emb)
 
 		// 持久化到 PostgreSQL
-		pgID, err := hs.inf.SaveRAGChunk(docHash, i, c.Content, embJSON)
+		pgID, err := hs.chunks.SavePG(docHash, i, c.Content, embJSON)
 		if err != nil {
 			log.Printf("⚠️  RAG chunk 写入 PG 失败 (idx=%d): %v", i, err)
 			continue
@@ -101,14 +101,14 @@ func (hs *HybridStore) Index(chunks []Chunk, docContent string) (string, []Index
 		indexed = append(indexed, IndexedChunk{ID: i, PGID: pgID, Content: c.Content})
 
 		// 索引到 Elasticsearch
-		if hs.inf.Ready.ES == "connected" {
-			if err := hs.inf.IndexRAGChunk(pgID, c.Content, docHash, i); err != nil {
+		if hs.chunks.ESAvailable() {
+			if err := hs.chunks.IndexES(pgID, c.Content, docHash, i); err != nil {
 				log.Printf("⚠️  RAG chunk 索引到 ES 失败 (pg_id=%d): %v", pgID, err)
 			}
 		}
 
 		// 收集 Milvus 批量写入数据
-		if hs.inf.Ready.Milvus == "connected" && len(emb) > 0 {
+		if hs.chunks.MilvusAvailable() && len(emb) > 0 {
 			pgIDs = append(pgIDs, pgID)
 			contents = append(contents, c.Content)
 			emb32 := make([]float32, len(emb))
@@ -121,35 +121,16 @@ func (hs *HybridStore) Index(chunks []Chunk, docContent string) (string, []Index
 
 	// 批量写入 Milvus
 	if len(pgIDs) > 0 {
-		if err := hs.inf.InsertRAGChunks(pgIDs, contents, embeddings); err != nil {
+		if err := hs.chunks.InsertMilvus(pgIDs, contents, embeddings); err != nil {
 			log.Printf("⚠️  RAG chunks 写入 Milvus 失败: %v", err)
 		}
 	}
 	return docHash, indexed
 }
 
-// Delete 按 doc_hash 删除文档的所有 chunks（PG + ES + Milvus）
+// Delete 按 doc_hash 删除文档的所有 chunks（PG + ES + Milvus 三路级联）
 func (hs *HybridStore) Delete(docHash string) error {
-	pgIDs, err := hs.inf.DeleteRAGChunksByDocHash(docHash)
-	if err != nil {
-		return fmt.Errorf("delete rag chunks failed: %w", err)
-	}
-	if len(pgIDs) == 0 {
-		return nil
-	}
-	// 删除 ES 索引
-	if hs.inf.Ready.ES == "connected" {
-		if err := hs.inf.DeleteRAGChunksFromES(pgIDs); err != nil {
-			log.Printf("⚠️  ES 删除 RAG chunks 失败: %v", err)
-		}
-	}
-	// 删除 Milvus 向量
-	if hs.inf.Ready.Milvus == "connected" {
-		if err := hs.inf.DeleteRAGChunksFromMilvus(pgIDs); err != nil {
-			log.Printf("⚠️  Milvus 删除 RAG chunks 失败: %v", err)
-		}
-	}
-	return nil
+	return hs.chunks.Delete(docHash)
 }
 
 // RestoreChunks 标记 chunks 已从 PG 恢复（由 Engine 设置 Loaded）
@@ -202,8 +183,8 @@ func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 		fetchK = 10
 	}
 
-	milvusHits, milvusErr := hs.inf.MilvusSearchWithScores("rag_chunks", queryEmb32, fetchK)
-	esHits, esErr := hs.inf.SearchRAGChunks(query, fetchK)
+	milvusHits, milvusErr := hs.chunks.SearchMilvus(queryEmb32, fetchK)
+	esHits, esErr := hs.chunks.SearchES(query, fetchK)
 
 	if milvusErr != nil && esErr != nil {
 		log.Printf("⚠️  Milvus 和 ES 均检索失败: %v / %v", milvusErr, esErr)
@@ -272,7 +253,7 @@ func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 	for _, s := range sorted {
 		ids = append(ids, s.id)
 	}
-	rows, err := hs.inf.LoadRAGChunksByIDs(ids)
+	rows, err := hs.chunks.LoadByIDs(ids)
 	if err != nil {
 		log.Printf("⚠️  从 PG 加载 RAG chunk 失败: %v", err)
 		return nil
@@ -310,7 +291,7 @@ func (hs *HybridStore) searchSemantic(query string, topK int) []HybridResult {
 		queryEmb32[i] = float32(v)
 	}
 
-	hits, err := hs.inf.MilvusSearchWithScores("rag_chunks", queryEmb32, topK)
+	hits, err := hs.chunks.SearchMilvus(queryEmb32, topK)
 	if err != nil {
 		log.Printf("⚠️  Milvus 检索失败: %v", err)
 		return nil
@@ -320,7 +301,7 @@ func (hs *HybridStore) searchSemantic(query string, topK int) []HybridResult {
 	for _, h := range hits {
 		ids = append(ids, h.ID)
 	}
-	rows, _ := hs.inf.LoadRAGChunksByIDs(ids)
+	rows, _ := hs.chunks.LoadByIDs(ids)
 	contentMap := make(map[int64]string)
 	for _, r := range rows {
 		contentMap[r.ID] = r.Content
@@ -343,7 +324,7 @@ func (hs *HybridStore) searchSemantic(query string, topK int) []HybridResult {
 
 // searchKeyword: 仅 Elasticsearch BM25 关键词检索
 func (hs *HybridStore) searchKeyword(query string, topK int) []HybridResult {
-	hits, err := hs.inf.SearchRAGChunks(query, topK)
+	hits, err := hs.chunks.SearchES(query, topK)
 	if err != nil {
 		log.Printf("⚠️  ES 检索失败: %v", err)
 		return nil
@@ -353,7 +334,7 @@ func (hs *HybridStore) searchKeyword(query string, topK int) []HybridResult {
 	for _, h := range hits {
 		ids = append(ids, h.PGID)
 	}
-	rows, _ := hs.inf.LoadRAGChunksByIDs(ids)
+	rows, _ := hs.chunks.LoadByIDs(ids)
 	contentMap := make(map[int64]string)
 	for _, r := range rows {
 		contentMap[r.ID] = r.Content

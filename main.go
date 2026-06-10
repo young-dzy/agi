@@ -2,23 +2,36 @@
 //
 // 目录结构：
 //
-//	config/           配置（环境变量读取 + 默认值）
+//	config/                配置（YAML 加载 + 默认值，分组子结构）
 //	internal/
-//	  infra/          基础设施连接（Milvus / PostgreSQL / ES / Kafka）
-//	  llm/            LLM 客户端（真实 API + Mock 降级）
-//	  rag/            RAG 引擎（文本切分 + TF 向量检索）
-//	  tools/          工具定义与调用（time / weather / search）
-//	  memory/         三层记忆（短期 / 长期 / 用户偏好）
-//	  agent/          UnifiedAgent（ReAct + Harness + 智能路由）
-//	  handler/        HTTP API 路由处理
-//	frontend/         单文件前端 HTML
+//	  promptctx/           Schema-driven prompt context 装配（原 runtime 包）
+//	  llm/                 LLM 客户端（真实 API + Mock 降级）
+//	  rag/                 RAG 引擎（文本切分 + 三路混合检索）
+//	  tools/               工具定义与调用（time / weather / search / exec_command / MCP）
+//	  memory/              三层记忆（短期 / 长期 / 用户偏好 / 图记忆）
+//	  graph/                知识图谱业务（实体抽取 + 文档图）
+//	  sandbox/             命令沙箱执行
+//	  agent/               UnifiedAgent（ReAct + Harness + 智能路由）
+//	  handler/             HTTP API 路由处理
+//	  platform/            平台层连接封装（milvus / postgres / es / kafka / neo4j）
+//	  repo/                数据访问仓储（chathistory / preference / snapshot / longterm / ragchunk / eventbus）
+//	frontend/              单文件前端 HTML
 package main
 
 import (
 	"agi-ai-assitant/config"
 	"agi-ai-assitant/internal/agent"
 	"agi-ai-assitant/internal/handler"
-	"agi-ai-assitant/internal/infra"
+	"agi-ai-assitant/internal/platform/es"
+	"agi-ai-assitant/internal/platform/kafka"
+	"agi-ai-assitant/internal/platform/milvus"
+	"agi-ai-assitant/internal/platform/postgres"
+	"agi-ai-assitant/internal/repo/chathistory"
+	"agi-ai-assitant/internal/repo/eventbus"
+	"agi-ai-assitant/internal/repo/longterm"
+	"agi-ai-assitant/internal/repo/preference"
+	"agi-ai-assitant/internal/repo/ragchunk"
+	"agi-ai-assitant/internal/repo/snapshot"
 	"fmt"
 	"log"
 	"net/http"
@@ -27,27 +40,61 @@ import (
 func main() {
 	cfg := config.DefaultConfig()
 
-	// 初始化基础设施（失败则降级，不阻塞启动）
+	// ── 平台层连接（每路独立失败降级，不阻塞启动）──
 	log.Println("🔧 正在连接基础设施...")
-	inf := infra.New(cfg)
-	defer inf.Close()
+	milvusClient, milvusStatus := milvus.Connect(cfg.MilvusConfig)
+	pgDB, pgStatus := postgres.Connect(cfg.PostgresConfig)
+	if pgDB != nil {
+		postgres.BootstrapSchema(pgDB)
+	}
+	esClient, esStatus := es.Connect(cfg.ESConfig)
+	kafkaWriter, kafkaStatus := kafka.Connect(cfg.KafkaConfig)
 
-	// 初始化 UnifiedAgent
-	a := agent.New(cfg, inf)
+	// ── 仓储层（接口实现）──
+	deps := agent.Deps{
+		ChatRepo:     chathistory.NewPGRepo(pgDB),
+		PrefRepo:     preference.NewPGRepo(pgDB),
+		SnapRepo:     snapshot.NewPGRepo(pgDB),
+		LTMRepo:      longterm.NewPGRepo(pgDB),
+		RAGChunkRepo: ragchunk.NewStore(pgDB, milvusClient, esClient),
+		Events:       eventbus.NewKafkaPublisher(kafkaWriter, kafkaStatus == "connected"),
+		InfraStatus: map[string]string{
+			"milvus":        milvusStatus,
+			"pg":            pgStatus,
+			"elasticsearch": esStatus,
+			"kafka":         kafkaStatus,
+		},
+	}
 
-	// 注册 HTTP 路由
-	handler.New(a, inf, cfg)
+	// 关闭顺序：HTTP 服务在 main 退出时随进程结束；这里负责释放外部连接
+	defer func() {
+		if milvusClient != nil {
+			milvusClient.Close()
+		}
+		if pgDB != nil {
+			pgDB.Close()
+		}
+		if kafkaWriter != nil {
+			kafkaWriter.Close()
+		}
+	}()
 
-	// 挂载前端静态资源
+	// ── 初始化 UnifiedAgent ──
+	a := agent.New(cfg, deps)
+
+	// ── 注册 HTTP 路由 ──
+	handler.New(a, cfg)
+
+	// ── 挂载前端静态资源 ──
 	http.Handle("/", http.FileServer(http.Dir("frontend")))
 
-	printBanner(cfg, inf)
+	printBanner(cfg, deps.InfraStatus)
 
 	addr := ":" + cfg.ServerPort
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
-func printBanner(cfg *config.APIConfig, inf *infra.Infrastructure) {
+func printBanner(cfg *config.APIConfig, status map[string]string) {
 	addr := ":" + cfg.ServerPort
 	fmt.Println("========================================")
 	fmt.Println("Final Stage · AGI 智能助手启动成功")
@@ -59,10 +106,10 @@ func printBanner(cfg *config.APIConfig, inf *infra.Infrastructure) {
 
 	fmt.Println("----------------------------------------")
 
-	fmt.Printf("[INFO] Milvus        %s\n", inf.Ready.Milvus)
-	fmt.Printf("[INFO] PostgreSQL    %s:%d\n", cfg.PGHost, cfg.PGPort)
-	fmt.Printf("[INFO] ElasticSearch %s\n", inf.Ready.ES)
-	fmt.Printf("[INFO] Kafka         %s\n", inf.Ready.Kafka)
+	fmt.Printf("[INFO] Milvus        %s\n", status["milvus"])
+	fmt.Printf("[INFO] PostgreSQL    %s:%d (%s)\n", cfg.PGHost, cfg.PGPort, status["pg"])
+	fmt.Printf("[INFO] ElasticSearch %s\n", status["elasticsearch"])
+	fmt.Printf("[INFO] Kafka         %s\n", status["kafka"])
 
 	fmt.Println("----------------------------------------")
 	fmt.Println("[READY] 道阻且长，行则将至。")

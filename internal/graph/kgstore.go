@@ -1,8 +1,8 @@
 package graph
 
 import (
-	"context"
 	"agi-ai-assitant/config"
+	"cont
 	"fmt"
 	"log"
 	"sort"
@@ -55,12 +55,14 @@ func (ks *KGStore) IndexDocument(docHash string, chunks []ChunkRef) {
 		for _, ent := range result.Entities {
 			ent.DocHash = docHash
 			ent.ChunkID = c.ID
+			ent.PGID = c.PGID
 			ks.upsertEntity(ctx, ent)
 		}
 		// 写入关系边
 		for _, rel := range result.Relations {
 			rel.DocHash = docHash
 			rel.ChunkID = c.ID
+			rel.PGID = c.PGID
 			ks.upsertRelation(ctx, rel)
 		}
 	}
@@ -69,7 +71,8 @@ func (ks *KGStore) IndexDocument(docHash string, chunks []ChunkRef) {
 
 // ChunkRef 是 KGStore 摄入时需要的 chunk 信息（避免直接依赖 rag 包形成循环）
 type ChunkRef struct {
-	ID      int
+	ID      int   // 文档内 chunk idx（0-based）
+	PGID    int64 // PostgreSQL 自增 ID，KG 节点上同时持久化以支持 RAG RRF 融合
 	Content string
 }
 
@@ -78,12 +81,13 @@ func (ks *KGStore) upsertEntity(ctx context.Context, ent Entity) {
 	sess := ks.neo4j.session()
 	defer sess.Close(ctx)
 	query := `MERGE (e:Entity {name: $name})
-	          SET e.type = $type, e.doc_hash = $doc_hash, e.chunk_id = $chunk_id`
+	          SET e.type = $type, e.doc_hash = $doc_hash, e.chunk_id = $chunk_id, e.pg_id = $pg_id`
 	_, err := sess.Run(ctx, query, map[string]any{
 		"name":     ent.Name,
 		"type":     string(ent.Type),
 		"doc_hash": ent.DocHash,
 		"chunk_id": ent.ChunkID,
+		"pg_id":    ent.PGID,
 	})
 	if err != nil {
 		log.Printf("⚠️  Neo4j upsertEntity 失败 (%s): %v", ent.Name, err)
@@ -99,12 +103,13 @@ func (ks *KGStore) upsertRelation(ctx context.Context, rel Relation) {
 	query := `MERGE (a:Entity {name: $from})
 	          MERGE (b:Entity {name: $to})
 	          MERGE (a)-[r:` + rel.RelType + ` {doc_hash: $doc_hash}]->(b)
-	          SET r.chunk_id = $chunk_id`
+	          SET r.chunk_id = $chunk_id, r.pg_id = $pg_id`
 	_, err := sess.Run(ctx, query, map[string]any{
 		"from":     rel.FromName,
 		"to":       rel.ToName,
 		"doc_hash": rel.DocHash,
 		"chunk_id": rel.ChunkID,
+		"pg_id":    rel.PGID,
 	})
 	if err != nil {
 		log.Printf("⚠️  Neo4j upsertRelation 失败 (%s→%s): %v", rel.FromName, rel.ToName, err)
@@ -162,11 +167,14 @@ func (ks *KGStore) Search(queryText string, topK int) []GraphSearchResult {
 		names = append(names, e.Name)
 	}
 
-	// Cypher：从命中节点出发做最多 maxHops 跳遍历，收集相关 chunk_id
+	// Cypher：从命中节点出发做最多 maxHops 跳遍历，收集相关 chunk_id + pg_id
 	// 每跳权重递减（直接命中 > 1跳 > 2跳）
 	hops := ks.maxHops
 	if hops <= 0 {
 		hops = 2
+	}
+	if hops > 3 { // 防御性 clamp，避免配置错误拖死 Neo4j
+		hops = 3
 	}
 	query := `
 	MATCH (e:Entity) WHERE e.name IN $names
@@ -177,8 +185,9 @@ func (ks *KGStore) Search(queryText string, topK int) []GraphSearchResult {
 	YIELD node AS neighbor
 	WHERE neighbor:Entity AND neighbor.chunk_id IS NOT NULL
 	WITH e.name AS seed, neighbor.name AS nb, neighbor.chunk_id AS cid,
+	     COALESCE(neighbor.pg_id, 0) AS pgid,
 	     toInteger(apoc.node.degree(neighbor)) AS degree
-	RETURN cid, collect(DISTINCT seed) AS seeds, collect(DISTINCT nb) AS neighbors, max(degree) AS deg
+	RETURN cid, pgid, collect(DISTINCT seed) AS seeds, collect(DISTINCT nb) AS neighbors, max(degree) AS deg
 	ORDER BY size(seeds) DESC, deg DESC
 	LIMIT $limit`
 
@@ -194,15 +203,17 @@ func (ks *KGStore) Search(queryText string, topK int) []GraphSearchResult {
 
 	// 收集结果
 	type rawResult struct {
-		chunkID  int
-		seeds    []string
+		chunkID   int
+		pgID      int64
+		seeds     []string
 		neighbors []string
-		degree   int64
+		degree    int64
 	}
 	var raw []rawResult
 	for records.Next(ctx) {
 		rec := records.Record()
 		cid, _ := rec.Get("cid")
+		pgid, _ := rec.Get("pgid")
 		seeds, _ := rec.Get("seeds")
 		nbs, _ := rec.Get("neighbors")
 		deg, _ := rec.Get("deg")
@@ -212,10 +223,11 @@ func (ks *KGStore) Search(queryText string, topK int) []GraphSearchResult {
 			continue
 		}
 		r := rawResult{
-			chunkID:  chunkID,
-			seeds:    toStringSlice(seeds),
+			chunkID:   chunkID,
+			pgID:      toInt64(pgid),
+			seeds:     toStringSlice(seeds),
 			neighbors: toStringSlice(nbs),
-			degree:   toInt64(deg),
+			degree:    toInt64(deg),
 		}
 		raw = append(raw, r)
 	}
@@ -224,17 +236,18 @@ func (ks *KGStore) Search(queryText string, topK int) []GraphSearchResult {
 	}
 
 	// 计算分数：命中种子越多 + 图中心度越高 → 分越高
-	seen := make(map[int]bool)
+	seen := make(map[int64]bool)
 	var results []GraphSearchResult
 	for _, r := range raw {
-		if seen[r.chunkID] {
+		if r.pgID == 0 || seen[r.pgID] { // 没有 pg_id 的节点（旧数据）跳过
 			continue
 		}
-		seen[r.chunkID] = true
+		seen[r.pgID] = true
 		score := float64(len(r.seeds))*0.6 + float64(r.degree)*0.01
 		score *= ks.kgWeight
 		results = append(results, GraphSearchResult{
 			ChunkID:  r.chunkID,
+			PGID:     r.pgID,
 			Score:    score,
 			Entities: r.seeds,
 			HopPath:  r.neighbors,
@@ -254,24 +267,26 @@ func (ks *KGStore) searchDirect(ctx context.Context, names []string, topK int) [
 
 	records, err := sess.Run(ctx,
 		`MATCH (e:Entity) WHERE e.name IN $names AND e.chunk_id IS NOT NULL
-		 RETURN e.chunk_id AS cid, e.name AS name ORDER BY cid LIMIT $limit`,
+		 RETURN e.chunk_id AS cid, COALESCE(e.pg_id, 0) AS pgid, e.name AS name ORDER BY cid LIMIT $limit`,
 		map[string]any{"names": names, "limit": int64(topK)})
 	if err != nil {
 		return nil
 	}
 
-	seen := make(map[int]bool)
+	seen := make(map[int64]bool)
 	var results []GraphSearchResult
 	for records.Next(ctx) {
 		rec := records.Record()
 		cid := toInt(rec.Values[0])
-		name := toString(rec.Values[1])
-		if seen[cid] {
+		pgid := toInt64(rec.Values[1])
+		name := toString(rec.Values[2])
+		if pgid == 0 || seen[pgid] {
 			continue
 		}
-		seen[cid] = true
+		seen[pgid] = true
 		results = append(results, GraphSearchResult{
 			ChunkID:  cid,
+			PGID:     pgid,
 			Score:    ks.kgWeight,
 			Entities: []string{name},
 		})

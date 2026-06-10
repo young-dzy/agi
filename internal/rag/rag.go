@@ -108,15 +108,17 @@ func (e *Engine) Mode() string {
 // 知识图谱索引异步执行，不阻塞返回
 func (e *Engine) Ingest(doc string) (int, string) {
 	chunks := e.splitter.Split(doc)
-	docHash := e.store.Index(chunks, doc)
+	docHash, indexed := e.store.Index(chunks, doc)
 	e.Loaded = true
 	e.inf.PublishEvent("rag.ingest", fmt.Sprintf(`{"chunk_count":%d,"mode":"%s","doc_hash":"%s"}`, len(chunks), e.store.Mode(), docHash))
 
 	// 异步建图：实体关系抽取耗时较长，不阻塞主流程
-	if e.kg != nil && e.kg.Available() {
-		refs := make([]graph.ChunkRef, len(chunks))
-		for i, c := range chunks {
-			refs[i] = graph.ChunkRef{ID: c.ID, Content: c.Content}
+	// 注意：使用 indexed（含真实 PGID）而非 chunks，否则 KG 节点上的 pg_id 缺失，
+	// 检索时三路 RRF 融合会拿不到匹配的 PG 行。
+	if e.kg != nil && e.kg.Available() && len(indexed) > 0 {
+		refs := make([]graph.ChunkRef, len(indexed))
+		for i, c := range indexed {
+			refs[i] = graph.ChunkRef{ID: c.ID, PGID: c.PGID, Content: c.Content}
 		}
 		go e.kg.IndexDocument(docHash, refs)
 	}

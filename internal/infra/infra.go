@@ -3,18 +3,18 @@
 package infra
 
 import (
+	"agi-ai
 	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
-	"agi-ai-assitant/config"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
 	es "github.com/elastic/go-elasticsearch/v8"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	milvusClient "github.com/milvus-io/milvus-sdk-go/v2/client"
 	"github.com/milvus-io/milvus-sdk-go/v2/entity"
 	"github.com/segmentio/kafka-go"
@@ -271,7 +271,7 @@ func (inf *Infrastructure) SaveLongTermItemClassified(content string, importance
 	err := inf.pg.QueryRow(
 		`INSERT INTO long_term_memory (content, importance, embedding, category, tags, slot_hint)
 		 VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')) RETURNING id`,
-		content, importance, embeddingJSON, category, pgStringArray(tags), slotHint,
+		content, importance, embeddingJSON, category, pq.Array(tags), slotHint,
 	).Scan(&id)
 	if err != nil {
 		log.Printf("⚠️  长期记忆保存失败: %v", err)
@@ -298,7 +298,7 @@ func (inf *Infrastructure) LoadLongTermItems() []LongTermRow {
 	for rows.Next() {
 		var row LongTermRow
 		var embJSON []byte
-		var tags pgTextArray
+		var tags pq.StringArray
 		if err := rows.Scan(&row.ID, &row.Content, &row.Importance, &embJSON,
 			&row.CreatedAt, &row.LastAccessed, &row.Category, &tags, &row.SlotHint); err != nil {
 			continue
@@ -832,43 +832,7 @@ func (inf *Infrastructure) Close() {
 
 // ─────────────────────────────── PG 辅助 ────────────────────────────────
 
-// pgTextArray 是 PostgreSQL TEXT[] 的可扫描类型
-type pgTextArray []string
-
-func (a *pgTextArray) Scan(src interface{}) error {
-	if src == nil {
-		*a = nil
-		return nil
-	}
-	var b []byte
-	switch v := src.(type) {
-	case []byte:
-		b = v
-	case string:
-		b = []byte(v)
-	default:
-		return fmt.Errorf("pgTextArray: unsupported type %T", src)
-	}
-	s := strings.TrimSpace(string(b))
-	s = strings.TrimPrefix(s, "{")
-	s = strings.TrimSuffix(s, "}")
-	if s == "" {
-		*a = []string{}
-		return nil
-	}
-	*a = strings.Split(s, ",")
-	return nil
-}
-
-// pgStringArray 将 Go []string 转换为 PostgreSQL TEXT[] 字面量
-func pgStringArray(ss []string) string {
-	if len(ss) == 0 {
-		return "{}"
-	}
-	quoted := make([]string, len(ss))
-	for i, s := range ss {
-		s = strings.ReplaceAll(s, `"`, `\"`)
-		quoted[i] = `"` + s + `"`
-	}
-	return "{" + strings.Join(quoted, ",") + "}"
-}
+// 注：PostgreSQL TEXT[] 的读写统一通过 github.com/lib/pq 提供的
+//   - pq.Array(...)        : driver.Valuer，写入时正确转义引号 / 反斜杠 / 逗号
+//   - pq.StringArray       : sql.Scanner，读取时正确解析含逗号 / 引号的元素
+// 不再手写解析（曾经会把 {"a,b"} 切成 ["\"a","b\""]，导致 tag 数据错乱）。

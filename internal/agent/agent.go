@@ -10,9 +10,6 @@
 package agent
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"agi-ai-assitant/config"
 	"agi-ai-assitant/internal/graph"
 	"agi-ai-assitant/internal/infra"
@@ -22,10 +19,14 @@ import (
 	"agi-ai-assitant/internal/runtime"
 	"agi-ai-assitant/internal/sandbox"
 	"agi-ai-assitant/internal/tools"
+	"bytes"
+	"context"
+	"enc
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,31 +56,31 @@ type ReActStep struct {
 type TaskStepStatus string
 
 const (
-	StepPending      TaskStepStatus = "pending"
-	StepRunning      TaskStepStatus = "running"
-	StepDone         TaskStepStatus = "done"
-	StepFailed       TaskStepStatus = "failed"
-	StepInterrupted  TaskStepStatus = "interrupted"
+	StepPending     TaskStepStatus = "pending"
+	StepRunning     TaskStepStatus = "running"
+	StepDone        TaskStepStatus = "done"
+	StepFailed      TaskStepStatus = "failed"
+	StepInterrupted TaskStepStatus = "interrupted"
 )
 
 // TaskStep 是 Harness 中可重试的原子执行单元
 type TaskStep struct {
-	ID         int            `json:"id"`
-	Name       string         `json:"name"`
-	ToolName   string         `json:"tool_name"`
+	ID         int               `json:"id"`
+	Name       string            `json:"name"`
+	ToolName   string            `json:"tool_name"`
 	Params     map[string]string `json:"params"`
-	Status     TaskStepStatus `json:"status"`
-	Result     string         `json:"result,omitempty"`
-	Error      string         `json:"error,omitempty"`
-	RetryCount int            `json:"retry_count"`
+	Status     TaskStepStatus    `json:"status"`
+	Result     string            `json:"result,omitempty"`
+	Error      string            `json:"error,omitempty"`
+	RetryCount int               `json:"retry_count"`
 }
 
 // TaskState 描述一次任务的完整执行状态
 type TaskState struct {
 	TaskID        string     `json:"task_id"`
 	Query         string     `json:"query"`
-	Status        string     `json:"status"`        // "running" | "completed" | "interrupted"
-	Phase         string     `json:"phase"`          // "planning" | "executing" | "generating" | "done" | "interrupted"
+	Status        string     `json:"status"` // "running" | "completed" | "interrupted"
+	Phase         string     `json:"phase"`  // "planning" | "executing" | "generating" | "done" | "interrupted"
 	Steps         []TaskStep `json:"steps"`
 	CurrentStep   int        `json:"current_step"`
 	InterruptedAt int        `json:"interrupted_at,omitempty"` // 在第几步被中断的（0-based）
@@ -96,18 +97,18 @@ type Snapshot struct {
 
 // Response 是 UnifiedAgent.Process 的输出，携带本次请求的全部上下文
 type Response struct {
-	Query          string                 `json:"query"`
-	Answer         string                 `json:"answer"`
-	Mode           string                 `json:"mode"`           // chat / tool / rag / memory / react
-	Steps          []ReActStep            `json:"steps,omitempty"`
-	ToolCall       *tools.CallResult      `json:"tool_call,omitempty"`
-	SearchResults  []rag.SearchResult     `json:"search_results,omitempty"`
-	Task           *TaskState             `json:"task,omitempty"`
-	ExtractedInfo  string                 `json:"extracted_info,omitempty"`
-	ShortTermCount int                    `json:"short_term_count"`
-	LongTermCount  int                    `json:"long_term_count"`
-	Preferences    map[string]string      `json:"preferences"`
-	Interrupted    bool                   `json:"interrupted,omitempty"`
+	Query          string             `json:"query"`
+	Answer         string             `json:"answer"`
+	Mode           string             `json:"mode"` // chat / tool / rag / memory / react
+	Steps          []ReActStep        `json:"steps,omitempty"`
+	ToolCall       *tools.CallResult  `json:"tool_call,omitempty"`
+	SearchResults  []rag.SearchResult `json:"search_results,omitempty"`
+	Task           *TaskState         `json:"task,omitempty"`
+	ExtractedInfo  string             `json:"extracted_info,omitempty"`
+	ShortTermCount int                `json:"short_term_count"`
+	LongTermCount  int                `json:"long_term_count"`
+	Preferences    map[string]string  `json:"preferences"`
+	Interrupted    bool               `json:"interrupted,omitempty"`
 }
 
 // ─────────────────────────────── SSE 流式事件 ────────────────────────────────
@@ -127,20 +128,20 @@ func NewStreamEvent(eventType string, data interface{}) StreamEvent {
 
 // UnifiedAgent 整合全部能力，是系统的核心调度入口
 type UnifiedAgent struct {
-	cfg      *config.APIConfig
-	llm      *llm.Client
-	rag      *rag.Engine
-	tools    map[string]tools.Tool
-	stm      *memory.ShortTerm
-	ltm      *memory.LongTerm      // 保留直接引用，供 handler 暴露
-	graphMem *memory.GraphMemory   // 图增强记忆层（包装 ltm）
-	pref     *memory.Preference
-	sandbox  *sandbox.Sandbox
-	kg       *graph.KGStore // 知识图谱（RAG + 记忆图共享）
+	cfg       *config.APIConfig
+	llm       *llm.Client
+	rag       *rag.Engine
+	tools     map[string]tools.Tool
+	stm       *memory.ShortTerm
+	ltm       *memory.LongTerm    // 保留直接引用，供 handler 暴露
+	graphMem  *memory.GraphMemory // 图增强记忆层（包装 ltm）
+	pref      *memory.Preference
+	sandbox   *sandbox.Sandbox
+	kg        *graph.KGStore // 知识图谱（RAG + 记忆图共享）
 	snapshots []Snapshot
-	task     *TaskState
-	inf      *infra.Infrastructure
-	cancelFn context.CancelFunc // 当前任务的取消函数
+	task      *TaskState
+	inf       *infra.Infrastructure
+	cancelFn  context.CancelFunc // 当前任务的取消函数
 
 	// Schema-driven Runtime Context Assembly
 	assembler   *runtime.ContextAssembler
@@ -188,9 +189,23 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	a.rag.SetEmbedFn(func(text string) ([]float64, error) {
 		return a.llm.Embed(text)
 	})
-	// 初始化 RAG 基础设施（Milvus collection + ES 索引）
-	a.inf.InitRAGInfra(cfg.RAGMilvusDim)
-	// 将 RAG 注册为可选工具（私人黑洞知识库检索）
+	// 启动期 IO 并发：以下 4 项互不依赖，串行总耗时是各自之和（PG 全量加载 + Milvus 建表
+	// + ES 建索引 + Docker probe 1.5s + Neo4j 5s 验证），并行后压缩到最慢一项的耗时。
+	//
+	//   - InitRAGInfra      建 Milvus collection + ES 索引
+	//   - restoreFromDB     从 PG 恢复偏好 / 长期记忆 / 聊天记录
+	//   - restoreRAGFromDB  从 PG 恢复 RAG chunks
+	//   - initSandbox       Docker daemon 探测 + exec_command 工具注册
+	//
+	// initKnowledgeGraph 依赖 restoreFromDB 完成后的 ltm.Items（SyncPrevID 读取最后一条），
+	// 因此放在并发组之后单独执行。
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() { defer wg.Done(); a.inf.InitRAGInfra(cfg.RAGMilvusDim) }()
+	go func() { defer wg.Done(); a.restoreFromDB() }()
+	go func() { defer wg.Done(); a.restoreRAGFromDB() }()
+	go func() { defer wg.Done(); a.initSandbox() }()
+	// 将 RAG 注册为可选工具（私人黑洞知识库检索）—— 不涉及 IO，与并发组同时跑
 	a.tools["rag_search"] = tools.Tool{
 		Name:        "rag_search",
 		Description: "从私人黑洞（个人知识库）中检索相关文档内容",
@@ -234,14 +249,10 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 			), nil
 		},
 	}
-	// 从 PostgreSQL 恢复跨会话记忆
-	a.restoreFromDB()
-	// 从 PostgreSQL 恢复 RAG chunks
-	a.restoreRAGFromDB()
-	// 初始化知识图谱（Neo4j），注入到 RAG 引擎
+	// 等待第一阶段并发 init 完成（restoreFromDB / restoreRAGFromDB / InitRAGInfra / initSandbox）
+	wg.Wait()
+	// 第二阶段：知识图谱依赖 restoreFromDB 加载的 ltm 才能 SyncPrevID
 	a.initKnowledgeGraph()
-	// 初始化沙箱并注册 exec_command 工具
-	a.initSandbox()
 
 	// ── Schema-driven Runtime Context Assembly ──
 	a.taskMem = runtime.NewTaskMemBuffer(20)
@@ -1484,11 +1495,11 @@ func (a *UnifiedAgent) fillParamsFromPreference(tc *tools.CallResult) {
 	}
 	// 偏好 key → 工具参数名的映射
 	prefToParam := map[string][]string{
-		"城市":   {"city", "location", "location_name"},
-		"时区":   {"timezone", "tz", "time_zone"},
-		"姓名":   {"name", "username", "user_name"},
-		"语言":   {"language", "lang"},
-		"国家":   {"country", "nation"},
+		"城市": {"city", "location", "location_name"},
+		"时区": {"timezone", "tz", "time_zone"},
+		"姓名": {"name", "username", "user_name"},
+		"语言": {"language", "lang"},
+		"国家": {"country", "nation"},
 	}
 	for prefKey, paramNames := range prefToParam {
 		prefVal, ok := a.pref.Data[prefKey]

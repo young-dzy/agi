@@ -14,13 +14,14 @@ import (
 // DockerSandbox 通过 docker CLI 在容器内执行命令
 //
 // 关键安全约束（作为 docker run 参数传入）:
-//   --rm                  执行完自动清理容器
-//   --network none        禁用网络
-//   --read-only           根文件系统只读
-//   --tmpfs /tmp:size=...允许 /tmp 临时写入
-//   --memory / --cpus / --pids-limit  cgroup 资源硬限制
-//   --security-opt no-new-privileges  禁止权限提升
-//   --cap-drop ALL        放弃所有 Linux capabilities
+//
+//	--rm                  执行完自动清理容器
+//	--network none        禁用网络
+//	--read-only           根文件系统只读
+//	--tmpfs /tmp:size=...允许 /tmp 临时写入
+//	--memory / --cpus / --pids-limit  cgroup 资源硬限制
+//	--security-opt no-new-privileges  禁止权限提升
+//	--cap-drop ALL        放弃所有 Linux capabilities
 type DockerSandbox struct {
 	cfg       SandboxConfig
 	available bool
@@ -40,9 +41,15 @@ func (d *DockerSandbox) Backend() string { return "docker" }
 func (d *DockerSandbox) Available() bool { return d.available }
 
 // probe 通过 docker version 命令检测 daemon 是否就绪
+//
+// 启动期被 agent.initSandbox 同步调用，超时直接拖慢服务启动。
+// 1.5s 已足以覆盖本地 daemon 响应（健康 daemon 通常 <100ms 返回）；
+// 真正不可用时不必等 3s 才确认 —— Docker socket 不存在 / 没权限会立即返回。
 func (d *DockerSandbox) probe() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
+	// 用 `docker info` 也能行，但 `docker version --format {{.Server.Version}}`
+	// 在 daemon 不在时立即返回错误（不会触发 client/server 协议握手）。
 	cmd := exec.CommandContext(ctx, "docker", "version", "--format", "{{.Server.Version}}")
 	if err := cmd.Run(); err != nil {
 		return false

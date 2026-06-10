@@ -2,11 +2,10 @@
 package rag
 
 import (
-	"crypto/sha256"
-	"encoding/json"
 	"agi-ai-assitant/config"
 	"agi-ai-assitant/internal/graph"
 	"agi-ai-assitant/internal/infra"
+	"crypto/sha2
 	"fmt"
 	"log"
 	"sort"
@@ -65,14 +64,24 @@ func (hs *HybridStore) Mode() string { return hs.mode }
 
 // ─────────────────────── Index ──────────────────────────────────────────
 
-// Index 将 chunks 持久化到 PG + Milvus + ES，返回文档哈希（用于后续删除）
-func (hs *HybridStore) Index(chunks []Chunk, docContent string) string {
+// IndexedChunk 是单条 chunk 摄入后的持久化引用，包含真实 PG 自增 ID
+// 供 KG 索引时建立 Entity → PG ID 的反查链路
+type IndexedChunk struct {
+	ID      int   // 文档内 chunk idx (0-based)
+	PGID    int64 // PostgreSQL 自增 ID
+	Content string
+}
+
+// Index 将 chunks 持久化到 PG + Milvus + ES，返回 (docHash, []IndexedChunk)
+// 调用方拿到 PGID 后可异步喂给 KG，让 KG 节点上同时持有 pg_id（用于检索期 RRF 融合）
+func (hs *HybridStore) Index(chunks []Chunk, docContent string) (string, []IndexedChunk) {
 	// 计算文档哈希（幂等摄入）
 	docHash := fmt.Sprintf("%x", sha256.Sum256([]byte(docContent)))[:16]
 
 	var pgIDs []int64
 	var contents []string
 	var embeddings [][]float32
+	indexed := make([]IndexedChunk, 0, len(chunks))
 
 	for i, c := range chunks {
 		// Embedding 向量化
@@ -88,6 +97,7 @@ func (hs *HybridStore) Index(chunks []Chunk, docContent string) string {
 			log.Printf("⚠️  RAG chunk 写入 PG 失败 (idx=%d): %v", i, err)
 			continue
 		}
+		indexed = append(indexed, IndexedChunk{ID: i, PGID: pgID, Content: c.Content})
 
 		// 索引到 Elasticsearch
 		if hs.inf.Ready.ES == "connected" {
@@ -114,7 +124,7 @@ func (hs *HybridStore) Index(chunks []Chunk, docContent string) string {
 			log.Printf("⚠️  RAG chunks 写入 Milvus 失败: %v", err)
 		}
 	}
-	return docHash
+	return docHash, indexed
 }
 
 // Delete 按 doc_hash 删除文档的所有 chunks（PG + ES + Milvus）
@@ -207,7 +217,10 @@ func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 		return hs.searchSemantic(query, topK)
 	}
 
-	// Reciprocal Rank Fusion: score(d) = Σ 1/(k + rank_i(d))
+	// Reciprocal Rank Fusion: score(d) = Σ w_i / (k + rank_i(d))
+	//
+	// 三路使用统一的 rank-based 评分（避免不同检索源的原始分数尺度不一致），
+	// 通过权重控制各路占比：语义/关键词默认 1.0，KG 用 cfg.KGWeight。
 	k := hs.cfg.RRFConstantK
 	if k <= 0 {
 		k = 60
@@ -221,15 +234,19 @@ func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 		rrfScores[hit.PGID] += 1.0 / float64(k+rank+1)
 	}
 
-	// 知识图谱第三路：将图检索结果的 chunkID 映射回 PG ID
-	// chunk_id 字段在 Neo4j 中存的是 PG 存储时的 idx（0-based），
-	// 实际 PG ID 通过 LoadRAGChunksByDocIdx 获取；
-	// 这里以 float64 分数直接叠加到 rrfScores（分数归一化后已无量纲）
+	// 知识图谱第三路：KG 节点上已持久化 pg_id（见 graph/kgstore.go upsertEntity），
+	// 直接用 hit.PGID 累加到 rrfScores 即可与 Milvus / ES 路径正确合并。
 	if hs.kg != nil && hs.kg.Available() {
+		kgWeight := hs.cfg.KGWeight
+		if kgWeight <= 0 {
+			kgWeight = 1.0
+		}
 		kgHits := hs.kg.Search(query, fetchK)
 		for rank, hit := range kgHits {
-			// hit.Score 是 kg 内部分数（已乘以 kgWeight），额外叠加 RRF 排名奖励
-			rrfScores[int64(hit.ChunkID)] += hit.Score + 1.0/float64(k+rank+1)
+			if hit.PGID == 0 { // 老节点（升级前数据）没有 pg_id，跳过避免污染
+				continue
+			}
+			rrfScores[hit.PGID] += kgWeight / float64(k+rank+1)
 		}
 	}
 

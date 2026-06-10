@@ -71,6 +71,15 @@ func (inf *Infrastructure) connectPostgres() {
 		inf.Ready.PG = "disconnected"
 		return
 	}
+	// 连接池调优：默认 unlimited 在并发量大时会打爆 PG max_connections。
+	//   - MaxOpenConns 25：单实例上限，留余量给其他客户端
+	//   - MaxIdleConns 5：维持最小空闲，避免每次冷连接
+	//   - ConnMaxLifetime 30min：定期回收，防止云数据库 idle timeout 后用到失效连接
+	pg.SetMaxOpenConns(25)
+	pg.SetMaxIdleConns(5)
+	pg.SetConnMaxLifetime(30 * time.Minute)
+	pg.SetConnMaxIdleTime(5 * time.Minute)
+
 	if err := pg.Ping(); err != nil {
 		log.Printf("⚠️  PostgreSQL Ping 失败: %v", err)
 		inf.Ready.PG = "disconnected"

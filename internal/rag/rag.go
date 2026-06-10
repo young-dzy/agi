@@ -7,8 +7,23 @@ import (
 	"agi-ai-assitant/internal/graph"
 	"agi-ai-assitant/internal/infra"
 	"fmt"
+	"log"
+	"runtime/debug"
 	"strings"
 )
+
+// goSafe 启动一个带 panic recover 的后台 goroutine。
+// KG IndexDocument 涉及 Neo4j 写入，断连时驱动可能 panic — 包一层避免拖崩进程。
+func goSafe(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️  goroutine panic [%s]: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
 
 // ─────────────────────────────── 文本分割 ────────────────────────────────
 
@@ -120,7 +135,7 @@ func (e *Engine) Ingest(doc string) (int, string) {
 		for i, c := range indexed {
 			refs[i] = graph.ChunkRef{ID: c.ID, PGID: c.PGID, Content: c.Content}
 		}
-		go e.kg.IndexDocument(docHash, refs)
+		goSafe("rag.kg-index", func() { e.kg.IndexDocument(docHash, refs) })
 	}
 
 	return len(chunks), docHash

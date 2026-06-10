@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -131,7 +132,6 @@ type UnifiedAgent struct {
 	cfg      *config.APIConfig
 	llm      *llm.Client
 	rag      *rag.Engine
-	tools    map[string]tools.Tool
 	stm      *memory.ShortTerm
 	ltm      *memory.LongTerm    // 保留直接引用，供 handler 暴露
 	graphMem *memory.GraphMemory // 图增强记忆层（包装 ltm）
@@ -144,6 +144,11 @@ type UnifiedAgent struct {
 	assembler   *runtime.ContextAssembler
 	taskMem     *runtime.TaskMemBuffer
 	toolTracker *runtime.ToolStateTracker
+
+	// 工具集：可被 RegisterTool（MCP 热插）并发写入，被 ReAct/Decide 并发读取。
+	// Go map 并发读写会直接 panic，必须串行化。toolsMu 独立于 mu 以避免锁粒度过大。
+	toolsMu sync.RWMutex
+	tools   map[string]tools.Tool
 
 	// per-request 共享状态：snapshots、当前任务、in-flight cancel funcs
 	//
@@ -214,8 +219,9 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	go func() { defer wg.Done(); a.restoreFromDB() }()
 	go func() { defer wg.Done(); a.restoreRAGFromDB() }()
 	go func() { defer wg.Done(); a.initSandbox() }()
-	// 将 RAG 注册为可选工具（私人黑洞知识库检索）—— 不涉及 IO，与并发组同时跑
-	a.tools["rag_search"] = tools.Tool{
+	// 将 RAG 注册为可选工具（私人黑洞知识库检索）。
+	// 通过 RegisterTool 持锁写入，避免与并发的 initSandbox（也写 a.tools["exec_command"]）竞争。
+	a.RegisterTool(tools.Tool{
 		Name:        "rag_search",
 		Description: "从私人黑洞（个人知识库）中检索相关文档内容",
 		Parameters: []tools.Param{
@@ -232,9 +238,9 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 			answer, _ := a.rag.Query(q)
 			return answer, nil
 		},
-	}
+	})
 	// 用 LLM 知识 + 可选 Tavily API 替换默认的 mock search_web
-	a.tools["search_web"] = tools.Tool{
+	a.RegisterTool(tools.Tool{
 		Name:        "search_web",
 		Description: "搜索互联网获取最新信息",
 		Parameters: []tools.Param{
@@ -257,7 +263,7 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 				[]llm.Message{{Role: "user", Content: "搜索：" + q}},
 			), nil
 		},
-	}
+	})
 	// 等待第一阶段并发 init 完成（restoreFromDB / restoreRAGFromDB / InitRAGInfra / initSandbox）
 	wg.Wait()
 	// 第二阶段：知识图谱依赖 restoreFromDB 加载的 ltm 才能 SyncPrevID
@@ -292,7 +298,8 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 	}))
 	reg.Register(runtime.NewTaskMemSource(a.taskMem))
 	reg.Register(runtime.NewToolStateSource(
-		func() map[string]tools.Tool { return a.tools },
+		// 持读锁拷贝供 ToolStateSource 装配 prompt：每次调用都拿一致的工具集快照
+		a.toolsSnapshot,
 		a.toolTracker,
 	))
 	reg.Register(runtime.NewConstraintsSource(sandbox.PolicySnapshot()))
@@ -308,15 +315,36 @@ func New(cfg *config.APIConfig, inf *infra.Infrastructure) *UnifiedAgent {
 }
 
 // RegisterTool 动态注册一个工具（支持 MCP 工具热插入）
+//
+// 持 toolsMu.Lock 串行化对工具 map 的写入，避免与 ReAct/Decide 并发读冲突
+// （Go map 并发读写会直接 panic，不只是脏读）。
 func (a *UnifiedAgent) RegisterTool(t tools.Tool) {
+	a.toolsMu.Lock()
 	a.tools[t.Name] = t
+	a.toolsMu.Unlock()
 }
 
 // RAG 暴露 RAG 引擎，供 HTTP handler 直接调用 Ingest
 func (a *UnifiedAgent) RAG() *rag.Engine { return a.rag }
 
-// Tools 暴露工具集，供 HTTP handler 列出工具信息
-func (a *UnifiedAgent) Tools() map[string]tools.Tool { return a.tools }
+// Tools 暴露工具集（持锁拷贝），供 HTTP handler 列出工具信息。
+// 调用方拿到的是快照，可无锁安全使用，且修改不影响 agent 内部 map。
+func (a *UnifiedAgent) Tools() map[string]tools.Tool {
+	return a.toolsSnapshot()
+}
+
+// toolsSnapshot 持锁返回工具 map 的浅拷贝（Tool 内部字段不可变，浅拷贝足够）
+// 路由层（runReAct*/runTool*/Decide）调用一次后即可无锁使用，且能保证整次
+// 调用看到一致的工具集（不被 in-flight RegisterTool 干扰）。
+func (a *UnifiedAgent) toolsSnapshot() map[string]tools.Tool {
+	a.toolsMu.RLock()
+	defer a.toolsMu.RUnlock()
+	cp := make(map[string]tools.Tool, len(a.tools))
+	for k, v := range a.tools {
+		cp[k] = v
+	}
+	return cp
+}
 
 // ShortTerm 暴露短期记忆，供 HTTP handler 查询
 func (a *UnifiedAgent) ShortTerm() *memory.ShortTerm { return a.stm }
@@ -370,6 +398,27 @@ func (a *UnifiedAgent) setTask(t *TaskState) {
 	a.task = t
 	a.snapshots = nil
 	a.mu.Unlock()
+}
+
+// goSafe 启动一个带 panic recover 的后台 goroutine。
+//
+// agent 有大量 fire-and-forget 异步任务（偏好提取、记忆挖掘、记忆合并、
+// Neo4j 异步写、KG 索引等）。任意一处 panic（比如 Neo4j 突然断连后某处空指针）
+// 在裸 go func() 下会让整个进程崩溃，影响其他正常请求。
+//
+// 这个 helper 给所有异步任务统一兜底：
+//   - 捕获 panic 并打印 stack trace（便于事后排查）
+//   - name 标记任务来源，方便日志检索
+//   - 不影响业务返回值（任务失败时静默丢弃）
+func (a *UnifiedAgent) goSafe(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️  goroutine panic [%s]: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
 }
 
 // ─────────────────────────────── 主处理流程 ──────────────────────────────
@@ -437,7 +486,7 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 	a.inf.SaveChatHistory("user", query)
 
 	// 偏好提取：优先 LLM，降级规则
-	go func() {
+	a.goSafe("process.preference-extract", func() {
 		kvs := a.llm.ExtractPreferences(query)
 		if len(kvs) > 0 {
 			a.pref.SaveBatch(kvs)
@@ -452,7 +501,7 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 				}
 			}
 		}
-	}()
+	})
 
 	// 同步规则提取（用于立即展示 ExtractedInfo）
 	if key, value, ok := a.pref.ExtractAndSave(query); ok {
@@ -480,10 +529,10 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 		switch {
 		case a.needReAct(query):
 			mode = "react"
-			routeTools = a.tools
+			routeTools = a.toolsSnapshot()
 		case a.needTool(query):
 			mode = "tool"
-			routeTools = a.tools
+			routeTools = a.toolsSnapshot()
 		case a.needRAG(query):
 			mode = "rag"
 		default:
@@ -528,10 +577,10 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 	a.inf.SaveChatHistory("assistant", resp.Answer)
 
 	// 从 assistant 回答中提取可记忆信息
-	go a.extractMemoryFromReply(resp.Answer)
+	a.goSafe("process.memory-extract", func() { a.extractMemoryFromReply(resp.Answer) })
 
 	// 异步触发记忆合并（去重+合并+衰减+过期；有图层时使用图感知合并以保护高中心度节点）
-	go func() {
+	a.goSafe("process.consolidate", func() {
 		if a.ltm.NeedConsolidation() {
 			var result memory.ConsolidationResult
 			if a.graphMem != nil {
@@ -541,7 +590,7 @@ func (a *UnifiedAgent) process(ctx context.Context, query string, opts ChatOptio
 			}
 			a.syncConsolidationToDB(result)
 		}
-	}()
+	})
 
 	eventData, _ := json.Marshal(map[string]interface{}{"query": query, "mode": resp.Mode})
 	a.inf.PublishEvent("agent.chat", string(eventData))
@@ -564,7 +613,7 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 	a.inf.SaveChatHistory("user", query)
 
 	// 偏好提取（异步，与 process 一致）
-	go func() {
+	a.goSafe("processStream.preference-extract", func() {
 		kvs := a.llm.ExtractPreferences(query)
 		if len(kvs) > 0 {
 			a.pref.SaveBatch(kvs)
@@ -579,7 +628,7 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 				}
 			}
 		}
-	}()
+	})
 
 	// 同步规则提取
 	if key, value, ok := a.pref.ExtractAndSave(query); ok {
@@ -608,10 +657,10 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 		switch {
 		case a.needReAct(query):
 			mode = "react"
-			routeTools = a.tools
+			routeTools = a.toolsSnapshot()
 		case a.needTool(query):
 			mode = "tool"
-			routeTools = a.tools
+			routeTools = a.toolsSnapshot()
 		case a.needRAG(query):
 			mode = "rag"
 		default:
@@ -658,9 +707,9 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 	a.stm.Add("assistant", resp.Answer)
 	a.inf.SaveChatHistory("assistant", resp.Answer)
 
-	go a.extractMemoryFromReply(resp.Answer)
+	a.goSafe("processStream.memory-extract", func() { a.extractMemoryFromReply(resp.Answer) })
 
-	go func() {
+	a.goSafe("processStream.consolidate", func() {
 		if a.ltm.NeedConsolidation() {
 			var result memory.ConsolidationResult
 			if a.graphMem != nil {
@@ -670,7 +719,7 @@ func (a *UnifiedAgent) processStream(ctx context.Context, query string, opts Cha
 			}
 			a.syncConsolidationToDB(result)
 		}
-	}()
+	})
 
 	eventData, _ := json.Marshal(map[string]interface{}{"query": query, "mode": resp.Mode})
 	a.inf.PublishEvent("agent.chat", string(eventData))
@@ -726,9 +775,11 @@ func (a *UnifiedAgent) buildHistoryMessages(query string) []llm.Message {
 	return msgs
 }
 
-// filterTools 按名称列表过滤可用工具集
+// filterTools 按名称列表过滤可用工具集（持读锁）
 func (a *UnifiedAgent) filterTools(names []string) map[string]tools.Tool {
-	result := make(map[string]tools.Tool)
+	a.toolsMu.RLock()
+	defer a.toolsMu.RUnlock()
+	result := make(map[string]tools.Tool, len(names))
 	for _, name := range names {
 		if t, ok := a.tools[name]; ok {
 			result[name] = t
@@ -1796,7 +1847,9 @@ func (a *UnifiedAgent) initSandbox() {
 	})
 
 	a.sandbox = sb
-	a.tools["exec_command"] = tools.ExecCommandTool(sb)
+	// 走 RegisterTool 持锁写入：initSandbox 在 New 中以 goroutine 形式运行，
+	// 与同期的 RAG/search_web 注册存在并发，必须串行化。
+	a.RegisterTool(tools.ExecCommandTool(sb))
 	log.Printf("🛡️  沙箱已就绪，后端=%s，exec_command 工具已注册", sb.Backend())
 }
 

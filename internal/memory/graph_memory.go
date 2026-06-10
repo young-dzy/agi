@@ -17,9 +17,25 @@ package memory
 import (
 	"agi-ai-assitant/internal/graph"
 	"log"
+	"runtime/debug"
 	"sort"
 	"time"
 )
+
+// goSafe 启动一个带 panic recover 的后台 goroutine。
+//
+// graph_memory 里的所有图层异步操作（Neo4j Upsert/AddEdge/Delete）都用它包：
+// Neo4j 断连后驱动可能 panic，裸 go 会让整个进程崩。
+func goSafe(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️  goroutine panic [%s]: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
 
 // GraphMemory 是 LongTerm 的图增强包装层
 type GraphMemory struct {
@@ -70,13 +86,13 @@ func (gm *GraphMemory) StoreClassified(content string, importance float64, embed
 	newID := newItem.ID
 
 	if gm.kg != nil && gm.kg.Available() {
-		go func() {
+		goSafe("graphmem.store-node", func() {
 			gm.kg.UpsertMemoryNode(newID, content, importance)
 			if gm.prevID >= 0 {
 				gm.kg.AddMemoryEdge(gm.prevID, newID, "FOLLOWS", 1.0)
 			}
 			gm.linkSimilarEdges(newItem, newID)
-		}()
+		})
 	}
 
 	gm.prevID = newID
@@ -211,11 +227,11 @@ func (gm *GraphMemory) GraphAwareConsolidate() ConsolidationResult {
 	}
 
 	// 同步删除 Neo4j 中对应节点
-	go func() {
+	goSafe("graphmem.consolidate-delete", func() {
 		for _, id := range result.DeleteFromDB {
 			gm.kg.DeleteMemoryNode(id)
 		}
-	}()
+	})
 
 	return result
 }
@@ -230,9 +246,9 @@ func (gm *GraphMemory) SyncPrevID() {
 // UpdateNodeAfterMerge 记忆合并后更新 Neo4j 节点内容
 func (gm *GraphMemory) UpdateNodeAfterMerge(item Item) {
 	if gm.kg != nil && gm.kg.Available() {
-		go func() {
+		goSafe("graphmem.update-after-merge", func() {
 			gm.kg.UpsertMemoryNode(item.ID, item.Content, item.Importance)
-		}()
+		})
 	}
 }
 
@@ -240,7 +256,9 @@ func (gm *GraphMemory) UpdateNodeAfterMerge(item Item) {
 func (gm *GraphMemory) StoreItem(item Item) {
 	gm.ltm.StoreItem(item)
 	if gm.kg != nil && gm.kg.Available() {
-		go gm.kg.UpsertMemoryNode(item.ID, item.Content, item.Importance)
+		goSafe("graphmem.store-item", func() {
+			gm.kg.UpsertMemoryNode(item.ID, item.Content, item.Importance)
+		})
 	}
 }
 
@@ -263,11 +281,11 @@ func (gm *GraphMemory) SyncLastItemPGID(pgID int) {
 		gm.prevID = last.ID
 		// 更新 Neo4j 节点 ID（SyncLastItemPGID 会修改最后一条 Item.ID）
 		if gm.kg != nil && gm.kg.Available() {
-			go func() {
+			goSafe("graphmem.sync-pgid", func() {
 				// 给 Neo4j 一点时间完成之前的异步操作
 				time.Sleep(50 * time.Millisecond)
 				gm.kg.UpsertMemoryNode(last.ID, last.Content, last.Importance)
-			}()
+			})
 		}
 	}
 }

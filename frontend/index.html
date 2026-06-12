@@ -21,7 +21,7 @@
   --primary:    #c4b5fd;
   --primary-d:  #a78bfa;
   --pink:       #f9a8d4;
-  --pink-d:     #f472b6;
+  --pink-d:     #f472b6;--pink-l:     #fce7f3;
   --green:      #6ee7b7;
   --green-l:    #d1fae5;
   --amber:      #fbbf24;
@@ -256,6 +256,11 @@ body {
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
+  /* 提升 stacking context，确保 .tool-picker 下拉浮在消息气泡之上。
+     旧实现里 .tool-picker 自己 z-index:100 但父级 .controls-bar 没设
+     position/z-index，导致部分浏览器把它和 .messages 视作同层，下拉被气泡遮住。 */
+  position: relative;
+  z-index: 50;
 }
 
 /* RAG toggle */

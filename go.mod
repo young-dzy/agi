@@ -1,4 +1,4 @@
-module agi-ai-assitant
+module agi-assistant
 
 go 1.23.0
 

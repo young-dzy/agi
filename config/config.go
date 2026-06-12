@@ -101,6 +101,14 @@ type RAGConfig struct {
 	SemanticWeight     float64
 	EnableHybridSearch bool
 	RAGMilvusDim       int
+
+	// Query Rewrite（history-aware + multi-query）
+	RAGRewriteEnabled    bool
+	RAGRewriteNumQueries int // 含原查询在内的目标改写条数
+
+	// Rerank（LLM listwise 精排）
+	RAGRerankEnabled    bool
+	RAGRerankPreviewLen int // 给 reranker 看的每条候选最大字符数
 }
 
 // MemoryConfig 三层记忆 + 长期记忆合并策略
@@ -208,6 +216,14 @@ type yamlFile struct {
 		SemanticWeight     float64 `yaml:"semantic_weight"`
 		EnableHybridSearch bool    `yaml:"enable_hybrid_search"`
 		RAGMilvusDim       int     `yaml:"rag_milvus_dim"`
+		Rewrite            struct {
+			Enabled    bool `yaml:"enabled"`
+			NumQueries int  `yaml:"num_queries"`
+		} `yaml:"rewrite"`
+		Rerank struct {
+			Enabled    bool `yaml:"enabled"`
+			PreviewLen int  `yaml:"preview_len"`
+		} `yaml:"rerank"`
 	} `yaml:"rag"`
 	Memory struct {
 		ShortTermMaxTurns int `yaml:"short_term_max_turns"`
@@ -323,13 +339,17 @@ func DefaultConfig() *APIConfig {
 			},
 		},
 		RAGConfig: RAGConfig{
-			ChunkSize:          y.RAG.ChunkSize,
-			ChunkOverlap:       y.RAG.ChunkOverlap,
-			TopK:               y.RAG.TopK,
-			RRFConstantK:       y.RAG.RRFConstantK,
-			SemanticWeight:     y.RAG.SemanticWeight,
-			EnableHybridSearch: y.RAG.EnableHybridSearch,
-			RAGMilvusDim:       y.RAG.RAGMilvusDim,
+			ChunkSize:            y.RAG.ChunkSize,
+			ChunkOverlap:         y.RAG.ChunkOverlap,
+			TopK:                 y.RAG.TopK,
+			RRFConstantK:         y.RAG.RRFConstantK,
+			SemanticWeight:       y.RAG.SemanticWeight,
+			EnableHybridSearch:   y.RAG.EnableHybridSearch,
+			RAGMilvusDim:         y.RAG.RAGMilvusDim,
+			RAGRewriteEnabled:    y.RAG.Rewrite.Enabled,
+			RAGRewriteNumQueries: y.RAG.Rewrite.NumQueries,
+			RAGRerankEnabled:     y.RAG.Rerank.Enabled,
+			RAGRerankPreviewLen:  y.RAG.Rerank.PreviewLen,
 		},
 		MemoryConfig: MemoryConfig{
 			ShortTermMaxTurns:             y.Memory.ShortTermMaxTurns,
@@ -385,6 +405,14 @@ func applyDefaults(c *APIConfig) {
 	}
 	if c.RAGMilvusDim <= 0 {
 		c.RAGMilvusDim = 1024
+	}
+
+	// Query Rewrite / Rerank 默认值（默认开启，复用主 LLM 不增加依赖）
+	if c.RAGRewriteNumQueries <= 0 {
+		c.RAGRewriteNumQueries = 3
+	}
+	if c.RAGRerankPreviewLen <= 0 {
+		c.RAGRerankPreviewLen = 200
 	}
 
 	// 记忆合并默认值

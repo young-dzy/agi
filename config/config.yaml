@@ -1,12 +1,12 @@
 # 对话模型配置
 llm:
-  api-url: https://ark.cn-beijing.volces.com/api/v3/chat/completions
-  api-key: "你的apikey"
-  model: deepseek-v4-flash-260425
+  api_url: https://api.deepseek.com/chat/completions
+  api_key: "你的key"
+  model: deepseek-v4-pro
   temperature: 0.7
 embedding:
-  api-url: https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal
-  api-key: "你的apikey"
+  api_url: https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal
+  api_key: "你的apikey"
   model: doubao-embedding-vision-250615
 
 # 向量数据库配置
@@ -76,7 +76,7 @@ server:
   port: "8090"
 
 search:
-  api_key: "填入自己的api"               # 请填入你的 Tavily API Key（可选）
+  api_key: "你的key"               # 请填入你的 Tavily API Key（可选）
   api_url: "https://tavily.com"
 
 # ===== 知识图谱（Neo4j，可选，不可用时跳过图检索）=====
@@ -115,3 +115,9 @@ security:
     - "node"
     - "go"
     - "java"
+
+# ===== 图运行时（ReAct 并行调度 + 竞速）=====
+graph_runtime:
+  max_parallel: 2            # 最大并行执行节点数
+  race_timeout_ms: 30000     # 竞速组内节点超时
+  enable_racing: true        # 是否启用竞速机制（First-success-wins）

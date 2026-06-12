@@ -158,6 +158,13 @@ type SecurityConfig struct {
 	SecAllowlist     []string
 }
 
+// GraphRuntimeConfig 图运行时配置（并行调度 + 竞速）
+type GraphRuntimeConfig struct {
+	GraphMaxParallel   int
+	GraphRaceTimeoutMs int
+	GraphEnableRacing  bool
+}
+
 // APIConfig 整合所有阶段的 API + 基础设施配置。
 //
 // 所有子结构以 embedded 方式放进来，访问路径 cfg.LLMAPIUrl / cfg.PGHost
@@ -173,6 +180,7 @@ type APIConfig struct {
 	SearchConfig
 	SandboxConfig
 	SecurityConfig
+	GraphRuntimeConfig
 }
 
 // yamlFile 对应 config/config.yaml 的结构
@@ -275,6 +283,11 @@ type yamlFile struct {
 		AllowlistMode    bool     `yaml:"allowlist_mode"`
 		Allowlist        []string `yaml:"allowlist"`
 	} `yaml:"security"`
+	GraphRuntime struct {
+		MaxParallel   int  `yaml:"max_parallel"`
+		RaceTimeoutMs int  `yaml:"race_timeout_ms"`
+		EnableRacing  bool `yaml:"enable_racing"`
+	} `yaml:"graph_runtime"`
 }
 
 // DefaultConfig 从 config/config.yaml 加载配置
@@ -388,6 +401,11 @@ func DefaultConfig() *APIConfig {
 			SecAllowlistMode: y.Security.AllowlistMode,
 			SecAllowlist:     y.Security.Allowlist,
 		},
+		GraphRuntimeConfig: GraphRuntimeConfig{
+			GraphMaxParallel:   y.GraphRuntime.MaxParallel,
+			GraphRaceTimeoutMs: y.GraphRuntime.RaceTimeoutMs,
+			GraphEnableRacing:  y.GraphRuntime.EnableRacing,
+		},
 	}
 
 	applyDefaults(c)
@@ -469,5 +487,13 @@ func applyDefaults(c *APIConfig) {
 	// 安全校验默认值
 	if c.SecMaxCmdLength <= 0 {
 		c.SecMaxCmdLength = 500
+	}
+
+	// 图运行时默认值
+	if c.GraphMaxParallel <= 0 {
+		c.GraphMaxParallel = 2
+	}
+	if c.GraphRaceTimeoutMs <= 0 {
+		c.GraphRaceTimeoutMs = 30000
 	}
 }

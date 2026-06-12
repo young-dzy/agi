@@ -4,6 +4,7 @@
 package chat
 
 import (
+	"agi-assistant/internal/domain/graph"
 	"agi-assistant/internal/domain/rag"
 	"agi-assistant/internal/domain/tool"
 )
@@ -55,14 +56,15 @@ type TaskStep struct {
 
 // TaskState 描述一次任务的完整执行状态
 type TaskState struct {
-	TaskID        string     `json:"task_id"`
-	Query         string     `json:"query"`
-	Status        string     `json:"status"` // "running" | "completed" | "interrupted"
-	Phase         string     `json:"phase"`  // "planning" | "executing" | "generating" | "done" | "interrupted"
-	Steps         []TaskStep `json:"steps"`
-	CurrentStep   int        `json:"current_step"`
-	InterruptedAt int        `json:"interrupted_at,omitempty"` // 在第几步被中断的（0-based）
-	Result        string     `json:"result,omitempty"`
+	TaskID        string          `json:"task_id"`
+	Query         string          `json:"query"`
+	Status        string          `json:"status"` // "running" | "completed" | "interrupted"
+	Phase         string          `json:"phase"`  // "planning" | "executing" | "generating" | "done" | "interrupted"
+	Steps         []TaskStep      `json:"steps"`
+	CurrentStep   int             `json:"current_step"`
+	InterruptedAt int             `json:"interrupted_at,omitempty"` // 在第几步被中断的（0-based）
+	Result        string          `json:"result,omitempty"`
+	Graph         *graph.TaskGraph `json:"graph,omitempty"` // 图执行时关联的 TaskGraph
 }
 
 // Snapshot 是某一时刻的任务状态快照（用于故障恢复）

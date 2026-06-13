@@ -6,12 +6,7 @@ package chat
 
 // InfraStatus 暴露平台层连接健康快照（供 status 端点使用）
 func (a *UnifiedAgent) InfraStatus() map[string]string {
-	// 拷贝避免外部修改
-	out := make(map[string]string, len(a.infraStatus))
-	for k, v := range a.infraStatus {
-		out[k] = v
-	}
-	return out
+	return a.repos.infraSnapshot()
 }
 
 // Status 构造系统状态视图模型，供 GET /api/status 渲染。
@@ -33,9 +28,9 @@ func (a *UnifiedAgent) Status() map[string]interface{} {
 		"rag_loaded":       a.rag.Loaded,
 		"rag_mode":         a.rag.Mode(),
 		"rag_chunks":       chunkPreviews,
-		"short_term_count": a.stm.Count(),
-		"long_term_count":  a.ltm.Count(),
-		"preferences":      a.pref.Snapshot(),
+		"short_term_count": a.mem.stm.Count(),
+		"long_term_count":  a.mem.ltm.Count(),
+		"preferences":      a.mem.pref.Snapshot(),
 		"tools_count":      len(a.toolsSnapshot()),
 		"llm_model":        a.cfg.LLMModel,
 		"embedding_model":  a.cfg.EmbeddingModel,

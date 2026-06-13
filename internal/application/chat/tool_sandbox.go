@@ -50,7 +50,7 @@ func (a *UnifiedAgent) initSandbox() {
 			"reason":      r.Validation.Reason,
 			"violations":  r.Validation.Violations,
 		})
-		a.events.Publish("sandbox.exec", string(event))
+		a.repos.events.Publish("sandbox.exec", string(event))
 	})
 
 	a.sandbox = sb

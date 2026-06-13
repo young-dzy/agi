@@ -17,13 +17,13 @@ import (
 // restoreFromDB 启动时从 PostgreSQL 恢复跨会话偏好、长期记忆和聊天记录
 func (a *UnifiedAgent) restoreFromDB() {
 	// 恢复偏好
-	prefs := a.prefRepo.Load("default")
-	a.pref.SaveBatch(prefs)
+	prefs := a.repos.pref.Load("default")
+	a.mem.pref.SaveBatch(prefs)
 
 	// 恢复长期记忆
-	rows := a.ltmRepo.Load()
+	rows := a.repos.ltm.Load()
 	for _, row := range rows {
-		a.ltm.StoreItem(longterm.Item{
+		a.mem.ltm.StoreItem(longterm.Item{
 			ID:           row.ID,
 			Content:      row.Content,
 			Importance:   row.Importance,
@@ -35,9 +35,9 @@ func (a *UnifiedAgent) restoreFromDB() {
 
 	// 恢复聊天记录到短期记忆（最近 N 条）
 	chatLimit := a.cfg.ShortTermMaxTurns * 2 // 每轮 = user + assistant
-	history := a.chatRepo.Load(chatLimit)
+	history := a.repos.chat.Load(chatLimit)
 	for _, h := range history {
-		a.stm.Add(h.Role, h.Content)
+		a.mem.stm.Add(h.Role, h.Content)
 	}
 
 	if len(prefs) > 0 || len(rows) > 0 || len(history) > 0 {
@@ -47,7 +47,7 @@ func (a *UnifiedAgent) restoreFromDB() {
 
 // restoreRAGFromDB 从 PostgreSQL 加载持久化的 RAG chunks 到 TF 兜底索引
 func (a *UnifiedAgent) restoreRAGFromDB() {
-	chunkRows, err := a.ragChunkRepo.LoadAll()
+	chunkRows, err := a.repos.ragChunk.LoadAll()
 	if err != nil || len(chunkRows) == 0 {
 		return
 	}
@@ -68,8 +68,9 @@ func (a *UnifiedAgent) initKnowledgeGraph() {
 	a.rag.SetKGStore(kg)
 
 	// 构建图记忆层（包装现有 ltm）；复用 kg 的 Neo4j 客户端避免双连接
-	a.graphMem = graphmem.New(a.ltm, kg, kg.Client(), a.cfg.MemoryConsolidationSimilarity)
-	a.graphMem.SyncPrevID() // 从 DB 恢复后对齐 prevID
+	gm := graphmem.New(a.mem.ltm, kg, kg.Client(), a.cfg.MemoryConsolidationSimilarity)
+	gm.SyncPrevID() // 从 DB 恢复后对齐 prevID
+	a.mem.attachGraph(gm)
 
 	if kg.Available() {
 		log.Printf("🕸️  知识图谱已就绪（Neo4j），RAG 升级为三路混合检索，记忆系统已接入图层")

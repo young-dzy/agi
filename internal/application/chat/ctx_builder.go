@@ -16,7 +16,7 @@ import (
 )
 
 func (a *UnifiedAgent) buildContextPrefix(ctx context.Context, query string, mode string) string {
-	if a.assembler == nil {
+	if a.pctx == nil {
 		return ""
 	}
 	emb, _ := a.llm.EmbedContext(ctx, query)
@@ -24,13 +24,12 @@ func (a *UnifiedAgent) buildContextPrefix(ctx context.Context, query string, mod
 	if t := a.currentTask(); t != nil {
 		taskID = t.TaskID
 	}
-	rc := a.assembler.Assemble(ctx, promptctx.Query{
+	return a.pctx.assemble(ctx, promptctx.Query{
 		Text:      query,
 		Embedding: emb,
 		TaskID:    taskID,
 		Mode:      mode,
 	})
-	return rc.Render()
 }
 
 // buildSystemPrompt 构建带记忆前缀的 system prompt
@@ -46,7 +45,7 @@ func (a *UnifiedAgent) buildHistoryMessages(query string) []llm.Message {
 	var msgs []llm.Message
 	// STM 最后一条是刚加入的 user query，跳过重复
 	// 通过 Snapshot 拿到一致性副本，避免遍历期间 Add 并发改写底层切片
-	for _, m := range a.stm.Snapshot() {
+	for _, m := range a.mem.stm.Snapshot() {
 		if m.Role == "user" || m.Role == "assistant" {
 			msgs = append(msgs, llm.Message{Role: m.Role, Content: m.Content})
 		}
@@ -61,7 +60,7 @@ func (a *UnifiedAgent) buildHistoryMessages(query string) []llm.Message {
 // recentHistoryForRAG 把 STM 转成 RAG Rewriter 需要的最小结构。
 // 取最近 6 条（3 轮）足够 history-aware 改写消除指代，再多反而拖长 prompt。
 func (a *UnifiedAgent) recentHistoryForRAG() []rag.HistoryMessage {
-	snap := a.stm.Snapshot()
+	snap := a.mem.stm.Snapshot()
 	const maxTurns = 6
 	start := 0
 	if len(snap) > maxTurns {
@@ -77,17 +76,9 @@ func (a *UnifiedAgent) recentHistoryForRAG() []rag.HistoryMessage {
 	return out
 }
 
-// filterTools 按名称列表过滤可用工具集（持读锁）
+// filterTools 按名称列表过滤可用工具集（toolRegistry 内部持锁）
 func (a *UnifiedAgent) filterTools(names []string) map[string]tool.Tool {
-	a.toolsMu.RLock()
-	defer a.toolsMu.RUnlock()
-	result := make(map[string]tool.Tool, len(names))
-	for _, name := range names {
-		if t, ok := a.tools[name]; ok {
-			result[name] = t
-		}
-	}
-	return result
+	return a.tools.filter(names)
 }
 
 // needReActFromTools — 只要工具集非空就走 ReAct，保证每次工具调用都有完整推理轨迹

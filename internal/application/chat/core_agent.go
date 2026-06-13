@@ -12,10 +12,6 @@ package chat
 import (
 	"agi-assistant/config"
 	"agi-assistant/internal/domain/knowledge"
-	graphmem "agi-assistant/internal/domain/memory/graph"
-	"agi-assistant/internal/domain/memory/longterm"
-	"agi-assistant/internal/domain/memory/preference"
-	"agi-assistant/internal/domain/memory/shortterm"
 	"agi-assistant/internal/domain/promptctx"
 	"agi-assistant/internal/domain/rag"
 	"agi-assistant/internal/domain/sandbox"
@@ -37,53 +33,32 @@ import (
 
 // UnifiedAgent 整合全部能力，是系统的核心调度入口
 type UnifiedAgent struct {
-	cfg      *config.APIConfig
-	llm      *llm.Client
-	rag      *rag.Engine
-	stm      *shortterm.ShortTerm
-	ltm      *longterm.LongTerm    // 保留直接引用，供 handler 暴露
-	graphMem *graphmem.GraphMemory // 图增强记忆层（包装 ltm）
-	pref     *preference.Preference
-	sandbox  *sandbox.Sandbox
-	kg       *knowledge.KGStore // 知识图谱（RAG + 记忆图共享）
+	cfg     *config.APIConfig
+	llm     *llm.Client
+	rag     *rag.Engine
+	sandbox *sandbox.Sandbox
+	kg      *knowledge.KGStore // 知识图谱（RAG + 记忆图共享）
 
-	// 数据访问层（每个 domain 用各自的 repo 接口）
-	chatRepo     chathistory.Repo
-	prefRepo     prefrepo.Repo
-	snapRepo     snapshot.Repo
-	ltmRepo      ltmrepo.Repo
-	ragChunkRepo ragchunk.Repo
-	events       eventbus.Publisher
+	// 三层记忆 + 偏好聚合（mem.stm / mem.ltm / mem.graphMem / mem.pref）
+	mem *memoryStack
 
-	// infraStatus 是 platform 层连接健康状态的快照（用于 status 端点）
-	// key: "milvus" | "pg" | "elasticsearch" | "kafka" | "neo4j"
-	// value: "connected" | "disconnected"
-	infraStatus map[string]string
+	// 数据访问层 + 事件 + 基础设施健康状态（repos.chat / repos.pref / ... / repos.events / repos.infra）
+	repos *repoBundle
 
 	// RAG 维度（启动期 ragchunk repo 初始化用）
 	ragMilvusDim int
 
-	// Schema-driven Runtime Context Assembly
-	assembler   *promptctx.ContextAssembler
-	taskMem     *promptctx.TaskMemBuffer
-	toolTracker *promptctx.ToolStateTracker
+	// Schema-driven Runtime Context Assembly（assembler / taskMem / toolTracker）
+	// 由 promptCtx 聚合管理，所有 nil 守卫集中在 promptCtx 方法内。
+	pctx *promptCtx
 
 	// 工具集：可被 RegisterTool（MCP 热插）并发写入，被 ReAct/Decide 并发读取。
-	// Go map 并发读写会直接 panic，必须串行化。toolsMu 独立于 mu 以避免锁粒度过大。
-	toolsMu sync.RWMutex
-	tools   map[string]tool.Tool
+	// 由 toolRegistry 统一管理 RWMutex + map，避免在 agent struct 上铺锁字段。
+	tools *toolRegistry
 
-	// per-request 共享状态：snapshots、当前任务、in-flight cancel funcs
-	//
-	// 并发：mu 串行化对 task/snapshots/cancelFns 的所有读写。
-	// 旧实现把这三个字段当无锁全局变量，多请求并发时数据竞争 + Cancel()
-	// 因 cancelFn 互相覆盖只能取消最近一次请求；这里改为 cancelFns map，
-	// 每个 in-flight 请求一个 token，Cancel() 触发全部。
-	mu           sync.Mutex
-	task         *TaskState
-	snapshots    []Snapshot
-	cancelFns    map[int64]context.CancelFunc
-	nextCancelID int64
+	// per-request 共享状态：snapshots、当前任务、in-flight cancel funcs。
+	// 由 taskRuntime 聚合并管理 sync.Mutex，避免在 agent struct 上铺锁字段。
+	runtime *taskRuntime
 }
 
 // Deps 是 UnifiedAgent 的依赖注入容器，由 main.go 在启动期组装。
@@ -98,41 +73,41 @@ type Deps struct {
 	InfraStatus map[string]string
 }
 
-// New 创建并初始化 UnifiedAgent
+// New 创建并初始化 UnifiedAgent。
+//
+// 启动序列分四步：
+//  1. 装配核心依赖（cfg / llm / rag engine / 5 个聚合：mem / repos / tools / runtime / pctx 之外的字段）
+//  2. wireRAGCallbacks：把 LLM/Embed/Rewriter/Reranker 回调注入 rag.Engine
+//  3. bootstrapConcurrent：4 路并发 IO 启动（restore 偏好/记忆/聊天/RAG chunks + 沙箱探测 + Milvus/ES 建索引）
+//  4. initKnowledgeGraph + buildPromptCtx：依赖前一阶段的 ltm/graphMem，必须串行
+//
+// 第一阶段把 builtin tool（rag_search / search_web）注册穿插在并发组里，
+// 因为 RegisterTool 是持锁的，与同期的 initSandbox 注册 exec_command 不会冲突。
 func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
-	llmClient := llm.New(cfg)
-	ragEngine := rag.NewEngine(cfg, deps.RAGChunkRepo, deps.Events)
-	ltm := longterm.New()
 	a := &UnifiedAgent{
 		cfg:          cfg,
-		llm:          llmClient,
-		rag:          ragEngine,
-		tools:        toolimpl.DefaultTools(),
-		stm:          shortterm.New(cfg.ShortTermMaxTurns),
-		ltm:          ltm,
-		pref:         preference.New(),
-		chatRepo:     deps.ChatRepo,
-		prefRepo:     deps.PrefRepo,
-		snapRepo:     deps.SnapRepo,
-		ltmRepo:      deps.LTMRepo,
-		ragChunkRepo: deps.RAGChunkRepo,
-		events:       deps.Events,
-		infraStatus:  deps.InfraStatus,
+		llm:          llm.New(cfg),
+		rag:          rag.NewEngine(cfg, deps.RAGChunkRepo, deps.Events),
+		tools:        newToolRegistry(toolimpl.DefaultTools()),
+		runtime:      newTaskRuntime(),
+		mem:          newMemoryStack(cfg),
+		repos:        newRepoBundle(deps),
 		ragMilvusDim: cfg.RAGMilvusDim,
 	}
-	// 配置长期记忆合并
-	a.ltm.SetConsolidationConfig(&longterm.ConsolidationConfig{
-		SimilarityThreshold: cfg.MemoryConsolidationSimilarity,
-		DedupThreshold:      cfg.MemoryConsolidationDedup,
-		TTLDays:             cfg.MemoryConsolidationTTLDays,
-		DecayRate:           cfg.MemoryConsolidationDecayRate,
-		MinImportance:       cfg.MemoryConsolidationMinImport,
-		TriggerInterval:     cfg.MemoryConsolidationTrigger,
-	})
-	// 注入 RAG 的 LLM 合成回调（携带记忆上下文）
+	a.wireRAGCallbacks()
+	a.bootstrapConcurrent()
+	a.initKnowledgeGraph()
+	a.pctx = a.buildPromptCtx()
+	return a
+}
+
+// wireRAGCallbacks 把 LLM 合成 / Embedding / 可选 Rewriter / 可选 Reranker
+// 等回调注入 rag.Engine。所有回调闭包捕获 a，运行时再读 a.pctx 等组件——
+// 因此该方法必须在并发组启动前调用，但运行期触发时 pctx 必定已就绪。
+func (a *UnifiedAgent) wireRAGCallbacks() {
+	cfg := a.cfg
+	// LLM 合成回调（携带记忆上下文）
 	a.rag.SetGenerateFn(func(systemPrompt, userMsg string) string {
-		// RAG 模式下用 schema-driven 装配（assembler 在 New 末尾才构造，此回调
-		// 在运行期才会被触发，因此 a.assembler 一定已就绪）
 		memPrefix := a.buildContextPrefix(context.Background(), userMsg, "rag")
 		fullSystem := systemPrompt
 		if memPrefix != "" {
@@ -140,43 +115,58 @@ func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
 		}
 		return a.llm.Chat(fullSystem, []llm.Message{{Role: "user", Content: userMsg}})
 	})
-	// 注入 RAG 的 Embedding 回调
+	// Embedding 回调
 	a.rag.SetEmbedFn(func(text string) ([]float64, error) {
 		return a.llm.Embed(text)
 	})
-	// 注入 Query Rewriter（history-aware + multi-query）
-	// 用独立的 generateFn（不带记忆前缀）避免改写 prompt 被偏好污染
+	// Query Rewriter（history-aware + multi-query）。用独立 LLM 闭包不带
+	// 记忆前缀，避免改写 prompt 被偏好污染。
 	if cfg.RAGRewriteEnabled && cfg.RAGRewriteNumQueries > 1 {
 		rewriteLLM := func(systemPrompt, userMsg string) string {
 			return a.llm.Chat(systemPrompt, []llm.Message{{Role: "user", Content: userMsg}})
 		}
 		a.rag.SetRewriter(rag.NewLLMRewriter(rewriteLLM, cfg.RAGRewriteNumQueries))
 	}
-	// 注入 Reranker（LLM listwise 精排）
+	// Reranker（LLM listwise 精排）
 	if cfg.RAGRerankEnabled {
 		rerankLLM := func(systemPrompt, userMsg string) string {
 			return a.llm.Chat(systemPrompt, []llm.Message{{Role: "user", Content: userMsg}})
 		}
 		a.rag.SetReranker(rag.NewLLMReranker(rerankLLM, cfg.RAGRerankPreviewLen))
 	}
-	// 启动期 IO 并发：以下 4 项互不依赖，串行总耗时是各自之和（PG 全量加载 + Milvus 建表
-	// + ES 建索引 + Docker probe 1.5s + Neo4j 5s 验证），并行后压缩到最慢一项的耗时。
-	//
-	//   - InitRAGInfra      建 Milvus collection + ES 索引
-	//   - restoreFromDB     从 PG 恢复偏好 / 长期记忆 / 聊天记录
-	//   - restoreRAGFromDB  从 PG 恢复 RAG chunks
-	//   - initSandbox       Docker daemon 探测 + exec_command 工具注册
-	//
-	// initKnowledgeGraph 依赖 restoreFromDB 完成后的 ltm.Items（SyncPrevID 读取最后一条），
-	// 因此放在并发组之后单独执行。
+}
+
+// bootstrapConcurrent 启动期 IO 并发：4 项互不依赖的 init 任务并行执行。
+//
+// 串行总耗时 = PG 全量加载 + Milvus 建表 + ES 建索引 + Docker probe 1.5s
+// + Neo4j 5s 验证；并行后压缩到最慢一项的耗时。
+//
+//   - InitRAGInfra      建 Milvus collection + ES 索引
+//   - restoreFromDB     从 PG 恢复偏好 / 长期记忆 / 聊天记录
+//   - restoreRAGFromDB  从 PG 恢复 RAG chunks
+//   - initSandbox       Docker daemon 探测 + exec_command 工具注册
+//
+// 在并发组运行期间穿插同步注册 builtin 工具（rag_search / search_web）：
+// RegisterTool 持锁串行，与 initSandbox 写 exec_command 不冲突。
+//
+// 注意：initKnowledgeGraph 依赖 restoreFromDB 完成后的 ltm，必须放在 wg.Wait() 之后单独执行。
+func (a *UnifiedAgent) bootstrapConcurrent() {
+	cfg := a.cfg
 	var wg sync.WaitGroup
 	wg.Add(4)
-	go func() { defer wg.Done(); a.ragChunkRepo.Init(cfg.RAGMilvusDim) }()
+	go func() { defer wg.Done(); a.repos.ragChunk.Init(cfg.RAGMilvusDim) }()
 	go func() { defer wg.Done(); a.restoreFromDB() }()
 	go func() { defer wg.Done(); a.restoreRAGFromDB() }()
 	go func() { defer wg.Done(); a.initSandbox() }()
-	// 将 RAG 注册为可选工具（私人黑洞知识库检索）。
-	// 通过 RegisterTool 持锁写入，避免与并发的 initSandbox（也写 a.tools["exec_command"]）竞争。
+	a.registerBuiltinTools()
+	wg.Wait()
+}
+
+// registerBuiltinTools 注册内置工具：rag_search（个人知识库检索）、
+// search_web（Tavily 优先、LLM 知识降级）。两者都通过 RegisterTool 持锁写入，
+// 与 initSandbox 的 exec_command 注册并发安全。
+func (a *UnifiedAgent) registerBuiltinTools() {
+	// 个人知识库检索
 	a.RegisterTool(tool.Tool{
 		Name:        "rag_search",
 		Description: "从私人黑洞（个人知识库）中检索相关文档内容",
@@ -195,7 +185,7 @@ func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
 			return answer, nil
 		},
 	})
-	// 用 LLM 知识 + 可选 Tavily API 替换默认的 mock search_web
+	// Tavily 优先 + LLM 知识降级（替换默认 mock search_web）
 	a.RegisterTool(tool.Tool{
 		Name:        "search_web",
 		Description: "搜索互联网获取最新信息",
@@ -207,30 +197,30 @@ func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
 			if q == "" {
 				return "", fmt.Errorf("搜索关键词不能为空")
 			}
-			// 优先尝试 Tavily 真实搜索
 			if a.cfg.SearchAPIKey != "" {
 				if result, err := toolimpl.TavilySearch(q, a.cfg.SearchAPIKey, a.cfg.SearchAPIURL); err == nil {
 					return result, nil
 				}
 			}
-			// 降级：用 LLM 知识库回答
 			return a.llm.Chat(
 				"你是一个知识丰富的搜索引擎助手。请基于你的知识，对用户的搜索问题给出准确、详细的回答。直接给出答案，不要说「我不知道」或「我无法搜索」。",
 				[]llm.Message{{Role: "user", Content: "搜索：" + q}},
 			), nil
 		},
 	})
-	// 等待第一阶段并发 init 完成（restoreFromDB / restoreRAGFromDB / InitRAGInfra / initSandbox）
-	wg.Wait()
-	// 第二阶段：知识图谱依赖 restoreFromDB 加载的 ltm 才能 SyncPrevID
-	a.initKnowledgeGraph()
+}
 
-	// ── Schema-driven Runtime Context Assembly ──
-	a.taskMem = promptctx.NewTaskMemBuffer(20)
-	a.toolTracker = promptctx.NewToolStateTracker(10)
+// buildPromptCtx 构造 Schema-driven 的 prompt 装配器。
+// 必须在 mem / tools / sandbox / kg 全部就绪后调用——RecallSource 依赖
+// graphMem，PlannerSource 闭包读 currentTask，ToolStateSource 闭包读 toolsSnapshot。
+func (a *UnifiedAgent) buildPromptCtx() *promptCtx {
+	pc := &promptCtx{
+		taskMem:     promptctx.NewTaskMemBuffer(20),
+		toolTracker: promptctx.NewToolStateTracker(10),
+	}
 
 	reg := promptctx.NewSourceRegistry()
-	reg.Register(promptctx.NewProfileSource(a.pref, a.ltm))
+	reg.Register(promptctx.NewProfileSource(a.mem.pref, a.mem.ltm))
 	reg.Register(promptctx.NewPlannerSource(func() *promptctx.PlannerSnapshot {
 		t := a.currentTask() // 持锁读取，避免与 ReAct 循环并发写打架
 		if t == nil {
@@ -252,25 +242,19 @@ func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
 		}
 		return snap
 	}))
-	reg.Register(promptctx.NewTaskMemSource(a.taskMem))
+	reg.Register(promptctx.NewTaskMemSource(pc.taskMem))
 	reg.Register(promptctx.NewToolStateSource(
 		// 持读锁拷贝供 ToolStateSource 装配 prompt：每次调用都拿一致的工具集快照
 		a.toolsSnapshot,
-		a.toolTracker,
+		pc.toolTracker,
 	))
 	reg.Register(promptctx.NewConstraintsSource(sandbox.PolicySnapshot()))
 	// RecallSource 优先用图记忆；graphMem 在 initKnowledgeGraph 中就绪
-	if a.graphMem != nil {
-		reg.Register(promptctx.NewRecallSource(a.graphMem))
+	if a.mem.graphMem != nil {
+		reg.Register(promptctx.NewRecallSource(a.mem.graphMem))
 	} else {
-		reg.Register(promptctx.NewRecallSource(a.ltm))
+		reg.Register(promptctx.NewRecallSource(a.mem.ltm))
 	}
-	a.assembler = promptctx.NewAssembler(promptctx.DefaultSchemas(), reg)
-
-	return a
+	pc.assembler = promptctx.NewAssembler(promptctx.DefaultSchemas(), reg)
+	return pc
 }
-
-// RegisterTool 动态注册一个工具（支持 MCP 工具热插入）
-//
-// 持 toolsMu.Lock 串行化对工具 map 的写入，避免与 ReAct/Decide 并发读冲突
-// （Go map 并发读写会直接 panic，不只是脏读）。

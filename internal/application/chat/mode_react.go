@@ -1,23 +1,35 @@
 // mode_react.go — ReAct 图任务模式。
 //
-//   - runReActWithTools / runReActStream  规划 → 图并行执行 → 合成
-//   - llmGenerate / llmGenerateStream     基于全部观察合成最终答案
-//   - extractParamsForTool                LLM 抽取参数 → 兜底规则
-//   - buildInterruptMessage / truncateStr 中断恢复 / 文本截断辅助
+//   - runReAct                     规划 → 图并行执行 → 合成（onEvent 为 nil 即非流式）
+//   - llmGenerate                  基于全部观察合成最终答案（流式/非流式由 onEvent 切换）
+//   - extractParamsForTool         LLM 抽取参数 → 兜底规则
+//   - buildInterruptMessageFromGraph / truncateStr  中断恢复 / 文本截断辅助
 package chat
 
 import (
-	"agi-assistant/internal/domain/graph"
-	"agi-assistant/internal/domain/tool"
-	"agi-assistant/internal/infrastructure/llm"
 	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+
+	"agi-assistant/internal/domain/graph"
+	"agi-assistant/internal/domain/tool"
+	"agi-assistant/internal/infrastructure/llm"
 )
 
-func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts map[string]tool.Tool, memPrefix string, histMsgs []llm.Message) (string, []ReActStep, *TaskState) {
+// runReAct 执行 ReAct 图调度模式。onEvent 为 nil 时即"非流式"路径。
+//
+// 流程：Planner LLM → 构图（Validate/降级全并行）→ GraphRuntime 并行执行
+// → 检查中断 → Generator LLM 合成最终答案。
+func (a *UnifiedAgent) runReAct(
+	ctx context.Context,
+	query string,
+	ts map[string]tool.Tool,
+	memPrefix string,
+	histMsgs []llm.Message,
+	onEvent func(StreamEvent),
+) (string, []ReActStep, *TaskState) {
 	var reactSteps []ReActStep
 
 	// ── Step 1: Planner LLM 输出带依赖的图节点 ──────────────────────────
@@ -26,8 +38,11 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 	// 若 Planner 决定不需要任何工具，直接走 LLM 对话
 	if len(planNodes) == 0 {
 		systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
-		answer := a.llm.ChatContext(ctx, systemPrompt, histMsgs)
-		reactSteps = append(reactSteps, ReActStep{Type: StepThought, Content: "分析后无需调用工具，直接回答"})
+		thought := ReActStep{Type: StepThought, Content: "分析后无需调用工具，直接回答"}
+		reactSteps = append(reactSteps, thought)
+		emit(onEvent, "step", thought)
+
+		answer := a.chatLLM(ctx, systemPrompt, histMsgs, onEvent)
 		reactSteps = append(reactSteps, ReActStep{Type: StepFinalAnswer, Content: answer})
 		if ctx.Err() != nil {
 			return "[已中断] 规划完成但生成被中断", reactSteps, nil
@@ -53,9 +68,7 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 		Steps: taskSteps, Graph: tg,
 	}
 	a.setTask(task)
-	if a.taskMem != nil {
-		a.taskMem.Reset()
-	}
+	a.pctx.resetTaskMem()
 	a.saveSnapshot(task)
 
 	// ── Step 3: GraphRuntime 并行执行 ─────────────────────────────────
@@ -64,7 +77,7 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 		RaceTimeoutMs: a.cfg.GraphRaceTimeoutMs,
 		EnableRacing:  a.cfg.GraphEnableRacing,
 	}
-	rt := NewGraphRuntime(tg, a, gcfg, ts, task, nil)
+	rt := NewGraphRuntime(tg, a, gcfg, ts, task, onEvent)
 	graphResult := rt.Execute(ctx)
 
 	// 从 GraphResult 收集 ReAct 步骤
@@ -80,73 +93,7 @@ func (a *UnifiedAgent) runReActWithTools(ctx context.Context, query string, ts m
 
 	// ── Step 5: Generator LLM 综合所有观察结果生成最终答案 ────────────────
 	task.Phase = "generating"
-	answer := a.llmGenerate(ctx, query, graphResult.Observations, memPrefix, histMsgs)
-	reactSteps = append(reactSteps, ReActStep{Type: StepFinalAnswer, Content: answer})
-	task.Result = answer
-	task.Status = "completed"
-	task.Phase = "done"
-	return answer, reactSteps, task
-}
-
-func (a *UnifiedAgent) runReActStream(ctx context.Context, query string, ts map[string]tool.Tool, memPrefix string, histMsgs []llm.Message, onEvent func(StreamEvent)) (string, []ReActStep, *TaskState) {
-	var reactSteps []ReActStep
-
-	planNodes := a.llmPlanGraph(ctx, query, ts, memPrefix)
-
-	if len(planNodes) == 0 {
-		systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
-		reactSteps = append(reactSteps, ReActStep{Type: StepThought, Content: "分析后无需调用工具，直接回答"})
-		onEvent(NewStreamEvent("step", ReActStep{Type: StepThought, Content: "分析后无需调用工具，直接回答"}))
-		answer := a.llm.ChatStreamContext(ctx, systemPrompt, histMsgs, func(token string) {
-			onEvent(NewStreamEvent("token", map[string]string{"content": token}))
-		})
-		reactSteps = append(reactSteps, ReActStep{Type: StepFinalAnswer, Content: answer})
-		if ctx.Err() != nil {
-			return "[已中断] 规划完成但生成被中断", reactSteps, nil
-		}
-		return answer, reactSteps, nil
-	}
-
-	tg := graph.NewTaskGraph(planNodes)
-	if err := tg.Validate(); err != nil {
-		for _, n := range planNodes {
-			n.DependsOn = nil
-		}
-		tg = graph.NewTaskGraph(planNodes)
-	}
-
-	taskSteps := graphToTaskSteps(tg)
-	task := &TaskState{
-		TaskID: fmt.Sprintf("task-%d", time.Now().UnixNano()),
-		Query:  query, Status: "running", Phase: "executing",
-		Steps: taskSteps, Graph: tg,
-	}
-	a.setTask(task)
-	if a.taskMem != nil {
-		a.taskMem.Reset()
-	}
-	a.saveSnapshot(task)
-
-	// 流式模式：传入 onEvent
-	gcfg := GraphConfig{
-		MaxParallel:   a.cfg.GraphMaxParallel,
-		RaceTimeoutMs: a.cfg.GraphRaceTimeoutMs,
-		EnableRacing:  a.cfg.GraphEnableRacing,
-	}
-	rt := NewGraphRuntime(tg, a, gcfg, ts, task, onEvent)
-	graphResult := rt.Execute(ctx)
-
-	reactSteps = graphResultToReActSteps(tg, graphResult)
-
-	if ctx.Err() != nil || graphResult.Interrupted {
-		task.Phase = "interrupted"
-		task.Status = "interrupted"
-		interruptMsg := a.buildInterruptMessageFromGraph(tg)
-		return "[已中断] " + interruptMsg, reactSteps, task
-	}
-
-	task.Phase = "generating"
-	answer := a.llmGenerateStream(ctx, query, graphResult.Observations, memPrefix, histMsgs, onEvent)
+	answer := a.llmGenerate(ctx, query, graphResult.Observations, memPrefix, histMsgs, onEvent)
 	reactSteps = append(reactSteps, ReActStep{Type: StepFinalAnswer, Content: answer})
 	task.Result = answer
 	task.Status = "completed"
@@ -227,13 +174,19 @@ func (a *UnifiedAgent) buildInterruptMessageFromGraph(tg *graph.TaskGraph) strin
 
 // ─────────────────────────── Generator LLM ───────────────────────────────
 
-// llmGenerateStream 流式版本的 Generator LLM，逐 token 回调
-func (a *UnifiedAgent) llmGenerateStream(ctx context.Context, query string, observations []string, memPrefix string, histMsgs []llm.Message, onEvent func(StreamEvent)) string {
+// llmGenerate 调用 Generator LLM，把多个工具观察结果合成为自然语言最终答案。
+// onEvent 为 nil 时一次性返回；非 nil 时逐 token 推送。
+func (a *UnifiedAgent) llmGenerate(
+	ctx context.Context,
+	query string,
+	observations []string,
+	memPrefix string,
+	histMsgs []llm.Message,
+	onEvent func(StreamEvent),
+) string {
 	if len(observations) == 0 {
 		systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
-		return a.llm.ChatStreamContext(ctx, systemPrompt, histMsgs, func(token string) {
-			onEvent(NewStreamEvent("token", map[string]string{"content": token}))
-		})
+		return a.chatLLM(ctx, systemPrompt, histMsgs, onEvent)
 	}
 	if !a.cfg.IsRealLLM() {
 		return "综合查询结果：" + strings.Join(observations, "；")
@@ -255,41 +208,7 @@ func (a *UnifiedAgent) llmGenerateStream(ctx context.Context, query string, obse
 	if memPrefix != "" {
 		generatorBase = memPrefix + "\n\n" + generatorBase + "\n结合用户偏好，使回答更个性化。"
 	}
-	return a.llm.ChatStreamContext(ctx, generatorBase,
-		[]llm.Message{{Role: "user", Content: genPrompt}},
-		func(token string) {
-			onEvent(NewStreamEvent("token", map[string]string{"content": token}))
-		})
-}
-
-// llmGenerate 调用 Generator LLM，将多个工具观察结果合成为自然语言最终答案
-func (a *UnifiedAgent) llmGenerate(ctx context.Context, query string, observations []string, memPrefix string, histMsgs []llm.Message) string {
-	if len(observations) == 0 {
-		systemPrompt := a.buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。")
-		return a.llm.ChatContext(ctx, systemPrompt, histMsgs)
-	}
-	if !a.cfg.IsRealLLM() {
-		return "综合查询结果：" + strings.Join(observations, "；")
-	}
-
-	var obsBuilder strings.Builder
-	for i, obs := range observations {
-		obsBuilder.WriteString(fmt.Sprintf("%d. %s\n", i+1, obs))
-	}
-
-	genPrompt := fmt.Sprintf(`请根据以下工具执行结果，综合回答用户的问题。回答要自然流畅、重点突出，不要机械罗列原始数据，也不要重复问题本身。
-
-	用户问题：%s
-
-	工具执行结果：
-	%s`, query, obsBuilder.String())
-
-	generatorBase := "你是一个善于综合信息的AI助手，能将多个工具的执行结果整合成清晰自然的回答。"
-	if memPrefix != "" {
-		generatorBase = memPrefix + "\n\n" + generatorBase + "\n结合用户偏好，使回答更个性化。"
-	}
-	return a.llm.ChatContext(ctx, generatorBase,
-		[]llm.Message{{Role: "user", Content: genPrompt}})
+	return a.chatLLM(ctx, generatorBase, []llm.Message{{Role: "user", Content: genPrompt}}, onEvent)
 }
 
 // extractParamsForTool 用 LLM 从 query 中提取工具所需参数；无法调用时用 query 填充首个必填参数

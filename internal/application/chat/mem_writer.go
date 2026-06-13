@@ -46,8 +46,8 @@ func (a *UnifiedAgent) extractMemoryFromReply(answer string) {
 		if k == "" || v == "" {
 			continue
 		}
-		a.pref.Save(k, v)
-		a.prefRepo.Save("default", k, v)
+		a.mem.pref.Save(k, v)
+		a.repos.pref.Save("default", k, v)
 		content := fmt.Sprintf("用户%s: %s", k, v)
 
 		// ── 分类管线：规则优先，LLM 兜底 ──
@@ -57,16 +57,16 @@ func (a *UnifiedAgent) extractMemoryFromReply(answer string) {
 		}
 
 		emb, _ := a.llm.Embed(content)
-		if a.graphMem != nil {
-			if added, _ := a.graphMem.StoreClassified(content, 0.7, emb, category, tags, slotHint); added {
+		if a.mem.graphMem != nil {
+			if added, _ := a.mem.graphMem.StoreClassified(content, 0.7, emb, category, tags, slotHint); added {
 				embJSON, _ := json.Marshal(emb)
-				pgID := a.ltmRepo.SaveClassified(content, 0.7, embJSON, category, tags, slotHint)
-				a.graphMem.SyncLastItemPGID(pgID)
+				pgID := a.repos.ltm.SaveClassified(content, 0.7, embJSON, category, tags, slotHint)
+				a.mem.graphMem.SyncLastItemPGID(pgID)
 			}
-		} else if a.ltm.StoreClassified(content, 0.7, emb, category, tags, slotHint) {
+		} else if a.mem.ltm.StoreClassified(content, 0.7, emb, category, tags, slotHint) {
 			embJSON, _ := json.Marshal(emb)
-			pgID := a.ltmRepo.SaveClassified(content, 0.7, embJSON, category, tags, slotHint)
-			a.ltm.SyncLastItemPGID(pgID)
+			pgID := a.repos.ltm.SaveClassified(content, 0.7, embJSON, category, tags, slotHint)
+			a.mem.ltm.SyncLastItemPGID(pgID)
 		}
 		log.Printf("🧠 从回复中提取记忆：%s = %s（类别=%s）", k, v, category)
 	}
@@ -125,13 +125,13 @@ func (a *UnifiedAgent) llmClassifyMemory(content string) (category string, tags 
 // syncConsolidationToDB 将记忆合并结果同步到 PostgreSQL
 func (a *UnifiedAgent) syncConsolidationToDB(result longterm.ConsolidationResult) {
 	if len(result.DeleteFromDB) > 0 {
-		a.ltmRepo.Delete(result.DeleteFromDB)
+		a.repos.ltm.Delete(result.DeleteFromDB)
 		log.Printf("🧹 记忆合并：删除 %d 条（去重=%d, 合并=%d, 过期=%d）",
 			result.Deduped+result.Merged+result.Expired, result.Deduped, result.Merged, result.Expired)
 	}
 	for _, item := range result.UpdateInDB {
 		embJSON, _ := json.Marshal(item.Embedding)
-		a.ltmRepo.Update(item.ID, item.Content, item.Importance, embJSON)
+		a.repos.ltm.Update(item.ID, item.Content, item.Importance, embJSON)
 		log.Printf("🔗 记忆合并：更新 id=%d", item.ID)
 	}
 }

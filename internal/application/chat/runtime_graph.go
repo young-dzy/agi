@@ -25,9 +25,9 @@ import (
 
 // GraphConfig 控制图运行时行为
 type GraphConfig struct {
-	MaxParallel   int  `yaml:"max_parallel"`   // 最大并行数，默认 2
+	MaxParallel   int  `yaml:"max_parallel"`    // 最大并行数，默认 2
 	RaceTimeoutMs int  `yaml:"race_timeout_ms"` // 竞速组超时（毫秒），默认 30000
-	EnableRacing  bool `yaml:"enable_racing"`  // 是否启用竞速，默认 true
+	EnableRacing  bool `yaml:"enable_racing"`   // 是否启用竞速，默认 true
 }
 
 // DefaultGraphConfig 返回默认配置
@@ -39,11 +39,11 @@ func DefaultGraphConfig() GraphConfig {
 
 // GraphResult 是图执行完毕后的汇总结果
 type GraphResult struct {
-	Observations    []string             // 所有成功节点的观察
-	NodeResults     map[graph.NodeID]NodeResult
-	Interrupted     bool
-	InterruptedAt   graph.NodeID         // 被中断时正在执行的节点
-	InterruptedMsg  string
+	Observations   []string // 所有成功节点的观察
+	NodeResults    map[graph.NodeID]NodeResult
+	Interrupted    bool
+	InterruptedAt  graph.NodeID // 被中断时正在执行的节点
+	InterruptedMsg string
 }
 
 // NodeResult 单节点的执行结果
@@ -69,12 +69,12 @@ type GraphRuntime struct {
 	agent   *UnifiedAgent
 	cfg     GraphConfig
 	tools   map[string]tool.Tool // 允许调用的工具集
-	sem     chan struct{}         // 并发信号量
+	sem     chan struct{}        // 并发信号量
 	mu      sync.Mutex
 	results map[graph.NodeID]string
 	errors  map[graph.NodeID]string
-	task    *TaskState             // 共享 TaskState，用于快照 / 中断恢复
-	onEvent func(StreamEvent)      // SSE 事件回调（nil = 静默模式）
+	task    *TaskState        // 共享 TaskState，用于快照 / 中断恢复
+	onEvent func(StreamEvent) // SSE 事件回调（nil = 静默模式）
 }
 
 // NewGraphRuntime 创建图运行时
@@ -316,17 +316,13 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 		if rt.onEvent != nil {
 			rt.onEvent(NewStreamEvent("step", ReActStep{Type: StepObservation, Content: fmt.Sprintf("执行失败: %s", errMsg)}))
 		}
-		if rt.agent.taskMem != nil {
-			rt.agent.taskMem.Push(promptctx.StepObservation{
-				StepID: nodeStepID(nodeID), ToolName: node.ToolName,
-				Error: errMsg, Success: false,
-			})
-		}
-		if rt.agent.toolTracker != nil {
-			rt.agent.toolTracker.Record(promptctx.ToolCallTrace{
-				ToolName: node.ToolName, Success: false, Summary: errMsg,
-			})
-		}
+		rt.agent.pctx.pushTaskMem(promptctx.StepObservation{
+			StepID: nodeStepID(nodeID), ToolName: node.ToolName,
+			Error: errMsg, Success: false,
+		})
+		rt.agent.pctx.recordToolCall(promptctx.ToolCallTrace{
+			ToolName: node.ToolName, Success: false, Summary: errMsg,
+		})
 		return "", execErr
 	}
 
@@ -341,17 +337,13 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 		rt.onEvent(NewStreamEvent("step", ReActStep{Type: StepObservation, Content: result}))
 	}
 
-	if rt.agent.taskMem != nil {
-		rt.agent.taskMem.Push(promptctx.StepObservation{
-			StepID: nodeStepID(nodeID), ToolName: node.ToolName,
-			Result: result, Success: true,
-		})
-	}
-	if rt.agent.toolTracker != nil {
-		rt.agent.toolTracker.Record(promptctx.ToolCallTrace{
-			ToolName: node.ToolName, Success: true, Summary: result,
-		})
-	}
+	rt.agent.pctx.pushTaskMem(promptctx.StepObservation{
+		StepID: nodeStepID(nodeID), ToolName: node.ToolName,
+		Result: result, Success: true,
+	})
+	rt.agent.pctx.recordToolCall(promptctx.ToolCallTrace{
+		ToolName: node.ToolName, Success: true, Summary: result,
+	})
 
 	return result, nil
 }

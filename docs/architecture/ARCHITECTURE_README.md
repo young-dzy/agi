@@ -1,6 +1,6 @@
 # AGI Assistant - Architecture Documentation
 
-This directory contains three comprehensive documents describing the current codebase architecture and refactoring roadmap.
+This directory contains architecture documents describing the current codebase, RAG ingestion flow, and refactoring roadmap.
 
 ## 📋 Documents
 
@@ -114,6 +114,23 @@ This directory contains three comprehensive documents describing the current cod
 
 ---
 
+### 4. **PDF_INGESTION_PIPELINE.md**
+**Current PDF upload, parsing, chunking, and RAG indexing flow.**
+
+**What it covers**:
+- Frontend `FormData` upload and `/api/upload` request handling
+- Parser priority: `pdfplumber` → `pdftotext` → Go PDF fallback
+- Text normalization and OCR detection
+- Parent/child chunking strategy for small-to-big retrieval
+- PostgreSQL-first indexing semantics
+- RRF fusion plus optional LLM listwise rerank behavior
+- Local PDF test results and next optimization steps
+
+Use this document when working on PDF parsing, OCR, RAG chunk quality,
+document-library persistence, or sub-agent report writeback.
+
+---
+
 ## 🚀 Quick Start for Refactoring
 
 ### If you want to understand the current system:
@@ -133,6 +150,12 @@ This directory contains three comprehensive documents describing the current cod
 3. **Is it a new search mode?** → Add ContextSource in runtime/, update schema
 4. **Is it a new LLM capability?** → Extend llm.Client, update graph extractor
 5. **Is it a new execution backend?** → Implement sandbox.Executor interface
+
+### If you want to optimize PDF/RAG ingestion:
+1. Start with **PDF_INGESTION_PIPELINE.md** — current upload and indexing flow
+2. Check rag/ splitter behavior before changing chunk sizes
+3. Verify PostgreSQL is available before judging `indexed_count`
+4. Add parser/upload tests when changing PDF extraction or API response fields
 
 ---
 
@@ -226,6 +249,7 @@ See **REFACTOR_READINESS.md** for detailed analysis:
 - Neo4j queries not parameterized (injection risk)
 - RRF search fusion not instrumented
 - Config is flat struct (hard to maintain)
+- OCR and persistent document-library metadata are not implemented yet
 
 ---
 

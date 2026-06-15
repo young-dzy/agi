@@ -39,7 +39,21 @@ This file serves as a quick reference to the complete architectural analysis of 
   - Dependency graph relationships
   - One-sentence purpose statement
 
-### 3. **Visuals: DEPENDENCY_GRAPH.md** (REFERENCE)
+### 3. **Deep Dive: PDF_INGESTION_PIPELINE.md**
+- **Purpose**: Current PDF upload → parsing → chunking → RAG indexing flow
+- **Best for**: Optimizing document ingestion, debugging upload issues, planning OCR/document-library work
+- **Time to read**: 10-15 minutes
+- **Key sections**:
+  - Request flow from frontend `FormData` to `/api/upload`
+  - PDF parser priority: `pdfplumber` → `pdftotext` → Go fallback
+  - Text normalization and OCR detection
+  - Parent/child chunking strategy
+  - PostgreSQL/Milvus/Elasticsearch/Neo4j indexing semantics
+  - Current rerank score behavior
+  - Local PDF test results
+  - Next optimization steps
+
+### 4. **Visuals: DEPENDENCY_GRAPH.md** (REFERENCE)
 - **Purpose**: Visual dependency diagrams and critical paths
 - **Best for**: Understanding request flows, impact analysis, tracing bugs
 - **Time to read**: 10-15 minutes
@@ -52,7 +66,7 @@ This file serves as a quick reference to the complete architectural analysis of 
   - Test coverage table (4 test files out of 33)
   - Refactoring impact map
 
-### 4. **Action: REFACTOR_READINESS.md** (ROADMAP)
+### 5. **Action: REFACTOR_READINESS.md** (ROADMAP)
 - **Purpose**: Strategic refactoring prioritization & planning
 - **Best for**: Planning refactoring work, assessing risks, picking next steps
 - **Time to read**: 15-20 minutes
@@ -87,6 +101,12 @@ This file serves as a quick reference to the complete architectural analysis of 
 2. Look up relevant packages in **ARCHITECTURE_MAP.md** (5 min)
 3. Trace affected code paths in **DEPENDENCY_GRAPH.md** (5 min)
 4. Check infra impacts in **ARCHITECTURE_MAP.md** infra section (5 min)
+
+### I want to optimize PDF/RAG ingestion
+1. Read **PDF_INGESTION_PIPELINE.md** current status and request flow (5 min)
+2. Check **PDF_INGESTION_PIPELINE.md** next optimization steps (5 min)
+3. Cross-reference **ARCHITECTURE_MAP.md** rag/handler/infra sections (10 min)
+4. Use **DEPENDENCY_GRAPH.md** critical paths to estimate impact (5 min)
 
 ### I'm debugging a complex issue
 1. Start in **DEPENDENCY_GRAPH.md** with relevant critical path (5 min)
@@ -191,6 +211,7 @@ Layer 6: main.go           — Application entry point
 ├── ARCHITECTURE_DOCS_INDEX.md      ← You are here
 ├── ARCHITECTURE_README.md          ← Navigation guide (START HERE)
 ├── ARCHITECTURE_MAP.md             ← Detailed package inventory
+├── PDF_INGESTION_PIPELINE.md       ← PDF upload, parsing, chunking, indexing
 ├── REFACTOR_READINESS.md           ← Refactoring roadmap
 ├── DEPENDENCY_GRAPH.md             ← Visualizations & impact
 ├── README.md                       (original project README)
@@ -218,6 +239,7 @@ Layer 6: main.go           — Application entry point
 - [ ] Read ARCHITECTURE_README.md
 - [ ] Review ARCHITECTURE_MAP.md packages involved
 - [ ] Check DEPENDENCY_GRAPH.md impact map
+- [ ] Check PDF_INGESTION_PIPELINE.md if the change touches upload/RAG ingest
 - [ ] Read REFACTOR_READINESS.md risk assessment
 - [ ] Run `go test ./...` to establish baseline
 

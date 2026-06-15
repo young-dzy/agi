@@ -64,6 +64,7 @@ type Repo interface {
 	// 启动初始化（创建 collection / index）
 	Init(dim int)
 	// 后端可用性
+	PGAvailable() bool
 	MilvusAvailable() bool
 	ESAvailable() bool
 }
@@ -85,6 +86,9 @@ func (s *Store) MilvusAvailable() bool { return s.milvus != nil }
 
 // ESAvailable 报告 ES 是否可用
 func (s *Store) ESAvailable() bool { return s.es != nil }
+
+// PGAvailable 报告 PostgreSQL 是否可用
+func (s *Store) PGAvailable() bool { return s.pg != nil }
 
 // ─────────────────────────────── PG ────────────────────────────────────────
 

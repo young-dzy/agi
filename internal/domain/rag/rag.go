@@ -67,6 +67,15 @@ type SearchResult struct {
 	Similarity float64 `json:"similarity"`
 }
 
+// IngestResult summarizes document ingestion and indexing.
+type IngestResult struct {
+	ChunkCount   int     `json:"chunk_count"`
+	ParentCount  int     `json:"parent_count"`
+	IndexedCount int     `json:"indexed_count"`
+	DocHash      string  `json:"doc_hash"`
+	ChunkPreview []Chunk `json:"chunk_preview,omitempty"`
+}
+
 // ─────────────────────────────── RAG 引擎 ────────────────────────────────
 
 // Engine 整合文本分割、混合检索与答案生成
@@ -148,7 +157,7 @@ func (e *Engine) Mode() string {
 // 切分策略：parent → child 两级
 //   - 父块用语义块大小（默认 800 字符），用于回填给 LLM 时上下文完整
 //   - 子块用 cfg.ChunkSize（默认 200），写入索引时关联父块，检索更精准
-func (e *Engine) Ingest(doc string) (int, string) {
+func (e *Engine) Ingest(doc string) IngestResult {
 	parents := e.parentSplitter.Split(doc)
 	var allChildren []Chunk
 	// childToParent[childIdx] = parentContent
@@ -163,11 +172,11 @@ func (e *Engine) Ingest(doc string) (int, string) {
 	}
 
 	docHash, indexed := e.store.IndexWithParents(allChildren, childToParent, doc)
-	e.Loaded = true
+	e.Loaded = len(indexed) > 0
 	if e.events != nil {
 		e.events.Publish("rag.ingest",
-			fmt.Sprintf(`{"chunk_count":%d,"parent_count":%d,"mode":"%s","doc_hash":"%s"}`,
-				len(allChildren), len(parents), e.store.Mode(), docHash))
+			fmt.Sprintf(`{"chunk_count":%d,"indexed_count":%d,"parent_count":%d,"mode":"%s","doc_hash":"%s"}`,
+				len(allChildren), len(indexed), len(parents), e.store.Mode(), docHash))
 	}
 
 	// 异步建图：实体关系抽取耗时较长，不阻塞主流程
@@ -181,7 +190,25 @@ func (e *Engine) Ingest(doc string) (int, string) {
 		goSafe("rag.kg-index", func() { e.kg.IndexDocument(docHash, refs) })
 	}
 
-	return len(allChildren), docHash
+	return IngestResult{
+		ChunkCount:   len(allChildren),
+		ParentCount:  len(parents),
+		IndexedCount: len(indexed),
+		DocHash:      docHash,
+		ChunkPreview: previewChunks(allChildren, 5),
+	}
+}
+
+func previewChunks(chunks []Chunk, limit int) []Chunk {
+	if limit <= 0 || len(chunks) == 0 {
+		return nil
+	}
+	if len(chunks) < limit {
+		limit = len(chunks)
+	}
+	out := make([]Chunk, limit)
+	copy(out, chunks[:limit])
+	return out
 }
 
 // Delete 按 docHash 删除文档的所有 chunks（PG + ES + Milvus + Neo4j KG）

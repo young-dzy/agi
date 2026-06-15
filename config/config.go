@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -292,10 +293,13 @@ type yamlFile struct {
 
 // DefaultConfig 从 config/config.yaml 加载配置
 func DefaultConfig() *APIConfig {
+	loadLocalEnv(".env")
+
 	data, err := os.ReadFile("config/config.yaml")
 	if err != nil {
 		log.Fatalf("读取 config/config.yaml 失败: %v", err)
 	}
+	data = []byte(os.ExpandEnv(string(data)))
 
 	// 严格解析：未知字段直接报错，避免 yaml 键名拼错（如 api-key vs api_key）
 	// 时被静默忽略，运行时才发现 LLM/Embedding 走了 mock 模式。
@@ -410,6 +414,34 @@ func DefaultConfig() *APIConfig {
 
 	applyDefaults(c)
 	return c
+}
+
+// loadLocalEnv loads KEY=VALUE pairs from a local .env file without overwriting
+// variables already provided by the process environment.
+func loadLocalEnv(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" || os.Getenv(key) != "" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		value = strings.Trim(value, `"'`)
+		if err := os.Setenv(key, value); err != nil {
+			log.Printf("⚠️  加载本地环境变量失败 (%s): %v", key, err)
+		}
+	}
 }
 
 // applyDefaults 为零值字段填充合理默认值

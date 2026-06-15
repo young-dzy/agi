@@ -5,6 +5,7 @@ package milvus
 import (
 	"context"
 	"log"
+	"time"
 
 	"agi-assistant/config"
 
@@ -13,7 +14,10 @@ import (
 
 // Connect 尝试连接 Milvus；失败时返回 (nil, "disconnected")，调用方决定是否降级。
 func Connect(cfg config.MilvusConfig) (milvusClient.Client, string) {
-	mc, err := milvusClient.NewClient(context.Background(), milvusClient.Config{
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	mc, err := milvusClient.NewClient(ctx, milvusClient.Config{
 		Address: cfg.MilvusAddr(),
 	})
 	if err != nil {

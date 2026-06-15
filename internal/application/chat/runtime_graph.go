@@ -280,7 +280,7 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 		if rt.onEvent != nil {
 			rt.onEvent(NewStreamEvent("step", ReActStep{Type: StepObservation, Content: errMsg}))
 		}
-		return "", fmt.Errorf(errMsg)
+		return "", fmt.Errorf("%s", errMsg)
 	}
 
 	// 重试执行

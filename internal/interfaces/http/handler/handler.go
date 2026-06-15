@@ -4,12 +4,15 @@ package handler
 import (
 	"agi-assistant/config"
 	"agi-assistant/internal/application/chat"
+	"agi-assistant/internal/domain/document"
 	"agi-assistant/internal/domain/tool"
 	toolimpl "agi-assistant/internal/infrastructure/tool"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 )
 
 // Server 聚合 Agent 引用，挂载所有 HTTP 路由
@@ -138,19 +141,74 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
+
+	parsed, err := parseUploadDocument(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if parsed.NeedsOCR {
+		writeJSON(w, map[string]interface{}{
+			"filename":      parsed.Filename,
+			"content_type":  parsed.ContentType,
+			"parser":        parsed.Parser,
+			"pages":         parsed.Pages,
+			"text_chars":    parsed.TextChars,
+			"needs_ocr":     true,
+			"chunk_count":   0,
+			"parent_count":  0,
+			"indexed_count": 0,
+			"doc_hash":      "",
+			"chunks":        nil,
+			"message":       "PDF 文本抽取结果过少，可能是扫描件，需要 OCR 后再入库",
+		})
+		return
+	}
+
+	ingested := s.agent.RAG().Ingest(parsed.Content)
+	writeJSON(w, map[string]interface{}{
+		"filename":      parsed.Filename,
+		"content_type":  parsed.ContentType,
+		"parser":        parsed.Parser,
+		"pages":         parsed.Pages,
+		"text_chars":    parsed.TextChars,
+		"needs_ocr":     parsed.NeedsOCR,
+		"chunk_count":   ingested.ChunkCount,
+		"parent_count":  ingested.ParentCount,
+		"indexed_count": ingested.IndexedCount,
+		"chunk_preview": ingested.ChunkPreview,
+		"doc_hash":      ingested.DocHash,
+		"chunks":        s.agent.RAG().Chunks(),
+	})
+}
+
+func parseUploadDocument(r *http.Request) (document.ParseResult, error) {
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data") {
+		if err := r.ParseMultipartForm(64 << 20); err != nil {
+			return document.ParseResult{}, fmt.Errorf("invalid multipart upload: %w", err)
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			return document.ParseResult{}, fmt.Errorf("file is required")
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return document.ParseResult{}, fmt.Errorf("read uploaded file failed: %w", err)
+		}
+		return document.ParseBytes(header.Filename, header.Header.Get("Content-Type"), data)
+	}
+
 	var req struct {
 		Content string `json:"content"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
+		return document.ParseResult{}, fmt.Errorf("invalid request body")
 	}
-	count, docHash := s.agent.RAG().Ingest(req.Content)
-	writeJSON(w, map[string]interface{}{
-		"chunk_count": count,
-		"doc_hash":    docHash,
-		"chunks":      s.agent.RAG().Chunks(),
-	})
+	return document.ParseBytes("upload.txt", "text/plain", []byte(req.Content))
 }
 
 // POST /api/docs/delete — 删除指定文档的所有 chunks

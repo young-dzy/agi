@@ -1,7 +1,7 @@
 # 对话模型配置
 llm:
   api_url: https://api.deepseek.com/chat/completions
-  api_key: "你的key"
+  api_key: "${DEEPSEEK_API_KEY}"
   model: deepseek-v4-pro
   temperature: 0.7
 embedding:

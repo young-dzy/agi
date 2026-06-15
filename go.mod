@@ -1,11 +1,12 @@
 module agi-assistant
 
-go 1.23.0
+go 1.24.1
 
 toolchain go1.24.13
 
 require (
 	github.com/elastic/go-elasticsearch/v8 v8.19.5
+	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/lib/pq v1.12.3
 	github.com/milvus-io/milvus-sdk-go/v2 v2.4.2
 	github.com/neo4j/neo4j-go-driver/v5 v5.18.0

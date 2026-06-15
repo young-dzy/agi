@@ -39,6 +39,9 @@ func NewHybridStore(cfg *config.APIConfig, chunks ragchunk.Repo) *HybridStore {
 		chunks: chunks,
 		mode:   "unavailable",
 	}
+	if !chunks.PGAvailable() {
+		return hs
+	}
 	milvusOK := chunks.MilvusAvailable()
 	esOK := chunks.ESAvailable()
 	switch {
@@ -92,6 +95,10 @@ func (hs *HybridStore) Index(chunks []Chunk, docContent string) (string, []Index
 func (hs *HybridStore) IndexWithParents(chunks []Chunk, parents []string, docContent string) (string, []IndexedChunk) {
 	// 计算文档哈希（幂等摄入）
 	docHash := fmt.Sprintf("%x", sha256.Sum256([]byte(docContent)))[:16]
+	if !hs.chunks.PGAvailable() {
+		log.Printf("⚠️  RAG 索引跳过：PostgreSQL 不可用，无法保存 chunks (doc_hash=%s, chunks=%d)", docHash, len(chunks))
+		return docHash, nil
+	}
 
 	var pgIDs []int64
 	var contents []string

@@ -953,15 +953,25 @@ zone.addEventListener('drop', async e => {
 });
 
 async function uploadFile(file) {
-  const text = await file.text();
   try {
+    const form = new FormData();
+    form.append('file', file);
     const res = await fetch('/api/upload', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: text })
+      body: form
     }).then(r => r.json());
 
-    const doc = { name: file.name, chunks: res.chunk_count, docHash: res.doc_hash, ts: Date.now() };
+    const doc = {
+      name: file.name,
+      chunks: res.chunk_count,
+      indexed: res.indexed_count || 0,
+      parser: res.parser || '',
+      pages: res.pages || 0,
+      textChars: res.text_chars || 0,
+      needsOCR: !!res.needs_ocr,
+      docHash: res.doc_hash,
+      ts: Date.now()
+    };
     uploadedDocs = uploadedDocs.filter(d => d.name !== file.name);
     uploadedDocs.unshift(doc);
     localStorage.setItem('ai_docs', JSON.stringify(uploadedDocs));
@@ -981,11 +991,15 @@ function renderDocs() {
     const delBtn = d.docHash
       ? `<span class="doc-del" onclick="deleteDoc('${d.docHash}','${d.name}')" title="删除">×</span>`
       : '';
+    const chunkLabel = d.needsOCR
+      ? '需 OCR'
+      : `${d.chunks || 0} 块${d.indexed ? `/${d.indexed}` : ''}`;
+    const title = `${d.name}${d.pages ? ` · ${d.pages} 页` : ''}${d.textChars ? ` · ${d.textChars} 字` : ''}${d.parser ? ` · ${d.parser}` : ''}`;
     return `
     <div class="doc-item">
-      <span class="doc-icon">✓</span>
-      <span class="doc-name" title="${d.name}">${d.name}</span>
-      <span class="doc-chunks">${d.chunks} 块</span>
+      <span class="doc-icon">${d.needsOCR ? '!' : '✓'}</span>
+      <span class="doc-name" title="${title}">${d.name}</span>
+      <span class="doc-chunks">${chunkLabel}</span>
       ${delBtn}
     </div>`;
   }).join('');

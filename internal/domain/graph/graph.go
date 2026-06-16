@@ -18,6 +18,7 @@ type NodeType string // "tool" | "think" | "aggregate"
 
 const (
 	NodeTypeTool      NodeType = "tool"
+	NodeTypeSubAgent  NodeType = "sub_agent"
 	NodeTypeThink     NodeType = "think"
 	NodeTypeAggregate NodeType = "aggregate"
 )
@@ -39,11 +40,13 @@ const (
 type Node struct {
 	ID         NodeID            `json:"id"`
 	Type       NodeType          `json:"type"`
-	Name       string            `json:"name"`                  // Planner 给出的 reason
-	ToolName   string            `json:"tool_name,omitempty"`   // 工具节点必填
+	Name       string            `json:"name"`                 // Planner 给出的 reason
+	ToolName   string            `json:"tool_name,omitempty"`  // 工具节点必填
+	AgentName  string            `json:"agent_name,omitempty"` // 子 Agent 节点必填
+	Goal       string            `json:"goal,omitempty"`       // 子 Agent 任务目标
 	Params     map[string]string `json:"params,omitempty"`
-	DependsOn  []NodeID          `json:"depends_on"`            // 入边：依赖哪些节点
-	RaceGroup  string            `json:"race_group,omitempty"`  // 空=独立；同 group=竞速
+	DependsOn  []NodeID          `json:"depends_on"`           // 入边：依赖哪些节点
+	RaceGroup  string            `json:"race_group,omitempty"` // 空=独立；同 group=竞速
 	Status     NodeStatus        `json:"status"`
 	Result     string            `json:"result,omitempty"`
 	Error      string            `json:"error,omitempty"`
@@ -54,9 +57,9 @@ type Node struct {
 
 // TaskGraph 是有向无环图，通过拓扑排序决定节点执行顺序。
 type TaskGraph struct {
-	Nodes    map[NodeID]*Node   `json:"nodes"`
+	Nodes    map[NodeID]*Node    `json:"nodes"`
 	AdjList  map[NodeID][]NodeID `json:"adj_list"`  // node → 下游节点
-	InDegree map[NodeID]int      `json:"in_degree"`  // 入度表
+	InDegree map[NodeID]int      `json:"in_degree"` // 入度表
 	levels   [][]NodeID          // 缓存的拓扑层级
 }
 
@@ -220,7 +223,11 @@ func (tg *TaskGraph) SuccessfulResults() []string {
 	var results []string
 	for _, n := range tg.Nodes {
 		if n.Status == StatusDone && n.Result != "" {
-			results = append(results, fmt.Sprintf("[%s] %s", n.ToolName, n.Result))
+			name := n.ToolName
+			if n.Type == NodeTypeSubAgent {
+				name = n.AgentName
+			}
+			results = append(results, fmt.Sprintf("[%s] %s", name, n.Result))
 		}
 	}
 	return results
@@ -239,7 +246,11 @@ func (tg *TaskGraph) Summary() string {
 		var names []string
 		for _, id := range level {
 			n := tg.Nodes[id]
-			names = append(names, fmt.Sprintf("%s(%s)", n.ID, n.ToolName))
+			name := n.ToolName
+			if n.Type == NodeTypeSubAgent {
+				name = n.AgentName
+			}
+			names = append(names, fmt.Sprintf("%s(%s)", n.ID, name))
 		}
 		fmt.Fprintf(&b, "  L%d: %s\n", i, strings.Join(names, ", "))
 	}

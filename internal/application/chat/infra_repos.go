@@ -8,6 +8,7 @@ package chat
 import (
 	"agi-assistant/internal/infrastructure/eventbus"
 	"agi-assistant/internal/infrastructure/persistence/chathistory"
+	docrepo "agi-assistant/internal/infrastructure/persistence/documentrepo"
 	ltmrepo "agi-assistant/internal/infrastructure/persistence/longterm"
 	prefrepo "agi-assistant/internal/infrastructure/persistence/preference"
 	"agi-assistant/internal/infrastructure/persistence/ragchunk"
@@ -21,6 +22,7 @@ type repoBundle struct {
 	snap     snapshot.Repo
 	ltm      ltmrepo.Repo
 	ragChunk ragchunk.Repo
+	docs     docrepo.Repo
 	events   eventbus.Publisher
 	infra    map[string]string // platform 层连接健康快照
 }
@@ -33,6 +35,7 @@ func newRepoBundle(deps Deps) *repoBundle {
 		snap:     deps.SnapRepo,
 		ltm:      deps.LTMRepo,
 		ragChunk: deps.RAGChunkRepo,
+		docs:     deps.DocumentRepo,
 		events:   deps.Events,
 		infra:    deps.InfraStatus,
 	}

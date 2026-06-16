@@ -198,11 +198,11 @@ func (rt *GraphRuntime) raceGroup(ctx context.Context, g raceGroup, wg *sync.Wai
 				node := rt.graph.Nodes[r.nodeID]
 				rt.onEvent(NewStreamEvent("race_won", map[string]string{
 					"race_group": g.RaceGroup, "winner": string(r.nodeID),
-					"tool": node.ToolName,
+					"tool": executorName(node),
 				}))
 				rt.onEvent(NewStreamEvent("step", ReActStep{
 					Type: StepObservation, Content: r.result,
-					Tool: node.ToolName, Params: node.Params,
+					Tool: executorName(node), Params: node.Params,
 				}))
 			}
 		} else if !winnerFound {
@@ -253,17 +253,18 @@ func (rt *GraphRuntime) executeNode(ctx context.Context, nodeID graph.NodeID, wg
 // executeSingleNode 执行单个节点：获取工具 → 重试执行 → 记录结果
 func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.NodeID) (string, error) {
 	node := rt.graph.Nodes[nodeID]
+	executor := executorName(node)
 
 	// 推送节点开始事件
 	if rt.onEvent != nil {
 		rt.onEvent(NewStreamEvent("node_start", map[string]string{
-			"id": string(nodeID), "tool": node.ToolName,
+			"id": string(nodeID), "tool": executor,
 		}))
 	}
 
 	// Thought 步骤
 	thoughtStep := ReActStep{Type: StepThought, Content: node.Name}
-	actionStep := ReActStep{Type: StepAction, Content: fmt.Sprintf("调用 %s", node.ToolName), Tool: node.ToolName, Params: node.Params}
+	actionStep := ReActStep{Type: StepAction, Content: fmt.Sprintf("调用 %s", executor), Tool: executor, Params: node.Params}
 	if rt.onEvent != nil {
 		rt.onEvent(NewStreamEvent("step", thoughtStep))
 		rt.onEvent(NewStreamEvent("step", actionStep))
@@ -271,22 +272,28 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 
 	rt.graph.SetNodeStatus(nodeID, graph.StatusRunning)
 
-	// 查找工具
-	t, ok := rt.tools[node.ToolName]
-	if !ok {
-		errMsg := fmt.Sprintf("工具 %s 不在允许列表中", node.ToolName)
-		rt.graph.SetNodeStatus(nodeID, graph.StatusFailed)
-		rt.graph.SetNodeError(nodeID, errMsg)
-		if rt.onEvent != nil {
-			rt.onEvent(NewStreamEvent("step", ReActStep{Type: StepObservation, Content: errMsg}))
-		}
-		return "", fmt.Errorf("%s", errMsg)
-	}
-
-	// 重试执行
 	params := make(map[string]interface{}, len(node.Params))
 	for k, v := range node.Params {
 		params[k] = v
+	}
+	run := func() (string, error) {
+		if node.Type == graph.NodeTypeSubAgent {
+			sa, ok := rt.agent.subagents.get(node.AgentName)
+			if !ok {
+				return "", fmt.Errorf("子 Agent %s 不存在", node.AgentName)
+			}
+			return sa.Run(ctx, SubAgentTask{
+				ID:       string(nodeID),
+				Goal:     node.Goal,
+				Query:    rt.task.Query,
+				Upstream: rt.upstreamResults(node),
+			})
+		}
+		t, ok := rt.tools[node.ToolName]
+		if !ok {
+			return "", fmt.Errorf("工具 %s 不在允许列表中", node.ToolName)
+		}
+		return t.Execute(params)
 	}
 
 	var result string
@@ -299,7 +306,7 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 			rt.graph.SetNodeStatus(nodeID, graph.StatusCancelled)
 			return "", fmt.Errorf("被用户中断")
 		}
-		result, execErr = t.Execute(params)
+		result, execErr = run()
 		if execErr == nil {
 			break
 		}
@@ -317,11 +324,11 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 			rt.onEvent(NewStreamEvent("step", ReActStep{Type: StepObservation, Content: fmt.Sprintf("执行失败: %s", errMsg)}))
 		}
 		rt.agent.pctx.pushTaskMem(promptctx.StepObservation{
-			StepID: nodeStepID(nodeID), ToolName: node.ToolName,
+			StepID: nodeStepID(nodeID), ToolName: executor,
 			Error: errMsg, Success: false,
 		})
 		rt.agent.pctx.recordToolCall(promptctx.ToolCallTrace{
-			ToolName: node.ToolName, Success: false, Summary: errMsg,
+			ToolName: executor, Success: false, Summary: errMsg,
 		})
 		return "", execErr
 	}
@@ -332,17 +339,17 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 
 	if rt.onEvent != nil {
 		rt.onEvent(NewStreamEvent("node_done", map[string]string{
-			"id": string(nodeID), "tool": node.ToolName, "status": "done",
+			"id": string(nodeID), "tool": executor, "status": "done",
 		}))
 		rt.onEvent(NewStreamEvent("step", ReActStep{Type: StepObservation, Content: result}))
 	}
 
 	rt.agent.pctx.pushTaskMem(promptctx.StepObservation{
-		StepID: nodeStepID(nodeID), ToolName: node.ToolName,
+		StepID: nodeStepID(nodeID), ToolName: executor,
 		Result: result, Success: true,
 	})
 	rt.agent.pctx.recordToolCall(promptctx.ToolCallTrace{
-		ToolName: node.ToolName, Success: true, Summary: result,
+		ToolName: executor, Success: true, Summary: result,
 	})
 
 	return result, nil
@@ -359,6 +366,30 @@ func nodeStepID(id graph.NodeID) int {
 		}
 	}
 	return 0
+}
+
+func executorName(n *graph.Node) string {
+	if n == nil {
+		return ""
+	}
+	if n.Type == graph.NodeTypeSubAgent {
+		return n.AgentName
+	}
+	return n.ToolName
+}
+
+func (rt *GraphRuntime) upstreamResults(node *graph.Node) map[string]string {
+	out := make(map[string]string, len(node.DependsOn))
+	for _, depID := range node.DependsOn {
+		if dep, ok := rt.graph.Nodes[depID]; ok && dep.Result != "" {
+			key := string(depID)
+			if name := executorName(dep); name != "" {
+				key = fmt.Sprintf("%s:%s", depID, name)
+			}
+			out[key] = dep.Result
+		}
+	}
+	return out
 }
 
 // groupByRace 将同一层中的节点按 race_group 分组

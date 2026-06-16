@@ -161,6 +161,12 @@ body {
 #fileInput { display: none; }
 
 .doc-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.library-panel {
+  padding-bottom: 10px;
+  max-height: 170px;
+  overflow-y: auto;
+  border-bottom: 1px solid rgba(196,181,253,0.16);
+}
 .doc-item {
   display: flex; align-items: center; gap: 8px;
   padding: 7px 12px;
@@ -170,6 +176,7 @@ body {
   color: var(--text2);
   border: 1px solid var(--border2);
   transition: background .15s;
+  cursor: pointer;
 }
 .doc-item:hover { background: rgba(255,255,255,0.8); }
 .doc-item .doc-icon { color: var(--pink-d); font-size: 13px; }
@@ -177,6 +184,12 @@ body {
 .doc-item .doc-chunks { color: var(--text3); font-size: 11px; flex-shrink: 0; }
 .doc-item .doc-del { cursor: pointer; color: #c4b0c8; font-size: 16px; font-weight: bold; line-height: 1; padding: 0 4px; border-radius: 6px; flex-shrink: 0; transition: color .15s, background .15s; }
 .doc-item .doc-del:hover { color: var(--red); background: var(--red-l); }
+.doc-item .doc-ingest { cursor: pointer; color: var(--primary-d); font-size: 13px; padding: 1px 5px; border-radius: 6px; flex-shrink: 0; transition: color .15s, background .15s; }
+.doc-item .doc-ingest:hover { color: var(--pink-d); background: var(--pink-l); }
+.doc-empty { font-size: 11px; color: var(--text3); padding: 7px 2px; line-height: 1.5; }
+.sec-label-row { display: flex; align-items: center; justify-content: space-between; padding-right: 14px; }
+.mini-refresh { border: 1px solid var(--border); background: rgba(255,255,255,.45); color: var(--text2); border-radius: 8px; padding: 2px 7px; font-size: 11px; cursor: pointer; }
+.mini-refresh:hover { border-color: var(--pink); color: var(--pink-d); }
 
 /* ── 近期对话 ── */
 .recent {
@@ -627,6 +640,96 @@ body {
   white-space: pre-wrap;
 }
 
+/* Local document viewer */
+.doc-viewer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+  background: rgba(61,50,80,0.22);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.doc-viewer-backdrop.open { display: flex; }
+.doc-viewer {
+  width: min(900px, 100%);
+  max-height: min(760px, calc(100vh - 56px));
+  display: flex;
+  flex-direction: column;
+  background: rgba(255,255,255,0.94);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 18px 60px rgba(87,69,120,0.22);
+  overflow: hidden;
+}
+.doc-viewer-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.doc-viewer-title-wrap { flex: 1; min-width: 0; }
+.doc-viewer-kicker {
+  font-size: 10px;
+  color: var(--pink-d);
+  font-weight: 700;
+  letter-spacing: .8px;
+  text-transform: uppercase;
+  margin-bottom: 5px;
+}
+.doc-viewer-title {
+  font-size: 18px;
+  color: var(--text);
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.doc-viewer-meta {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text3);
+}
+.doc-viewer-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.doc-viewer-action,
+.doc-viewer-close {
+  height: 32px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,.7);
+  color: var(--text2);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.doc-viewer-action {
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.doc-viewer-close {
+  width: 32px;
+  font-size: 18px;
+  line-height: 1;
+}
+.doc-viewer-action:hover,
+.doc-viewer-close:hover { border-color: var(--pink); color: var(--pink-d); background: rgba(249,168,212,0.08); }
+.doc-viewer-action:disabled { opacity: .5; cursor: default; }
+.doc-viewer-body {
+  overflow-y: auto;
+  padding: 20px;
+}
+.doc-viewer-content {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Progress indicator */
 .progress-bar {
   display: flex; align-items: center; gap: 8px;
@@ -752,6 +855,14 @@ body {
     <div class="doc-list" id="docList"></div>
   </div>
 
+  <div class="sec-label sec-label-row">
+    <span>📚 本地文档库</span>
+    <button class="mini-refresh" type="button" onclick="loadLibraryDocs(event)">刷新</button>
+  </div>
+  <div class="blackhole library-panel">
+    <div class="doc-list" id="libraryDocList"></div>
+  </div>
+
   <!-- 近期对话 -->
   <div class="sec-label">🎀 近期对话</div>
   <div class="recent" id="sessionList">
@@ -820,6 +931,26 @@ body {
   </div>
 </div>
 
+<!-- Local document viewer -->
+<div class="doc-viewer-backdrop" id="docViewer" onclick="closeDocumentViewer(event)">
+  <section class="doc-viewer" role="dialog" aria-modal="true" aria-labelledby="docViewerTitle" onclick="event.stopPropagation()">
+    <div class="doc-viewer-head">
+      <div class="doc-viewer-title-wrap">
+        <div class="doc-viewer-kicker">本地文档库</div>
+        <div class="doc-viewer-title" id="docViewerTitle">本地文档</div>
+        <div class="doc-viewer-meta" id="docViewerMeta"></div>
+      </div>
+      <div class="doc-viewer-actions">
+        <button class="doc-viewer-action" id="docViewerIngest" type="button" onclick="ingestCurrentViewerDocument()">↻ 入库</button>
+        <button class="doc-viewer-close" type="button" aria-label="关闭文档" onclick="closeDocumentViewer()">×</button>
+      </div>
+    </div>
+    <div class="doc-viewer-body">
+      <pre class="doc-viewer-content" id="docViewerContent"></pre>
+    </div>
+  </section>
+</div>
+
 <script>
 // ══════════════════════════════════════════
 //  Background Decorations
@@ -863,6 +994,8 @@ let availableTools = [];
 let sessions = JSON.parse(localStorage.getItem('ai_sessions') || '[]');
 let currentId = null;
 let uploadedDocs = [];
+let libraryDocs = [];
+let currentViewerDocId = null;
 localStorage.removeItem('ai_docs');
 let isLoading = false;
 
@@ -1026,6 +1159,135 @@ async function deleteDoc(docHash, name) {
 }
 
 // ══════════════════════════════════════════
+//  Local document library
+// ══════════════════════════════════════════
+async function loadLibraryDocs(e) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  try {
+    const res = await fetchDocumentJSON('/api/documents');
+    libraryDocs = res.documents || [];
+  } catch(e) {
+    libraryDocs = [];
+  }
+  renderLibraryDocs();
+}
+
+function renderLibraryDocs() {
+  const el = document.getElementById('libraryDocList');
+  if (!el) return;
+  if (libraryDocs.length === 0) {
+    el.innerHTML = '<div class="doc-empty">暂无本地文档。让 Agent 生成报告并保存后，会出现在这里。</div>';
+    return;
+  }
+  el.innerHTML = libraryDocs.slice(0, 8).map(d => `
+    <div class="doc-item" role="button" onclick="viewLibraryDocument(event, '${escAttr(d.id)}')">
+      <span class="doc-icon">§</span>
+      <span class="doc-name" title="${escAttr(d.title || '')}">${escHtml(d.title || '未命名文档')}</span>
+      <span class="doc-chunks">v${d.latest_version || 0}</span>
+      <span class="doc-ingest" onclick="ingestLibraryDocument(event, '${escAttr(d.id)}')" title="重新入库 RAG">↻</span>
+    </div>`).join('');
+}
+
+async function fetchDocumentJSON(url, options) {
+  const resp = await fetch(url, options);
+  const raw = await resp.text();
+  let data = {};
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch(e) {
+      data = { error: raw };
+    }
+  }
+  if (!resp.ok) throw new Error(data.error || raw || `HTTP ${resp.status}`);
+  return data;
+}
+
+async function viewLibraryDocument(e, id) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  try {
+    const res = await fetchDocumentJSON('/api/documents/' + encodeURIComponent(id));
+    const doc = res.document || {};
+    const ver = res.version || {};
+    openDocumentViewer(doc, ver);
+  } catch(e) {
+    openDocumentViewer({ title: '读取文档失败', id: '' }, { content_md: e.message });
+  }
+}
+
+async function ingestLibraryDocument(e, id) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  try {
+    const res = await ingestDocumentByID(id);
+    appendBubble('ai', `文档已重新入库：${res.indexed_count || 0}/${res.chunk_count || 0} 个 chunk`, false);
+  } catch(err) {
+    appendBubble('ai', '入库失败：' + err.message);
+  }
+}
+
+async function ingestDocumentByID(id) {
+  const res = await fetchDocumentJSON('/api/documents/' + encodeURIComponent(id) + '/ingest', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+  loadLibraryDocs();
+  return res;
+}
+
+function openDocumentViewer(doc, ver) {
+  currentViewerDocId = doc.id || null;
+  const viewer = document.getElementById('docViewer');
+  const title = document.getElementById('docViewerTitle');
+  const meta = document.getElementById('docViewerMeta');
+  const content = document.getElementById('docViewerContent');
+  const ingestBtn = document.getElementById('docViewerIngest');
+  const version = doc.latest_version || ver.version || 0;
+  const updated = formatDocTime(doc.updated_at || ver.created_at);
+  title.textContent = doc.title || '本地文档';
+  meta.dataset.base = `v${version} · ${doc.doc_type || 'document'} · ${doc.source || 'local'}${updated ? ' · ' + updated : ''}`;
+  meta.textContent = meta.dataset.base;
+  content.textContent = ver.content_md || '（空文档）';
+  ingestBtn.disabled = !currentViewerDocId;
+  viewer.classList.add('open');
+}
+
+function closeDocumentViewer(e) {
+  if (e && e.currentTarget && e.target !== e.currentTarget) return;
+  const viewer = document.getElementById('docViewer');
+  if (viewer) viewer.classList.remove('open');
+  currentViewerDocId = null;
+}
+
+async function ingestCurrentViewerDocument() {
+  if (!currentViewerDocId) return;
+  const btn = document.getElementById('docViewerIngest');
+  const meta = document.getElementById('docViewerMeta');
+  const base = meta.dataset.base || meta.textContent || '';
+  btn.disabled = true;
+  meta.textContent = `${base} · 入库中...`;
+  try {
+    const res = await ingestDocumentByID(currentViewerDocId);
+    meta.textContent = `${base} · 已入库 ${res.indexed_count || 0}/${res.chunk_count || 0} chunks`;
+  } catch(err) {
+    meta.textContent = `${base} · 入库失败：${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function formatDocTime(value) {
+  if (!value) return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeDocumentViewer();
+});
+
+// ══════════════════════════════════════════
 //  RAG toggle
 // ══════════════════════════════════════════
 function toggleRAG() {
@@ -1151,6 +1413,10 @@ function appendBubble(role, html, isHtml = false) {
 
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+}
+
+function escAttr(s) {
+  return escHtml(String(s || '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // ══════════════════════════════════════════
@@ -1479,6 +1745,7 @@ async function send() {
 
     const replyHtml = bubble.innerHTML;
     pushMessage('ai', replyHtml);
+    loadLibraryDocs();
 
   } catch(e) {
     const typing = answerEl.querySelector('.typing');
@@ -1524,6 +1791,7 @@ function autoResize(el) {
 // ══════════════════════════════════════════
 renderSessions();
 renderDocs();
+loadLibraryDocs();
 loadTools();
 if (sessions.length > 0) {
   // don't auto-switch, just show sessions in sidebar

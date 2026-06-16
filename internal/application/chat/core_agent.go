@@ -19,6 +19,7 @@ import (
 	"agi-assistant/internal/infrastructure/eventbus"
 	"agi-assistant/internal/infrastructure/llm"
 	"agi-assistant/internal/infrastructure/persistence/chathistory"
+	docrepo "agi-assistant/internal/infrastructure/persistence/documentrepo"
 	ltmrepo "agi-assistant/internal/infrastructure/persistence/longterm"
 	prefrepo "agi-assistant/internal/infrastructure/persistence/preference"
 	"agi-assistant/internal/infrastructure/persistence/ragchunk"
@@ -56,6 +57,9 @@ type UnifiedAgent struct {
 	// 由 toolRegistry 统一管理 RWMutex + map，避免在 agent struct 上铺锁字段。
 	tools *toolRegistry
 
+	// 子 Agent 集：research / writer / review / doc 等同进程 worker。
+	subagents *subAgentRegistry
+
 	// per-request 共享状态：snapshots、当前任务、in-flight cancel funcs。
 	// 由 taskRuntime 聚合并管理 sync.Mutex，避免在 agent struct 上铺锁字段。
 	runtime *taskRuntime
@@ -68,6 +72,7 @@ type Deps struct {
 	SnapRepo     snapshot.Repo
 	LTMRepo      ltmrepo.Repo
 	RAGChunkRepo ragchunk.Repo
+	DocumentRepo docrepo.Repo
 	Events       eventbus.Publisher
 	// InfraStatus 平台层连接健康快照
 	InfraStatus map[string]string
@@ -89,12 +94,14 @@ func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
 		llm:          llm.New(cfg),
 		rag:          rag.NewEngine(cfg, deps.RAGChunkRepo, deps.Events),
 		tools:        newToolRegistry(toolimpl.DefaultTools()),
+		subagents:    newSubAgentRegistry(),
 		runtime:      newTaskRuntime(),
 		mem:          newMemoryStack(cfg),
 		repos:        newRepoBundle(deps),
 		ragMilvusDim: cfg.RAGMilvusDim,
 	}
 	a.wireRAGCallbacks()
+	a.registerBuiltinSubAgents()
 	a.bootstrapConcurrent()
 	a.initKnowledgeGraph()
 	a.pctx = a.buildPromptCtx()
@@ -208,6 +215,8 @@ func (a *UnifiedAgent) registerBuiltinTools() {
 			), nil
 		},
 	})
+
+	a.registerDocumentTools()
 }
 
 // buildPromptCtx 构造 Schema-driven 的 prompt 装配器。

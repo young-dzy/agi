@@ -32,6 +32,7 @@ func (a *UnifiedAgent) Status() map[string]interface{} {
 		"long_term_count":  a.mem.ltm.Count(),
 		"preferences":      a.mem.pref.Snapshot(),
 		"tools_count":      len(a.toolsSnapshot()),
+		"sub_agents_count": len(a.subagents.snapshot()),
 		"llm_model":        a.cfg.LLMModel,
 		"embedding_model":  a.cfg.EmbeddingModel,
 		"is_mock":          !a.cfg.IsRealLLM(),

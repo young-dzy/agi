@@ -34,6 +34,8 @@ func (s *Server) registerRoutes() {
 	http.HandleFunc("/api/chat/cancel", s.chatCancel)
 	http.HandleFunc("/api/upload", s.upload)
 	http.HandleFunc("/api/docs/delete", s.docsDelete)
+	http.HandleFunc("/api/documents", s.documents)
+	http.HandleFunc("/api/documents/", s.documentByID)
 	http.HandleFunc("/api/memory", s.memory)
 	http.HandleFunc("/api/tools", s.toolsList)
 	http.HandleFunc("/api/tools/mcp", s.registerMCPTool)
@@ -233,6 +235,86 @@ func (s *Server) docsDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"ok": true, "doc_hash": req.DocHash})
+}
+
+// GET/POST /api/documents — 列出或写入本地文档库
+func (s *Server) documents(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		docs, err := s.agent.ListDocuments()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]interface{}{"documents": docs})
+	case http.MethodPost:
+		var req struct {
+			DocumentID  string                 `json:"document_id"`
+			Title       string                 `json:"title"`
+			DocType     string                 `json:"doc_type"`
+			Source      string                 `json:"source"`
+			CreatedBy   string                 `json:"created_by"`
+			ContentMD   string                 `json:"content_md"`
+			Summary     string                 `json:"summary"`
+			Metadata    map[string]interface{} `json:"metadata"`
+			IngestToRAG bool                   `json:"ingest_to_rag"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		res, err := s.agent.WriteDocument(document.WriteRequest{
+			DocumentID: req.DocumentID,
+			Title:      req.Title,
+			DocType:    req.DocType,
+			Source:     req.Source,
+			CreatedBy:  req.CreatedBy,
+			ContentMD:  req.ContentMD,
+			Summary:    req.Summary,
+			Metadata:   req.Metadata,
+		}, req.IngestToRAG)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, res)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// GET /api/documents/{id} 或 POST /api/documents/{id}/ingest
+func (s *Server) documentByID(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/documents/")
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, "document_id is required", http.StatusBadRequest)
+		return
+	}
+	documentID := parts[0]
+	if r.Method == http.MethodGet && len(parts) == 1 {
+		doc, ver, err := s.agent.GetDocument(documentID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]interface{}{"document": doc, "version": ver})
+		return
+	}
+	if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "ingest" {
+		var req struct {
+			VersionID string `json:"version_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		res, err := s.agent.IngestDocument(documentID, req.VersionID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, res)
+		return
+	}
+	http.Error(w, "Not found", http.StatusNotFound)
 }
 
 // GET /api/memory — 查看三层记忆状态

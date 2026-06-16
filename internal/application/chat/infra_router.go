@@ -26,6 +26,13 @@ func (a *UnifiedAgent) needRAG(query string) bool {
 // needReAct 当 query 涉及 2+ 个子需求时触发多步推理
 func (a *UnifiedAgent) needReAct(query string) bool {
 	q := strings.ToLower(query)
+	if (strings.Contains(q, "报告") || strings.Contains(q, "文档") || strings.Contains(q, "方案")) &&
+		(strings.Contains(q, "生成") || strings.Contains(q, "写") || strings.Contains(q, "总结") || strings.Contains(q, "保存")) {
+		return true
+	}
+	if strings.Contains(q, "调研") || strings.Contains(q, "研究") {
+		return true
+	}
 	count := 0
 	if strings.Contains(q, "时间") || strings.Contains(q, "几点") {
 		count++

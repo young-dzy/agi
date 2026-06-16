@@ -4,6 +4,7 @@
 /dist/
 *.test
 *.out
+.data/
 
 # IDE
 /.idea/

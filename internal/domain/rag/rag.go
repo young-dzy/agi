@@ -158,6 +158,10 @@ func (e *Engine) Mode() string {
 //   - 父块用语义块大小（默认 800 字符），用于回填给 LLM 时上下文完整
 //   - 子块用 cfg.ChunkSize（默认 200），写入索引时关联父块，检索更精准
 func (e *Engine) Ingest(doc string) IngestResult {
+	return e.IngestWithMetadata(doc, IngestMetadata{})
+}
+
+func (e *Engine) IngestWithMetadata(doc string, metadata IngestMetadata) IngestResult {
 	parents := e.parentSplitter.Split(doc)
 	var allChildren []Chunk
 	// childToParent[childIdx] = parentContent
@@ -171,7 +175,7 @@ func (e *Engine) Ingest(doc string) IngestResult {
 		}
 	}
 
-	docHash, indexed := e.store.IndexWithParents(allChildren, childToParent, doc)
+	docHash, indexed := e.store.IndexWithParentsAndMetadata(allChildren, childToParent, doc, metadata)
 	e.Loaded = len(indexed) > 0
 	if e.events != nil {
 		e.events.Publish("rag.ingest",

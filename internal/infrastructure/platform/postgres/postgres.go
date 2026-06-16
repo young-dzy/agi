@@ -88,6 +88,31 @@ func BootstrapSchema(pg *sql.DB) {
 		// 父子块（small-to-big）：检索用小块（精准），返回大块给 LLM（上下文完整）
 		// 老行的 parent_content 为 NULL，HybridStore 会回退到 content 自身，向后兼容
 		`ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS parent_content TEXT`,
+		`CREATE TABLE IF NOT EXISTS documents (
+			id         TEXT PRIMARY KEY,
+			title      TEXT NOT NULL,
+			doc_type   TEXT NOT NULL,
+			source     TEXT NOT NULL,
+			status     TEXT NOT NULL,
+			created_by TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT NOW(),
+			updated_at TIMESTAMP DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS document_versions (
+			id          TEXT PRIMARY KEY,
+			document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+			version     INT NOT NULL,
+			content_md  TEXT NOT NULL,
+			summary     TEXT,
+			metadata    JSONB,
+			created_at  TIMESTAMP DEFAULT NOW(),
+			UNIQUE(document_id, version)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_document_versions_document ON document_versions(document_id, version DESC)`,
+		`ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS document_id TEXT`,
+		`ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS version_id TEXT`,
+		`ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS section TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_rag_chunks_document ON rag_chunks(document_id, version_id)`,
 	}
 	for _, ddl := range ddls {
 		if _, err := pg.Exec(ddl); err != nil {

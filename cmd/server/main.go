@@ -23,6 +23,7 @@ import (
 	"agi-assistant/internal/application/chat"
 	"agi-assistant/internal/infrastructure/eventbus"
 	"agi-assistant/internal/infrastructure/persistence/chathistory"
+	"agi-assistant/internal/infrastructure/persistence/documentrepo"
 	"agi-assistant/internal/infrastructure/persistence/longterm"
 	"agi-assistant/internal/infrastructure/persistence/preference"
 	"agi-assistant/internal/infrastructure/persistence/ragchunk"
@@ -57,6 +58,7 @@ func main() {
 		SnapRepo:     snapshot.NewPGRepo(pgDB),
 		LTMRepo:      longterm.NewPGRepo(pgDB),
 		RAGChunkRepo: ragchunk.NewStore(pgDB, milvusClient, esClient),
+		DocumentRepo: documentrepo.NewStore(pgDB, ".data/documents"),
 		Events:       eventbus.NewKafkaPublisher(kafkaWriter, kafkaStatus == "connected"),
 		InfraStatus: map[string]string{
 			"milvus":        milvusStatus,

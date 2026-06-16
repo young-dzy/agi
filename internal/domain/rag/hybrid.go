@@ -83,6 +83,12 @@ type IndexedChunk struct {
 	Content string
 }
 
+type IngestMetadata struct {
+	DocumentID string
+	VersionID  string
+	Section    string
+}
+
 // Index 旧入口：调用 IndexWithParents(parents=nil) 等价于无父块写入
 func (hs *HybridStore) Index(chunks []Chunk, docContent string) (string, []IndexedChunk) {
 	return hs.IndexWithParents(chunks, nil, docContent)
@@ -93,6 +99,10 @@ func (hs *HybridStore) Index(chunks []Chunk, docContent string) (string, []Index
 //
 // 调用方拿到 PGID 后可异步喂给 KG，让 KG 节点上同时持有 pg_id（用于检索期 RRF 融合）
 func (hs *HybridStore) IndexWithParents(chunks []Chunk, parents []string, docContent string) (string, []IndexedChunk) {
+	return hs.IndexWithParentsAndMetadata(chunks, parents, docContent, IngestMetadata{})
+}
+
+func (hs *HybridStore) IndexWithParentsAndMetadata(chunks []Chunk, parents []string, docContent string, metadata IngestMetadata) (string, []IndexedChunk) {
 	// 计算文档哈希（幂等摄入）
 	docHash := fmt.Sprintf("%x", sha256.Sum256([]byte(docContent)))[:16]
 	if !hs.chunks.PGAvailable() {
@@ -120,7 +130,11 @@ func (hs *HybridStore) IndexWithParents(chunks []Chunk, parents []string, docCon
 		}
 
 		// 持久化到 PostgreSQL
-		pgID, err := hs.chunks.SavePGWithParent(docHash, i, c.Content, parentContent, embJSON)
+		pgID, err := hs.chunks.SavePGWithMetadata(docHash, i, c.Content, parentContent, embJSON, ragchunk.Metadata{
+			DocumentID: metadata.DocumentID,
+			VersionID:  metadata.VersionID,
+			Section:    metadata.Section,
+		})
 		if err != nil {
 			log.Printf("⚠️  RAG chunk 写入 PG 失败 (idx=%d): %v", i, err)
 			continue

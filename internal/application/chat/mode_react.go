@@ -112,8 +112,12 @@ func graphToTaskSteps(tg *graph.TaskGraph) []TaskStep {
 		for _, id := range level {
 			counter++
 			n := tg.Nodes[id]
+			executor := n.ToolName
+			if n.Type == graph.NodeTypeSubAgent {
+				executor = n.AgentName
+			}
 			steps = append(steps, TaskStep{
-				ID: counter, Name: n.Name, ToolName: n.ToolName,
+				ID: counter, Name: n.Name, ToolName: executor,
 				Params: n.Params, Status: StepPending,
 			})
 		}
@@ -129,9 +133,13 @@ func graphResultToReActSteps(tg *graph.TaskGraph, gr *GraphResult) []ReActStep {
 		for _, id := range level {
 			n := tg.Nodes[id]
 			steps = append(steps, ReActStep{Type: StepThought, Content: n.Name})
+			executor := n.ToolName
+			if n.Type == graph.NodeTypeSubAgent {
+				executor = n.AgentName
+			}
 			steps = append(steps, ReActStep{
-				Type: StepAction, Content: fmt.Sprintf("调用 %s", n.ToolName),
-				Tool: n.ToolName, Params: n.Params,
+				Type: StepAction, Content: fmt.Sprintf("调用 %s", executor),
+				Tool: executor, Params: n.Params,
 			})
 			switch n.Status {
 			case graph.StatusDone:
@@ -157,9 +165,9 @@ func (a *UnifiedAgent) buildInterruptMessageFromGraph(tg *graph.TaskGraph) strin
 		switch n.Status {
 		case graph.StatusDone:
 			doneCount++
-			doneDesc = append(doneDesc, fmt.Sprintf("%s(%s)→%s", n.ID, n.ToolName, truncateStr(n.Result, 30)))
+			doneDesc = append(doneDesc, fmt.Sprintf("%s(%s)→%s", n.ID, executorName(n), truncateStr(n.Result, 30)))
 		case graph.StatusPending, graph.StatusRunning, graph.StatusCancelled:
-			pendingDesc = append(pendingDesc, fmt.Sprintf("%s(%s)", n.ID, n.ToolName))
+			pendingDesc = append(pendingDesc, fmt.Sprintf("%s(%s)", n.ID, executorName(n)))
 		}
 	}
 	msg := fmt.Sprintf("已完成 %d/%d 步", doneCount, len(tg.Nodes))

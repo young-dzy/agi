@@ -20,7 +20,10 @@ import (
 // planNode 是 Planner LLM 输出的图节点（带依赖和竞速组）
 type planNode struct {
 	ID        string            `json:"id"`
+	Type      string            `json:"type"`
 	Tool      string            `json:"tool"`
+	Agent     string            `json:"agent"`
+	Goal      string            `json:"goal"`
 	Params    map[string]string `json:"params"`
 	Reason    string            `json:"reason"`
 	DependsOn []string          `json:"depends_on"`
@@ -29,11 +32,21 @@ type planNode struct {
 
 // toGraphNode 将 planNode 转为 graph.Node
 func (pn planNode) toGraphNode() *graph.Node {
+	nodeType := graph.NodeTypeTool
+	if pn.Type == string(graph.NodeTypeSubAgent) || pn.Agent != "" {
+		nodeType = graph.NodeTypeSubAgent
+	}
+	name := pn.Reason
+	if name == "" {
+		name = pn.Goal
+	}
 	return &graph.Node{
 		ID:        graph.NodeID(pn.ID),
-		Type:      graph.NodeTypeTool,
-		Name:      pn.Reason,
+		Type:      nodeType,
+		Name:      name,
 		ToolName:  pn.Tool,
+		AgentName: pn.Agent,
+		Goal:      pn.Goal,
 		Params:    pn.Params,
 		DependsOn: toNodeIDs(pn.DependsOn),
 		RaceGroup: pn.RaceGroup,
@@ -51,6 +64,9 @@ func toNodeIDs(ss []string) []graph.NodeID {
 // llmPlanGraph 调用 Planner LLM，输出带依赖关系的 planNode 列表。
 // 若 LLM 不可用或解析失败，降级为关键词规则。
 func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[string]tool.Tool, memPrefix string) []*graph.Node {
+	if a.needsSubAgentPlan(strings.ToLower(query)) {
+		return a.rulePlanNodes(ctx, query, ts, memPrefix)
+	}
 	if !a.cfg.IsRealLLM() {
 		return a.rulePlanNodes(ctx, query, ts, memPrefix)
 	}
@@ -72,21 +88,33 @@ func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[st
 		}
 		toolLines = append(toolLines, fmt.Sprintf("- %s: %s [参数: %s]", name, t.Description, params))
 	}
+	var agentLines []string
+	for name, sa := range a.subagents.snapshot() {
+		agentLines = append(agentLines, fmt.Sprintf("- %s: %s", name, sa.Description()))
+	}
 
-	planPrompt := fmt.Sprintf(`你是一个任务规划器。根据用户问题，从可用工具中选出需要调用的工具，并标注它们之间的依赖关系。
+	planPrompt := fmt.Sprintf(`你是一个任务规划器。根据用户问题，从可用工具和可用子 Agent 中选出需要调用的节点，并标注它们之间的依赖关系。
 
 规则：
-- 给每个工具调用分配一个唯一 id（如 n1, n2, n3...）
-- 如果工具 B 需要工具 A 的输出，则 B 的 depends_on 包含 A 的 id
+- 给每个节点分配一个唯一 id（如 n1, n2, n3...）
+- type 只能是 "tool" 或 "sub_agent"
+- 工具节点填写 tool 和 params；子 Agent 节点填写 agent 和 goal
+- 如果节点 B 需要节点 A 的输出，则 B 的 depends_on 包含 A 的 id
 - 如果两个工具功能类似（如多个搜索源），设相同的 race_group，系统会并行执行谁先返回用谁
-- 无依赖关系的工具不要互相等待，depends_on 设为 []
+- 无依赖关系的节点不要互相等待，depends_on 设为 []
+- 需要研究、总结、报告、写文档时，优先使用 research_agent / writer_agent / review_agent / doc_agent 组合
+- doc_agent 负责把上游内容保存到本地文档库并写入 RAG
 
 用户问题：%s
-可用工具：%s
+可用工具：
+%s
+
+可用子 Agent：
+%s
 
 请以 JSON 数组格式输出执行计划：
-[{"id":"n1","tool":"工具名","params":{"参数名":"参数值"},"reason":"一句话说明为什么调用","depends_on":[],"race_group":""}]
-如果无需工具直接回答，输出 []。只输出 JSON，不要其他内容。`, query, strings.Join(toolLines, "\n"))
+[{"id":"n1","type":"sub_agent","agent":"research_agent","goal":"研究目标","params":{},"reason":"一句话说明为什么调用","depends_on":[],"race_group":""}]
+如果无需工具直接回答，输出 []。只输出 JSON，不要其他内容。`, query, strings.Join(toolLines, "\n"), strings.Join(agentLines, "\n"))
 
 	plannerBase := "你是一个精准的任务规划器，只在必要时才调用工具，不做无意义的调用。能识别工具间的依赖关系和可竞速的同类工具。"
 	if memPrefix != "" {
@@ -157,7 +185,18 @@ func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[st
 	// 过滤：只保留工具集中实际存在的工具，自动补全 id/depends_on/race_group
 	var valid []*graph.Node
 	for i, n := range nodes {
-		if _, ok := ts[n.Tool]; !ok {
+		if n.Type == "" {
+			if n.Agent != "" {
+				n.Type = string(graph.NodeTypeSubAgent)
+			} else {
+				n.Type = string(graph.NodeTypeTool)
+			}
+		}
+		if n.Type == string(graph.NodeTypeSubAgent) {
+			if _, ok := a.subagents.get(n.Agent); !ok {
+				continue
+			}
+		} else if _, ok := ts[n.Tool]; !ok {
 			continue
 		}
 		if n.ID == "" {
@@ -168,6 +207,9 @@ func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[st
 		}
 		if n.Params == nil {
 			n.Params = map[string]string{}
+		}
+		if n.Goal == "" {
+			n.Goal = n.Reason
 		}
 		valid = append(valid, n.toGraphNode())
 	}
@@ -182,6 +224,37 @@ func (a *UnifiedAgent) rulePlanNodes(ctx context.Context, query string, ts map[s
 	nextID := func() string {
 		counter++
 		return fmt.Sprintf("n%d", counter)
+	}
+
+	if a.needsSubAgentPlan(q) {
+		researchID := nextID()
+		writerID := nextID()
+		reviewID := nextID()
+		nodes = append(nodes,
+			&graph.Node{
+				ID: graph.NodeID(researchID), Type: graph.NodeTypeSubAgent,
+				AgentName: "research_agent", Goal: "围绕用户任务进行多轮检索和证据整理",
+				Name: "子 Agent 研究与证据收集", DependsOn: []graph.NodeID{},
+			},
+			&graph.Node{
+				ID: graph.NodeID(writerID), Type: graph.NodeTypeSubAgent,
+				AgentName: "writer_agent", Goal: "基于研究结果生成 Markdown 报告",
+				Name: "子 Agent 生成报告", DependsOn: []graph.NodeID{graph.NodeID(researchID)},
+			},
+			&graph.Node{
+				ID: graph.NodeID(reviewID), Type: graph.NodeTypeSubAgent,
+				AgentName: "review_agent", Goal: "检查报告质量、风险和证据缺口",
+				Name: "子 Agent 审查报告", DependsOn: []graph.NodeID{graph.NodeID(writerID)},
+			},
+		)
+		if wantsDocumentWrite(q) {
+			nodes = append(nodes, &graph.Node{
+				ID: graph.NodeID(nextID()), Type: graph.NodeTypeSubAgent,
+				AgentName: "doc_agent", Goal: "保存报告到本地文档库并写入 RAG",
+				Name: "子 Agent 保存文档", DependsOn: []graph.NodeID{graph.NodeID(writerID), graph.NodeID(reviewID)},
+			})
+		}
+		return nodes
 	}
 
 	if _, ok := ts["get_time"]; ok {
@@ -256,4 +329,18 @@ func (a *UnifiedAgent) rulePlanNodes(ctx context.Context, query string, ts map[s
 		})
 	}
 	return nodes
+}
+
+func (a *UnifiedAgent) needsSubAgentPlan(q string) bool {
+	return strings.Contains(q, "研究") || strings.Contains(q, "调研") ||
+		strings.Contains(q, "总结") || strings.Contains(q, "报告") ||
+		strings.Contains(q, "文档") || strings.Contains(q, "方案") ||
+		strings.Contains(q, "分析")
+}
+
+func wantsDocumentWrite(q string) bool {
+	return strings.Contains(q, "保存") || strings.Contains(q, "落库") ||
+		strings.Contains(q, "写入") || strings.Contains(q, "文档库") ||
+		strings.Contains(q, "知识库") || strings.Contains(q, "生成报告") ||
+		strings.Contains(q, "报告")
 }

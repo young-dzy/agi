@@ -16,6 +16,7 @@ import (
 
 	"agi-assistant/internal/domain/memory/longterm"
 	"agi-assistant/internal/infrastructure/llm"
+	ltmrepo "agi-assistant/internal/infrastructure/persistence/longterm"
 )
 
 // extractMemoryFromReply 从 assistant 回复中提取值得记忆的信息并存入长期记忆。
@@ -133,5 +134,13 @@ func (a *UnifiedAgent) syncConsolidationToDB(result longterm.ConsolidationResult
 		embJSON, _ := json.Marshal(item.Embedding)
 		a.repos.ltm.Update(item.ID, item.Content, item.Importance, embJSON)
 		log.Printf("🔗 记忆合并：更新 id=%d", item.ID)
+	}
+	if len(result.DecayUpdates) > 0 {
+		updates := make([]ltmrepo.ImportanceUpdate, 0, len(result.DecayUpdates))
+		for _, d := range result.DecayUpdates {
+			updates = append(updates, ltmrepo.ImportanceUpdate{ID: d.ID, Importance: d.Importance})
+		}
+		a.repos.ltm.UpdateImportanceBatch(updates)
+		log.Printf("📉 记忆衰减：批量更新 %d 条 importance", len(updates))
 	}
 }

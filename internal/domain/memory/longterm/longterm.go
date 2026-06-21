@@ -51,6 +51,10 @@ type ConsolidationConfig struct {
 	DecayRate           float64 // 每日衰减系数 (0~1, 如 0.995 表示每天保留 99.5%)
 	MinImportance       float64 // 低于此重要性且超 TTL 的条目会被淘汰
 	TriggerInterval     int     // 每存入 N 条新记忆后触发合并
+	// ProtectFn 是删除前的保护钩子。给定 candidates（即将物理删除的 ID 集合），
+	// 返回其中需要保留的 ID 子集。GraphMemory 注入入度高的节点保护规则，
+	// 让保护决策与物理删除发生在同一临界区，避免内存/PG 不一致。
+	ProtectFn func(candidates []int) (protected []int)
 }
 
 // DefaultConsolidationConfig 返回默认合并配置
@@ -67,11 +71,18 @@ func DefaultConsolidationConfig() *ConsolidationConfig {
 
 // ConsolidationResult 记忆合并结果
 type ConsolidationResult struct {
-	Deduped      int    // 去重删除的条目数
-	Merged       int    // 合并的条目数
-	Expired      int    // 过期删除的条目数
-	DeleteFromDB []int  // 需要从 PG 删除的 ID 列表
-	UpdateInDB   []Item // 需要在 PG 更新的条目列表
+	Deduped      int           // 去重删除的条目数
+	Merged       int           // 合并的条目数
+	Expired      int           // 过期删除的条目数
+	DeleteFromDB []int         // 需要从 PG 删除的 ID 列表
+	UpdateInDB   []Item        // 需要在 PG 更新的条目列表（合并产物）
+	DecayUpdates []DecayUpdate // 仅 importance 变化的批量更新（Phase 1 衰减）
+}
+
+// DecayUpdate 衰减阶段单条 importance 变更
+type DecayUpdate struct {
+	ID         int
+	Importance float64
 }
 
 // LongTerm 支持语义向量召回（embedding 优先）或 TF 词袋降级
@@ -95,6 +106,14 @@ func (m *LongTerm) SetConsolidationConfig(cfg *ConsolidationConfig) {
 	m.mu.Lock()
 	m.consolidationCfg = cfg
 	m.mu.Unlock()
+}
+
+// ConsolidationCfg 返回当前合并配置（指针，调用方修改字段后需再调 SetConsolidationConfig
+// 才能保证 happens-before；GraphMemory 仅在初始化时挂 ProtectFn 后调用一次）
+func (m *LongTerm) ConsolidationCfg() *ConsolidationConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.consolidationCfg
 }
 
 // Snapshot 返回 Items 的只读副本，调用方可安全遍历不被并发写入打断
@@ -421,9 +440,19 @@ func (m *LongTerm) Consolidate() ConsolidationResult {
 	removed := make(map[int]bool)
 
 	// Phase 1: 重要性衰减 — 重要性随时间指数递减
+	// 仅当变化幅度 > 0.01 时入 DecayUpdates，避免每次 Consolidate 都全表 UPDATE
+	const minDecayDelta = 0.01
 	for i := range m.Items {
 		days := time.Since(m.Items[i].CreatedAt).Hours() / 24
-		m.Items[i].Importance *= math.Pow(m.consolidationCfg.DecayRate, days)
+		oldImp := m.Items[i].Importance
+		newImp := oldImp * math.Pow(m.consolidationCfg.DecayRate, days)
+		m.Items[i].Importance = newImp
+		if oldImp-newImp >= minDecayDelta {
+			result.DecayUpdates = append(result.DecayUpdates, DecayUpdate{
+				ID:         m.Items[i].ID,
+				Importance: newImp,
+			})
+		}
 	}
 
 	// Phase 2: 去重 + 合并 — 两两比较相似度
@@ -472,6 +501,46 @@ func (m *LongTerm) Consolidate() ConsolidationResult {
 			removed[i] = true
 			result.Expired++
 			result.DeleteFromDB = append(result.DeleteFromDB, m.Items[i].ID)
+		}
+	}
+
+	// Phase 4: 保护钩子 — GraphMemory 注入的图中心度保护在此生效。
+	// 必须在物理删除之前回滚 removed 标记，否则会出现"内存已删但 PG 还在"的不一致窗口。
+	if m.consolidationCfg.ProtectFn != nil && len(result.DeleteFromDB) > 0 {
+		protected := m.consolidationCfg.ProtectFn(result.DeleteFromDB)
+		if len(protected) > 0 {
+			protSet := make(map[int]bool, len(protected))
+			for _, id := range protected {
+				protSet[id] = true
+			}
+			// 1) 从 removed 集合中撤回保护节点
+			for i := range m.Items {
+				if removed[i] && protSet[m.Items[i].ID] {
+					removed[i] = false
+				}
+			}
+			// 2) 同步剔除 DeleteFromDB 中的保护节点（PG 不删，与内存对齐）
+			filtered := result.DeleteFromDB[:0]
+			for _, id := range result.DeleteFromDB {
+				if !protSet[id] {
+					filtered = append(filtered, id)
+				}
+			}
+			// 重算各计数：被保护的不计入 Deduped/Expired/Merged
+			rescued := len(result.DeleteFromDB) - len(filtered)
+			result.DeleteFromDB = filtered
+			// 保护节点优先回填到去重计数，再回退过期与合并
+			for _, n := range []*int{&result.Deduped, &result.Expired, &result.Merged} {
+				if rescued <= 0 {
+					break
+				}
+				take := rescued
+				if take > *n {
+					take = *n
+				}
+				*n -= take
+				rescued -= take
+			}
 		}
 	}
 

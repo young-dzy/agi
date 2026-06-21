@@ -32,7 +32,14 @@ type Repo interface {
 		category string, tags []string, slotHint string) int
 	Load() []Row
 	Update(id int, content string, importance float64, embeddingJSON []byte)
+	UpdateImportanceBatch(items []ImportanceUpdate)
 	Delete(ids []int)
+}
+
+// ImportanceUpdate 批量衰减时的最小变更单元
+type ImportanceUpdate struct {
+	ID         int
+	Importance float64
 }
 
 // PGRepo 是 Postgres 实现
@@ -132,5 +139,30 @@ func (r *PGRepo) Delete(ids []int) {
 	query := fmt.Sprintf("DELETE FROM long_term_memory WHERE id IN (%s)", strings.Join(placeholders, ","))
 	if _, err := r.db.Exec(query, args...); err != nil {
 		log.Printf("⚠️  长期记忆批量删除失败: %v", err)
+	}
+}
+
+// UpdateImportanceBatch 用单条 SQL（VALUES + UPDATE FROM）批量刷新 importance。
+// 衰减阶段每次 Consolidate 都会触达全表，单条 UPDATE 会产生 N 次往返；
+// 这里用 unnest 把 (id, importance) 数组下推一次完成。
+func (r *PGRepo) UpdateImportanceBatch(items []ImportanceUpdate) {
+	if r.db == nil || len(items) == 0 {
+		return
+	}
+	ids := make([]int64, len(items))
+	imps := make([]float64, len(items))
+	for i, it := range items {
+		ids[i] = int64(it.ID)
+		imps[i] = it.Importance
+	}
+	_, err := r.db.Exec(
+		`UPDATE long_term_memory AS m
+		 SET importance = v.importance
+		 FROM (SELECT unnest($1::BIGINT[]) AS id, unnest($2::DOUBLE PRECISION[]) AS importance) AS v
+		 WHERE m.id = v.id`,
+		pq.Array(ids), pq.Array(imps),
+	)
+	if err != nil {
+		log.Printf("⚠️  长期记忆批量衰减更新失败 (n=%d): %v", len(items), err)
 	}
 }

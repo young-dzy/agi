@@ -18,6 +18,7 @@ import (
 	"log"
 	"runtime/debug"
 	"sort"
+	"sync"
 	"time"
 
 	"agi-assistant/internal/domain/knowledge"
@@ -44,11 +45,12 @@ func goSafe(name string, fn func()) {
 // 它持有 platform/neo4j.Client 直接执行记忆图节点/边操作。kg 仅用于
 // 在 Consolidate / IndexDocument 等流程里联动文档图（目前未直接调用，预留接口）。
 type GraphMemory struct {
-	ltm       *longterm.LongTerm
-	kg        *knowledge.KGStore // 文档知识图谱（保留以便记忆联动文档实体）
-	neo       *pneo4j.Client     // 直接驱动 Memory 节点/边
-	simThresh float64            // 建立 SIMILAR_TO 边的相似度阈值
-	prevID    int                // 上一条存入记忆的 ID（用于 FOLLOWS 边）
+	ltm         *longterm.LongTerm
+	kg          *knowledge.KGStore // 文档知识图谱（保留以便记忆联动文档实体）
+	neo         *pneo4j.Client     // 直接驱动 Memory 节点/边
+	simThresh   float64            // 建立 SIMILAR_TO 边的相似度阈值
+	prevID      int                // 上一条存入记忆的 ID（用于 FOLLOWS 边）
+	protectOnce sync.Once          // 保证 ProtectFn 只挂一次
 }
 
 // New 创建图记忆层；neo 为 nil 或不可用时退化为纯 LongTerm
@@ -362,33 +364,20 @@ func (gm *GraphMemory) RecallByFilter(query string, queryEmbedding []float64, fi
 // ─────────────────────────────── Consolidate ─────────────────────────────────
 
 // GraphAwareConsolidate 在 LTM.Consolidate 基础上：
-//  1. 对图中入度高的节点提供保护（不轻易删除核心记忆）
-//  2. 删除 LTM 条目时同步删除 Neo4j 节点
+//  1. 通过 ConsolidationConfig.ProtectFn 钩子，让"图中心度保护"在 LTM 内部
+//     与物理删除发生在同一临界区——不再有"内存已删但 PG 还在"的窗口。
+//  2. 删除 LTM 条目时同步删除 Neo4j 节点。
+//
+// 注意：钩子在 InstallProtectHook 中安装，调用方只要保证 graphMem 已构造即可。
 func (gm *GraphMemory) GraphAwareConsolidate() longterm.ConsolidationResult {
+	gm.installProtectHookOnce()
 	result := gm.ltm.Consolidate()
 
 	if !gm.neoAvailable() {
 		return result
 	}
 
-	// 保护：图中入度 ≥ 3 的节点不在本次删除
-	protected := gm.getHighCentralityMemoryIDs(result.DeleteFromDB, 3)
-	if len(protected) > 0 {
-		protSet := make(map[int]bool)
-		for _, id := range protected {
-			protSet[id] = true
-		}
-		filtered := result.DeleteFromDB[:0]
-		for _, id := range result.DeleteFromDB {
-			if !protSet[id] {
-				filtered = append(filtered, id)
-			}
-		}
-		log.Printf("🛡️  图中心度保护：%d 条记忆免于删除（入度≥3）", len(result.DeleteFromDB)-len(filtered))
-		result.DeleteFromDB = filtered
-	}
-
-	// 同步删除 Neo4j 中对应节点
+	// 同步删除 Neo4j 中对应节点（保护节点已在 Consolidate 内部从 DeleteFromDB 移除）
 	goSafe("graphmem.consolidate-delete", func() {
 		for _, id := range result.DeleteFromDB {
 			gm.deleteMemoryNode(id)
@@ -396,6 +385,28 @@ func (gm *GraphMemory) GraphAwareConsolidate() longterm.ConsolidationResult {
 	})
 
 	return result
+}
+
+// installProtectHookOnce 把"图中心度保护"挂进 LongTerm 的 ProtectFn 钩子。
+// 幂等：多次调用只生效一次。
+func (gm *GraphMemory) installProtectHookOnce() {
+	gm.protectOnce.Do(func() {
+		cfg := gm.ltm.ConsolidationCfg()
+		if cfg == nil {
+			return
+		}
+		cfg.ProtectFn = func(candidates []int) []int {
+			if !gm.neoAvailable() || len(candidates) == 0 {
+				return nil
+			}
+			protected := gm.getHighCentralityMemoryIDs(candidates, 3)
+			if len(protected) > 0 {
+				log.Printf("🛡️  图中心度保护：%d 条记忆免于删除（入度≥3）", len(protected))
+			}
+			return protected
+		}
+		gm.ltm.SetConsolidationConfig(cfg)
+	})
 }
 
 // SyncPrevID 在从 DB 恢复记忆后调用，将 prevID 对齐到最新条目

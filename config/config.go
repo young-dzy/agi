@@ -166,6 +166,17 @@ type GraphRuntimeConfig struct {
 	GraphEnableRacing  bool
 }
 
+// AuthConfig 认证 / JWT 配置。
+//
+// JWTSecret 必须 ≥32 字节随机；生产部署通过环境变量 / secret manager 注入，
+// 不得直接写在 config.yaml 提交进 git。
+// 缺失时启动期返回错误（不允许默认值），强制配置正确再启动。
+type AuthConfig struct {
+	JWTSecret   string
+	JWTTTLHours int    // access token 有效时长（小时）；0 → 7 天默认
+	JWTIssuer   string // 签发方标识，默认 "agi-assistant"
+}
+
 // APIConfig 整合所有阶段的 API + 基础设施配置。
 //
 // 所有子结构以 embedded 方式放进来，访问路径 cfg.LLMAPIUrl / cfg.PGHost
@@ -182,6 +193,7 @@ type APIConfig struct {
 	SandboxConfig
 	SecurityConfig
 	GraphRuntimeConfig
+	AuthConfig
 }
 
 // yamlFile 对应 config/config.yaml 的结构
@@ -289,6 +301,11 @@ type yamlFile struct {
 		RaceTimeoutMs int  `yaml:"race_timeout_ms"`
 		EnableRacing  bool `yaml:"enable_racing"`
 	} `yaml:"graph_runtime"`
+	Auth struct {
+		JWTSecret string `yaml:"jwt_secret"`
+		JWTTTLHrs int    `yaml:"jwt_ttl_hours"`
+		JWTIssuer string `yaml:"jwt_issuer"`
+	} `yaml:"auth"`
 }
 
 // DefaultConfig 从 config/config.yaml 加载配置
@@ -409,6 +426,11 @@ func DefaultConfig() *APIConfig {
 			GraphMaxParallel:   y.GraphRuntime.MaxParallel,
 			GraphRaceTimeoutMs: y.GraphRuntime.RaceTimeoutMs,
 			GraphEnableRacing:  y.GraphRuntime.EnableRacing,
+		},
+		AuthConfig: AuthConfig{
+			JWTSecret:   y.Auth.JWTSecret,
+			JWTTTLHours: y.Auth.JWTTTLHrs,
+			JWTIssuer:   y.Auth.JWTIssuer,
 		},
 	}
 

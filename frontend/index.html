@@ -87,6 +87,150 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 
 /* ════════════════════════════════════
+   AUTH MODAL（登录 / 注册）
+═════════════════════════════════════ */
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(60, 50, 80, 0.45);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 默认隐藏，启动时若已登录则保持隐藏 */
+  display: none;
+}
+.auth-overlay.show { display: flex; }
+.auth-card {
+  width: 360px;
+  background: var(--card-solid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-purple);
+  padding: 28px 28px 24px;
+}
+.auth-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+  text-align: center;
+  margin-bottom: 4px;
+}
+.auth-sub {
+  font-size: 12px;
+  color: var(--text3);
+  text-align: center;
+  margin-bottom: 20px;
+}
+.auth-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 18px;
+  background: rgba(196,181,253,0.10);
+  border-radius: var(--radius-pill);
+  padding: 4px;
+}
+.auth-tab {
+  flex: 1;
+  text-align: center;
+  padding: 8px 0;
+  border-radius: var(--radius-pill);
+  font-size: 13px;
+  color: var(--text2);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.auth-tab.active {
+  background: var(--card-solid);
+  color: var(--primary-d);
+  font-weight: 600;
+  box-shadow: var(--shadow-soft);
+}
+.auth-field {
+  margin-bottom: 14px;
+}
+.auth-field label {
+  display: block;
+  font-size: 12px;
+  color: var(--text2);
+  margin-bottom: 6px;
+}
+.auth-field input {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  background: var(--card-solid);
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.15s;
+}
+.auth-field input:focus {
+  border-color: var(--primary-d);
+}
+.auth-error {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--red-l);
+  color: #b8425d;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  display: none;
+}
+.auth-error.show { display: block; }
+.auth-submit {
+  width: 100%;
+  padding: 11px 0;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(135deg, var(--pink-d) 0%, var(--primary-d) 100%);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.1s, opacity 0.2s;
+}
+.auth-submit:hover { transform: translateY(-1px); }
+.auth-submit:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+
+/* sidebar 底部用户信息 + 登出按钮 */
+.user-bar {
+  margin-top: auto;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+}
+.user-bar .uname {
+  color: var(--text);
+  font-weight: 600;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-bar .logout-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text2);
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.user-bar .logout-btn:hover {
+  background: var(--red-l);
+  color: #b8425d;
+  border-color: transparent;
+}
+
+/* ════════════════════════════════════
    SIDEBAR
 ════════════════════════════════════ */
 .sidebar {
@@ -830,6 +974,33 @@ body {
 </head>
 <body>
 
+<!-- ═══════════════ AUTH MODAL ═══════════════ -->
+<!-- 启动时若 localStorage 无 token 或后端 401，则显示此层；登录/注册成功后隐藏 -->
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-card">
+    <div class="auth-title">🌸 AI 小助手</div>
+    <div class="auth-sub" id="authSub">登录以使用专属记忆</div>
+
+    <div class="auth-tabs">
+      <div class="auth-tab active" id="authTabLogin"   onclick="switchAuthTab('login')">登录</div>
+      <div class="auth-tab"        id="authTabRegister" onclick="switchAuthTab('register')">注册</div>
+    </div>
+
+    <div class="auth-field">
+      <label>用户名</label>
+      <input type="text" id="authUsername" autocomplete="username" placeholder="3-32 字符">
+    </div>
+    <div class="auth-field">
+      <label>密码</label>
+      <input type="password" id="authPassword" autocomplete="current-password" placeholder="至少 8 位">
+    </div>
+
+    <div class="auth-error" id="authError"></div>
+
+    <button class="auth-submit" id="authSubmitBtn" onclick="submitAuth()">登录</button>
+  </div>
+</div>
+
 <!-- 背景装饰 -->
 <div class="bg-decor" id="bgDecor"></div>
 
@@ -870,6 +1041,12 @@ body {
   </div>
 
   <button class="new-chat-btn" onclick="newSession()">✨ 新建对话</button>
+
+  <!-- 当前登录用户 + 登出 -->
+  <div class="user-bar" id="userBar" style="display:none">
+    <span class="uname" id="userBarName">—</span>
+    <button class="logout-btn" type="button" onclick="logout()">登出</button>
+  </div>
 </aside>
 
 <!-- ═══════════════ MAIN ═══════════════ -->
@@ -953,6 +1130,156 @@ body {
 
 <script>
 // ══════════════════════════════════════════
+//  Auth: token + apiFetch wrapper
+// ══════════════════════════════════════════
+//
+// 设计：
+//   - JWT 存 localStorage（页面刷新不丢，关闭浏览器仍在）
+//   - apiFetch 统一注入 Authorization header；401 自动登出 + 弹登录 modal
+//   - 上传 multipart/form-data 走相同包装（不能手动设 Content-Type，
+//     fetch 会自动加 boundary）
+//   - 启动时若已有 token，直接走业务 init；否则弹登录 modal
+//
+const AUTH_TOKEN_KEY = 'agi_auth_token';
+const AUTH_USER_KEY  = 'agi_auth_user';
+
+function getToken() { return localStorage.getItem(AUTH_TOKEN_KEY) || ''; }
+function getUsername() { return localStorage.getItem(AUTH_USER_KEY) || ''; }
+function setAuth(token, username) {
+  localStorage.setItem(AUTH_TOKEN_KEY, token);
+  localStorage.setItem(AUTH_USER_KEY, username);
+}
+function clearAuth() {
+  localStorage.removeItem(AUTH_TOKEN_KEY);
+  localStorage.removeItem(AUTH_USER_KEY);
+}
+
+// apiFetch 包装 fetch：自动注入 Bearer token；401 时清 token 弹登录。
+// 不修改 url/method/body，只补 Authorization header（保留调用方原 headers）。
+async function apiFetch(url, options) {
+  options = options || {};
+  const headers = new Headers(options.headers || {});
+  const tok = getToken();
+  if (tok) headers.set('Authorization', 'Bearer ' + tok);
+  options.headers = headers;
+  const resp = await fetch(url, options);
+  if (resp.status === 401) {
+    // token 失效或缺失——清缓存 + 强制重新登录
+    clearAuth();
+    showAuthOverlay('会话已失效，请重新登录');
+    // 抛错让上层 catch，避免继续处理空响应
+    throw new Error('unauthorized');
+  }
+  return resp;
+}
+
+// ══════════════════════════════════════════
+//  Auth Modal 控制
+// ══════════════════════════════════════════
+let authMode = 'login'; // 'login' | 'register'
+
+function switchAuthTab(mode) {
+  authMode = mode;
+  document.getElementById('authTabLogin').classList.toggle('active', mode === 'login');
+  document.getElementById('authTabRegister').classList.toggle('active', mode === 'register');
+  document.getElementById('authSubmitBtn').textContent = (mode === 'login') ? '登录' : '注册';
+  document.getElementById('authSub').textContent = (mode === 'login') ? '登录以使用专属记忆' : '创建一个新账号';
+  hideAuthError();
+}
+
+function showAuthOverlay(msg) {
+  document.getElementById('authOverlay').classList.add('show');
+  if (msg) showAuthError(msg);
+}
+function hideAuthOverlay() {
+  document.getElementById('authOverlay').classList.remove('show');
+  hideAuthError();
+}
+function showAuthError(msg) {
+  const el = document.getElementById('authError');
+  el.textContent = msg;
+  el.classList.add('show');
+}
+function hideAuthError() {
+  document.getElementById('authError').classList.remove('show');
+}
+
+async function submitAuth() {
+  const username = document.getElementById('authUsername').value.trim();
+  const password = document.getElementById('authPassword').value;
+  if (!username || !password) {
+    showAuthError('用户名和密码不能为空');
+    return;
+  }
+  const btn = document.getElementById('authSubmitBtn');
+  btn.disabled = true;
+  btn.textContent = '处理中...';
+  hideAuthError();
+
+  const url = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+  try {
+    // 注意：登录/注册端点本身不要求 token，所以这里直接用 fetch 而非 apiFetch
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showAuthError(data.error || '操作失败');
+      return;
+    }
+    setAuth(data.token, data.username);
+    hideAuthOverlay();
+    document.getElementById('authPassword').value = '';
+    onAuthReady();
+  } catch (e) {
+    showAuthError('网络错误，请稍后再试');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = (authMode === 'login') ? '登录' : '注册';
+  }
+}
+
+// 登录后或刷新页面 token 仍有效时调用——刷新 user-bar 并 init 业务
+function onAuthReady() {
+  const uname = getUsername();
+  if (uname) {
+    document.getElementById('userBarName').textContent = '👋 ' + uname;
+    document.getElementById('userBar').style.display = 'flex';
+  }
+  initApp();
+}
+
+function logout() {
+  // 防止已登出的用户的 SSE 还在跑（响应里可能含敏感数据）
+  if (typeof abortInFlightChat === 'function') abortInFlightChat();
+  clearAuth();
+  document.getElementById('userBar').style.display = 'none';
+  // 清运行时缓存避免上一个用户的会话/文档/工具列表残留到下一个用户。
+  // 用 typeof 守卫——这些变量在脚本后部声明，logout 可能在它们就绪前被调用。
+  if (typeof sessions !== 'undefined') {
+    sessions = [];
+    if (typeof renderSessions === 'function') renderSessions();
+  }
+  if (typeof uploadedDocs !== 'undefined') {
+    uploadedDocs = [];
+    if (typeof renderDocs === 'function') renderDocs();
+  }
+  if (typeof libraryDocs !== 'undefined') libraryDocs = [];
+  if (typeof availableTools !== 'undefined') availableTools = [];
+  showAuthOverlay();
+}
+
+// 回车提交
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && document.getElementById('authOverlay').classList.contains('show')) {
+    if (document.activeElement && document.activeElement.id && document.activeElement.id.startsWith('auth')) {
+      submitAuth();
+    }
+  }
+});
+// ══════════════════════════════════════════
 //  Background Decorations
 // ══════════════════════════════════════════
 function initBgDecor() {
@@ -1003,6 +1330,8 @@ let isLoading = false;
 //  Session management
 // ══════════════════════════════════════════
 function newSession() {
+  // 切换前取消还在跑的 SSE，避免上一会话的 AI 回复延迟落到新会话里
+  abortInFlightChat();
   const id = Date.now().toString();
   sessions.unshift({ id, title: '新对话', messages: [], ts: Date.now() });
   if (sessions.length > 5) sessions = sessions.slice(0, 5);
@@ -1013,12 +1342,24 @@ function newSession() {
 }
 
 function switchSession(id) {
+  // 同上：切到别的会话之前先把当前会话的 SSE 拦掉
+  abortInFlightChat();
   currentId = id;
   renderSessions();
   const sess = sessions.find(s => s.id === id);
   if (!sess) return;
   clearMessages();
   sess.messages.forEach(m => appendBubble(m.role, m.html, true));
+}
+
+// abortInFlightChat 中断当前 SSE 请求，并复位 loading 状态。
+// 用户切换会话/新建会话/登出时调用——避免 AI 回复延迟落到错误的会话里。
+function abortInFlightChat() {
+  if (window._chatAbortCtrl) {
+    window._chatAbortCtrl.abort();
+    window._chatAbortCtrl = null;
+  }
+  if (typeof setLoadingState === 'function') setLoadingState(false);
 }
 
 function saveSessions() {
@@ -1030,7 +1371,15 @@ function curSession() {
 }
 
 function pushMessage(role, html) {
-  const sess = curSession();
+  pushMessageTo(currentId, role, html);
+}
+
+// pushMessageTo 把一条消息追加到指定 sessionId 的本地存储中。
+// 比 pushMessage 多一层 sessionId 参数——SSE 流式回复期间用户可能切换会话，
+// 必须用"请求开始时锁定的 sessionId"而非 currentId，否则回复会落错会话。
+function pushMessageTo(sessionId, role, html) {
+  if (!sessionId) return;
+  const sess = sessions.find(s => s.id === sessionId);
   if (!sess) return;
   sess.messages.push({ role, html });
   if (sess.messages.length === 1 && role === 'user') {
@@ -1089,7 +1438,7 @@ async function uploadFile(file) {
   try {
     const form = new FormData();
     form.append('file', file);
-    const res = await fetch('/api/upload', {
+    const res = await apiFetch('/api/upload', {
       method: 'POST',
       body: form
     }).then(r => r.json());
@@ -1141,7 +1490,7 @@ function renderDocs() {
 async function deleteDoc(docHash, name) {
   if (!confirm('确定删除「' + name + '」？')) return;
   try {
-    const res = await fetch('/api/docs/delete', {
+    const res = await apiFetch('/api/docs/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ doc_hash: docHash })
@@ -1189,7 +1538,7 @@ function renderLibraryDocs() {
 }
 
 async function fetchDocumentJSON(url, options) {
-  const resp = await fetch(url, options);
+  const resp = await apiFetch(url, options);
   const raw = await resp.text();
   let data = {};
   if (raw) {
@@ -1301,7 +1650,7 @@ function toggleRAG() {
 // ══════════════════════════════════════════
 async function loadTools() {
   try {
-    availableTools = await fetch('/api/tools').then(r => r.json()) || [];
+    availableTools = await apiFetch('/api/tools').then(r => r.json()) || [];
     renderPicker();
   } catch(e) {}
 }
@@ -1329,7 +1678,7 @@ async function submitMCPTool() {
   const endpoint = document.getElementById('mcpEndpoint').value.trim();
   if (!name || !endpoint) { alert('工具名称和端点不能为空'); return; }
   try {
-    const res = await fetch('/api/tools/mcp', {
+    const res = await apiFetch('/api/tools/mcp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, description: desc, endpoint, params: [] })
@@ -1526,7 +1875,7 @@ function stopChat() {
     window._chatAbortCtrl.abort();
     window._chatAbortCtrl = null;
   }
-  fetch('/api/chat/cancel', { method: 'POST' }).catch(() => {});
+  apiFetch('/api/chat/cancel', { method: 'POST' }).catch(() => {});
   setLoadingState(false);
 }
 
@@ -1551,9 +1900,13 @@ async function send() {
 
   if (!currentId) newSession();
 
+  // 锚定本次请求所属会话——之后所有 pushMessage 都走 pushMessageTo(sessionId, ...)
+  // 即使期间用户切到别的会话，AI 回复仍然落回原会话；用户切回去能看到完整对话
+  const sessionId = currentId;
+
   const userHtml = escHtml(msg);
   appendBubble('user', msg);
-  pushMessage('user', userHtml);
+  pushMessageTo(sessionId, 'user', userHtml);
   input.value = ''; autoResize(input);
 
   setLoadingState(true);
@@ -1598,7 +1951,7 @@ async function send() {
   try {
     const body = { message: msg, use_rag: ragOn, selected_tools: selectedTools, explicit: true };
 
-    const resp = await fetch('/api/chat/stream', {
+    const resp = await apiFetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -1607,7 +1960,7 @@ async function send() {
 
     if (!resp.ok) {
       aiWrap.remove();
-      const syncData = await fetch('/api/chat', {
+      const syncData = await apiFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -1615,7 +1968,7 @@ async function send() {
       const replyHtml = buildReply(syncData);
       const msgEl = appendBubble('ai', replyHtml, true);
       autoExpandThinking(msgEl, syncData);
-      pushMessage('ai', replyHtml);
+      pushMessageTo(sessionId, 'ai', replyHtml);
       return;
     }
 
@@ -1744,7 +2097,7 @@ async function send() {
     }
 
     const replyHtml = bubble.innerHTML;
-    pushMessage('ai', replyHtml);
+    pushMessageTo(sessionId, 'ai', replyHtml);
     loadLibraryDocs();
 
   } catch(e) {
@@ -1752,10 +2105,10 @@ async function send() {
     if (typing) typing.remove();
     if (e.name === 'AbortError') {
       answerEl.innerHTML = `<div class="answer-text">🌸 已中断</div>`;
-      pushMessage('ai', '🌸 已中断');
+      pushMessageTo(sessionId, 'ai', '🌸 已中断');
     } else {
       answerEl.innerHTML = `<div class="answer-text">❌ 请求失败，请检查服务是否正常运行。</div>`;
-      pushMessage('ai', '❌ 请求失败');
+      pushMessageTo(sessionId, 'ai', '❌ 请求失败');
     }
   } finally {
     setLoadingState(false);
@@ -1787,15 +2140,30 @@ function autoResize(el) {
 }
 
 // ══════════════════════════════════════════
-//  Init
+//  Init（门控版：登录后才 init 业务）
 // ══════════════════════════════════════════
-renderSessions();
-renderDocs();
-loadLibraryDocs();
-loadTools();
-if (sessions.length > 0) {
-  // don't auto-switch, just show sessions in sidebar
+//
+// initApp 会被两条路径调用：
+//   1) 启动时已有 token（getToken() 非空）→ onAuthReady → initApp
+//   2) 弹了登录 modal，用户登录/注册成功 → onAuthReady → initApp
+// 任意 401 都会清 token + 弹 modal，登录后再次 initApp。
+// 多次调用安全：renderSessions / loadTools 等都是幂等覆盖。
+function initApp() {
+  renderSessions();
+  renderDocs();
+  loadLibraryDocs();
+  loadTools();
+  // 不自动切换会话——侧边栏展示给用户选
 }
+
+// 启动入口：检查 token，无则弹登录
+(function bootstrap() {
+  if (getToken()) {
+    onAuthReady();
+  } else {
+    showAuthOverlay();
+  }
+})();
 </script>
 </body>
 </html>

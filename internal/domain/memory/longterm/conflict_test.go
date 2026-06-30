@@ -17,9 +17,9 @@ func TestConflictCandidates_Range(t *testing.T) {
 	embA := []float64{1, 0, 0}
 	embB := []float64{0.5, 0.866, 0}
 	embC := []float64{0, 0, 1}
-	m.StoreClassified("用户喜欢猫", 0.7, embA, "preference", nil, "")
-	m.StoreClassified("用户不喜欢猫", 0.7, embB, "preference", nil, "")
-	m.StoreClassified("用户喜欢咖啡", 0.7, embC, "preference", nil, "")
+	m.StoreClassified("u1", "用户喜欢猫", 0.7, embA, "preference", nil, "")
+	m.StoreClassified("u1", "用户不喜欢猫", 0.7, embB, "preference", nil, "")
+	m.StoreClassified("u1", "用户喜欢咖啡", 0.7, embC, "preference", nil, "")
 	if m.Count() != 3 {
 		t.Fatalf("应有 3 条 preference, 得到 %d", m.Count())
 	}
@@ -27,7 +27,7 @@ func TestConflictCandidates_Range(t *testing.T) {
 	// newEmb=[0.9,0.4,0]：与 A cosine≈0.914，与 B cosine≈0.808，与 C 垂直
 	// → A,B 都应进候选；C 不应进
 	newEmb := []float64{0.9, 0.4, 0}
-	cands := m.ConflictCandidates(newEmb, "preference", 0.75, 0.95)
+	cands := m.ConflictCandidates("u1", newEmb, "preference", 0.75, 0.95)
 	if len(cands) == 0 {
 		t.Fatalf("应该至少返回 1 个候选，得到 0")
 	}
@@ -46,10 +46,10 @@ func TestConflictCandidates_CategoryFilter(t *testing.T) {
 	m := New()
 	m.SetConsolidationConfig(DefaultConsolidationConfig())
 	emb := []float64{1, 0}
-	m.StoreClassified("身份: 工程师", 0.9, emb, "identity", nil, "")
-	m.StoreClassified("偏好: 工程", 0.9, []float64{0.99, 0.01}, "preference", nil, "")
+	m.StoreClassified("u1", "身份: 工程师", 0.9, emb, "identity", nil, "")
+	m.StoreClassified("u1", "偏好: 工程", 0.9, []float64{0.99, 0.01}, "preference", nil, "")
 
-	cands := m.ConflictCandidates(emb, "identity", 0.5, 0.99)
+	cands := m.ConflictCandidates("u1", emb, "identity", 0.5, 0.99)
 	for _, c := range cands {
 		if c.Item.Category != "identity" {
 			t.Errorf("跨 category 候选不应出现：%+v", c.Item)
@@ -62,21 +62,21 @@ func TestConflictCandidates_ExcludeSuperseded(t *testing.T) {
 	m := New()
 	m.SetConsolidationConfig(DefaultConsolidationConfig())
 	embA := []float64{1, 0}
-	m.StoreClassified("用户在北京", 0.7, embA, "fact", nil, "")
+	m.StoreClassified("u1", "用户在北京", 0.7, embA, "fact", nil, "")
 	idA := m.LastID()
 
 	// query=[0.8,0.6], stored=[1,0] → cosine = 0.8（落在 [0.5, 0.99) 区间内）
 	queryEmb := []float64{0.8, 0.6}
 
 	// 第一次冲突：找候选 → A 在结果里
-	cands := m.ConflictCandidates(queryEmb, "fact", 0.5, 0.99)
+	cands := m.ConflictCandidates("u1", queryEmb, "fact", 0.5, 0.99)
 	if len(cands) != 1 || cands[0].Item.ID != idA {
 		t.Fatalf("应找到 A 作为候选, 得到 %+v", cands)
 	}
 
 	// 标 A 为 superseded，再次找候选 → 不应再出现
 	m.MarkSuperseded([]int{idA}, 0)
-	cands2 := m.ConflictCandidates(queryEmb, "fact", 0.5, 0.99)
+	cands2 := m.ConflictCandidates("u1", queryEmb, "fact", 0.5, 0.99)
 	if len(cands2) != 0 {
 		t.Errorf("Superseded 条目不应出现在候选中, 得到 %+v", cands2)
 	}
@@ -86,9 +86,9 @@ func TestConflictCandidates_ExcludeSuperseded(t *testing.T) {
 func TestMarkSuperseded_BlocksRecall(t *testing.T) {
 	m := New()
 	m.SetConsolidationConfig(DefaultConsolidationConfig())
-	m.StoreClassified("旧事实", 0.7, []float64{1, 0}, "fact", nil, "")
+	m.StoreClassified("u1", "旧事实", 0.7, []float64{1, 0}, "fact", nil, "")
 	idOld := m.LastID()
-	m.StoreClassified("新事实", 0.7, []float64{0, 1}, "fact", nil, "")
+	m.StoreClassified("u1", "新事实", 0.7, []float64{0, 1}, "fact", nil, "")
 	idNew := m.LastID()
 
 	// 标旧 superseded，新条目记录替代关系
@@ -99,7 +99,7 @@ func TestMarkSuperseded_BlocksRecall(t *testing.T) {
 
 	// 默认召回不应包含旧条目
 	q := []float64{1, 1}
-	got := m.RecallByFilter("", q, RecallFilter{TopK: 5, MinScore: 0})
+	got := m.RecallByFilter("", q, RecallFilter{UserID: "u1", TopK: 5, MinScore: 0})
 	for _, it := range got {
 		if it.ID == idOld {
 			t.Errorf("Superseded 条目不应被召回, 得到 ID=%d", it.ID)
@@ -107,7 +107,7 @@ func TestMarkSuperseded_BlocksRecall(t *testing.T) {
 	}
 
 	// 审计模式应能看到
-	got2 := m.RecallByFilter("", q, RecallFilter{TopK: 5, MinScore: 0, IncludeSuperseded: true})
+	got2 := m.RecallByFilter("", q, RecallFilter{UserID: "u1", TopK: 5, MinScore: 0, IncludeSuperseded: true})
 	found := false
 	for _, it := range got2 {
 		if it.ID == idOld {
@@ -122,11 +122,11 @@ func TestMarkSuperseded_BlocksRecall(t *testing.T) {
 // TestMarkSuperseded_LinksNewItem 验证新条目的 Supersedes 字段被正确填充。
 func TestMarkSuperseded_LinksNewItem(t *testing.T) {
 	m := New()
-	m.StoreClassified("旧 1", 0.5, nil, "fact", nil, "")
+	m.StoreClassified("u1", "旧 1", 0.5, nil, "fact", nil, "")
 	id1 := m.LastID()
-	m.StoreClassified("旧 2", 0.5, nil, "fact", nil, "")
+	m.StoreClassified("u1", "旧 2", 0.5, nil, "fact", nil, "")
 	id2 := m.LastID()
-	m.StoreClassified("新", 0.5, nil, "fact", nil, "")
+	m.StoreClassified("u1", "新", 0.5, nil, "fact", nil, "")
 	idNew := m.LastID()
 
 	m.MarkSuperseded([]int{id1, id2}, idNew)
@@ -143,9 +143,9 @@ func TestMarkSuperseded_LinksNewItem(t *testing.T) {
 // TestMarkSuperseded_Idempotent 验证重复标记不会产生 Supersedes 重复条目。
 func TestMarkSuperseded_Idempotent(t *testing.T) {
 	m := New()
-	m.StoreClassified("旧", 0.5, nil, "fact", nil, "")
+	m.StoreClassified("u1", "旧", 0.5, nil, "fact", nil, "")
 	idOld := m.LastID()
-	m.StoreClassified("新", 0.5, nil, "fact", nil, "")
+	m.StoreClassified("u1", "新", 0.5, nil, "fact", nil, "")
 	idNew := m.LastID()
 
 	m.MarkSuperseded([]int{idOld}, idNew)
@@ -163,9 +163,9 @@ func TestMarkSuperseded_Idempotent(t *testing.T) {
 // TestSupersededItems 验证审计端点能拿到完整列表。
 func TestSupersededItems(t *testing.T) {
 	m := New()
-	m.StoreClassified("a", 0.5, nil, "fact", nil, "")
-	m.StoreClassified("b", 0.5, nil, "fact", nil, "")
-	m.StoreClassified("c", 0.5, nil, "fact", nil, "")
+	m.StoreClassified("u1", "a", 0.5, nil, "fact", nil, "")
+	m.StoreClassified("u1", "b", 0.5, nil, "fact", nil, "")
+	m.StoreClassified("u1", "c", 0.5, nil, "fact", nil, "")
 
 	if got := m.SupersededItems(); len(got) != 0 {
 		t.Errorf("初始应无 superseded, 得到 %d", len(got))
@@ -180,15 +180,15 @@ func TestSupersededItems(t *testing.T) {
 // TestFilterByCategory_ExcludesSuperseded 验证 profile slot 路径也过滤 superseded。
 func TestFilterByCategory_ExcludesSuperseded(t *testing.T) {
 	m := New()
-	m.StoreClassified("身份 v1", 0.9, nil, "identity", nil, "profile")
+	m.StoreClassified("u1", "身份 v1", 0.9, nil, "identity", nil, "profile")
 	id1 := m.LastID()
-	m.StoreClassified("身份 v2", 0.9, nil, "identity", nil, "profile")
+	m.StoreClassified("u1", "身份 v2", 0.9, nil, "identity", nil, "profile")
 
-	if got := m.FilterByCategory([]string{"identity"}, 10); len(got) != 2 {
+	if got := m.FilterByCategory("u1", []string{"identity"}, 10); len(got) != 2 {
 		t.Fatalf("初始应有 2 条, 得到 %d", len(got))
 	}
 	m.MarkSuperseded([]int{id1}, 0)
-	got := m.FilterByCategory([]string{"identity"}, 10)
+	got := m.FilterByCategory("u1", []string{"identity"}, 10)
 	if len(got) != 1 {
 		t.Errorf("Superseded 应被过滤, 得到 %d", len(got))
 	}

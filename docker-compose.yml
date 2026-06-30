@@ -5,8 +5,12 @@ services:
     container_name: final-ai-agent
     ports:
       - "8090:8090"
+    # JWT_SECRET 从宿主机 .env 读取；config.docker.yaml 中的 ${JWT_SECRET} 启动期会被 envsubst 展开。
+    # 缺失会 Fatal——启动前确保 .env 存在且含 32 字节以上随机串：
+    #   echo "JWT_SECRET=$(openssl rand -hex 32)" >> .env
     environment:
       - TZ=Asia/Shanghai
+      - JWT_SECRET=${JWT_SECRET}
     volumes:
       - ./config/config.docker.yaml:/app/config/config.yaml:ro
     depends_on:

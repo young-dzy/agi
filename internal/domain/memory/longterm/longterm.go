@@ -28,6 +28,10 @@ type Item struct {
 	Score        float64   `json:"score,omitempty"` // 召回时的综合得分（不持久化）
 	CreatedAt    time.Time `json:"created_at"`
 	LastAccessed time.Time `json:"last_accessed"`
+	// 多租户：每条记忆所属用户 ID（来自 JWT.subject）。RecallByFilter 强制按此过滤，
+	// 不传 UserID 的召回会得到空结果——避免 V1 升级期间出现"忘传 ID 就泄漏所有用户"的灾难。
+	// 老数据（迁移前 'legacy'）仍能被 user_id="legacy" 显式查询到，便于人工审计。
+	UserID string `json:"user_id,omitempty"`
 	// Schema-driven 装配字段（promptctx 包按这些字段过滤）
 	Category string   `json:"category,omitempty"`  // 主类别：identity / preference / fact / episodic / tool_failure / policy / general
 	Tags     []string `json:"tags,omitempty"`      // 自由标签
@@ -47,6 +51,9 @@ type Item struct {
 
 // RecallFilter 控制 RecallByFilter 的语义召回约束（与 promptctx.SlotFilter 同构）
 type RecallFilter struct {
+	// UserID 强制——空字符串将不召回任何条目（防忘传导致跨用户泄漏）。
+	// 通过此设计把"多租户隔离"从 application 层下沉到 domain 层强制实施。
+	UserID      string
 	Categories  []string
 	RequireTags []string
 	MinScore    float64
@@ -58,6 +65,9 @@ type RecallFilter struct {
 	// IncludeSuperseded 默认 false：被新条目取代的历史记忆不参与召回，
 	// 避免"用户已搬到上海"的事实被旧的"在北京"覆盖。审计端点可显式打开。
 	IncludeSuperseded bool
+	// IncludeAllUsers 仅 admin 审计端点用——置 true 可越过 UserID 过滤看全量数据。
+	// 默认 false 时 UserID="" 等价于"看不到任何条目"。
+	IncludeAllUsers bool
 }
 
 // ConsolidationConfig 记忆合并配置
@@ -201,20 +211,29 @@ func (m *LongTerm) textToVector(text string) []float64 {
 }
 
 // Store 将内容存入长期记忆（embedding 可选，传 nil 则使用 TF 降级）
-// 返回 true 表示新增成功，false 表示因去重而跳过
-func (m *LongTerm) Store(content string, importance float64, embedding []float64) bool {
-	return m.StoreClassified(content, importance, embedding, "general", nil, "")
+// 返回 true 表示新增成功，false 表示因去重而跳过。
+//
+// userID 是多租户隔离主键——空字符串退化为 "legacy"（迁移期兼容），
+// 强制让所有写入都打上归属。
+func (m *LongTerm) Store(userID, content string, importance float64, embedding []float64) bool {
+	return m.StoreClassified(userID, content, importance, embedding, "general", nil, "")
 }
 
 // StoreClassified 与 Store 行为相同，但额外记录 category/tags/slot_hint
-// 用于 Schema-driven 槽位装配过滤
-func (m *LongTerm) StoreClassified(content string, importance float64, embedding []float64,
+// 用于 Schema-driven 槽位装配过滤。userID 同上。
+func (m *LongTerm) StoreClassified(userID, content string, importance float64, embedding []float64,
 	category string, tags []string, slotHint string) bool {
+	if userID == "" {
+		userID = "legacy"
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// 去重检测：与已有条目相似度过高时跳过，但更新已有条目的访问时间和重要性
+	// 去重检测：仅与同 userID 的现有条目对比——不同用户即使内容一样也独立存储
 	if m.consolidationCfg != nil && len(m.Items) > 0 && len(embedding) > 0 {
 		for i := range m.Items {
+			if m.Items[i].UserID != userID {
+				continue
+			}
 			if len(m.Items[i].Embedding) == len(embedding) {
 				sim := Cosine(embedding, m.Items[i].Embedding)
 				if sim >= m.consolidationCfg.DedupThreshold {
@@ -245,6 +264,7 @@ func (m *LongTerm) StoreClassified(content string, importance float64, embedding
 	}
 	m.Items = append(m.Items, Item{
 		ID:           m.nextID,
+		UserID:       userID,
 		Content:      content,
 		Importance:   importance,
 		Embedding:    embedding,
@@ -314,9 +334,10 @@ func (m *LongTerm) NeedConsolidation() bool {
 
 // Recall 从长期记忆中召回与 query 最相关的 topK 条
 // 优先使用 embedding 余弦相似度，若无 embedding 则退回 TF
-// 只返回综合得分超过 threshold 的条目，避免注入噪声
-func (m *LongTerm) Recall(query string, topK int, queryEmbedding []float64) []Item {
-	return m.RecallByFilter(query, queryEmbedding, RecallFilter{TopK: topK, MinScore: 0.4})
+// 只返回综合得分超过 threshold 的条目，避免注入噪声。
+// userID 强制——空字符串将不返回任何条目。
+func (m *LongTerm) Recall(userID, query string, topK int, queryEmbedding []float64) []Item {
+	return m.RecallByFilter(query, queryEmbedding, RecallFilter{UserID: userID, TopK: topK, MinScore: 0.4})
 }
 
 // RecallByFilter 按 Schema-driven 过滤条件做语义召回
@@ -351,6 +372,16 @@ func (m *LongTerm) RecallByFilter(query string, queryEmbedding []float64, filter
 	}
 	var items []scored
 	for i := range m.Items {
+		// 多租户隔离（默认强制）：UserID 为空且未显式打开 IncludeAllUsers 时，
+		// 直接返回空——避免 application 层忘传 UserID 时跨用户泄漏。
+		if !filter.IncludeAllUsers {
+			if filter.UserID == "" {
+				return nil
+			}
+			if m.Items[i].UserID != filter.UserID {
+				continue
+			}
+		}
 		// 隔离过滤（默认开启）：被 poison detector / 人工标记的不召回，
 		// 但仍然保留在 m.Items 中便于审计端点查看。
 		if m.Items[i].Quarantined && !filter.IncludeQuarantined {
@@ -434,15 +465,21 @@ func containsAllTags(itemTags, required []string) bool {
 }
 
 // FilterByCategory 直接返回属于指定 category 的全部条目（不做语义召回）
-// 用于 Profile 等结构化槽位的稳定枚举。隔离条目会被自动过滤。
-func (m *LongTerm) FilterByCategory(categories []string, limit int) []Item {
+// 用于 Profile 等结构化槽位的稳定枚举。
+//
+// userID 强制——空字符串将不返回任何条目（与 RecallByFilter 的隔离保持一致）。
+// 隔离 / superseded 条目自动过滤。
+func (m *LongTerm) FilterByCategory(userID string, categories []string, limit int) []Item {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if len(m.Items) == 0 || len(categories) == 0 {
+	if userID == "" || len(m.Items) == 0 || len(categories) == 0 {
 		return nil
 	}
 	var result []Item
 	for i := range m.Items {
+		if m.Items[i].UserID != userID {
+			continue
+		}
 		if m.Items[i].Quarantined || m.Items[i].Superseded {
 			continue
 		}
@@ -517,8 +554,9 @@ type ConflictCandidate struct {
 //   - domain 层只做"提名"，不做语义判断（LLM-judge 在 application 层）。
 //
 // minSim ≤ 0 时使用 0.75 默认下界；maxSim ≤ 0 时使用 dedup 阈值（默认 0.95）。
-func (m *LongTerm) ConflictCandidates(emb []float64, category string, minSim, maxSim float64) []ConflictCandidate {
-	if len(emb) == 0 || category == "" {
+// userID 强制——空字符串返 nil（不会跨用户找冲突）。
+func (m *LongTerm) ConflictCandidates(userID string, emb []float64, category string, minSim, maxSim float64) []ConflictCandidate {
+	if userID == "" || len(emb) == 0 || category == "" {
 		return nil
 	}
 	if minSim <= 0 {
@@ -536,6 +574,9 @@ func (m *LongTerm) ConflictCandidates(emb []float64, category string, minSim, ma
 	var out []ConflictCandidate
 	for i := range m.Items {
 		it := m.Items[i]
+		if it.UserID != userID {
+			continue
+		}
 		if it.Superseded || it.Quarantined {
 			continue
 		}

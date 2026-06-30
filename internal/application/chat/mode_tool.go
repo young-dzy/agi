@@ -11,6 +11,7 @@ import (
 	promptctx "agi-assistant/internal/domain/promptctx"
 	"agi-assistant/internal/domain/tool"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/usercontext"
 )
 
 // runTool 执行单工具模式。onEvent 为 nil 时即"非流式"路径。
@@ -31,8 +32,8 @@ func (a *UnifiedAgent) runTool(
 		return fmt.Sprintf("工具 %s 不存在", tc.ToolName), tc
 	}
 
-	// 偏好感知参数自动填充
-	a.fillParamsFromPreference(tc)
+	// 偏好感知参数自动填充——按当前用户的偏好桶
+	a.fillParamsFromPreference(usercontext.UserIDFromContext(ctx), tc)
 
 	result, err := t.Execute(tc.Params)
 	if err != nil {

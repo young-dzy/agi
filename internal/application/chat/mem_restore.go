@@ -1,7 +1,12 @@
-// restore.go — 启动期从 PostgreSQL 恢复偏好/长期记忆/聊天记录/RAG chunks，
+// restore.go — 启动期从 PostgreSQL 恢复长期记忆 + RAG chunks，
 // 以及把 KGStore 与 GraphMemory 串起来。
 //
-// 这些都是 agent.New 在并发组里调用的"对齐持久化与运行时状态"动作。
+// V2 多租户重构：preference / chat_history 不再启动期 restore——
+//   - preference 跨用户全量加载没意义（每用户只需要自己的）
+//   - chat_history 改成请求级 lazy load（按 userID + limit 即查即用）
+//
+// 仅 LTM 仍走启动期全量加载——它是单进程内全用户共享缓存，
+// 召回时由 RecallByFilter 按 userID 过滤实现隔离。
 package chat
 
 import (
@@ -14,17 +19,15 @@ import (
 	"agi-assistant/internal/infrastructure/llm"
 )
 
-// restoreFromDB 启动时从 PostgreSQL 恢复跨会话偏好、长期记忆和聊天记录
+// restoreFromDB 启动时从 PostgreSQL 恢复长期记忆。
+// preference / chat_history 改为请求级懒加载，本函数不再处理。
 func (a *UnifiedAgent) restoreFromDB() {
-	// 恢复偏好
-	prefs := a.repos.pref.Load("default")
-	a.mem.pref.SaveBatch(prefs)
-
-	// 恢复长期记忆
+	// 恢复长期记忆（含所有用户的条目；召回时由 UserID 过滤实现隔离）
 	rows := a.repos.ltm.Load()
 	for _, row := range rows {
 		a.mem.ltm.StoreItem(longterm.Item{
 			ID:               row.ID,
+			UserID:           row.UserID,
 			Content:          row.Content,
 			Importance:       row.Importance,
 			Embedding:        row.Embedding,
@@ -41,15 +44,8 @@ func (a *UnifiedAgent) restoreFromDB() {
 		})
 	}
 
-	// 恢复聊天记录到短期记忆（最近 N 条）
-	chatLimit := a.cfg.ShortTermMaxTurns * 2 // 每轮 = user + assistant
-	history := a.repos.chat.Load(chatLimit)
-	for _, h := range history {
-		a.mem.stm.Add(h.Role, h.Content)
-	}
-
-	if len(prefs) > 0 || len(rows) > 0 || len(history) > 0 {
-		log.Printf("✅ 记忆恢复：%d 条偏好，%d 条长期记忆，%d 条聊天记录", len(prefs), len(rows), len(history))
+	if len(rows) > 0 {
+		log.Printf("✅ 长期记忆恢复：%d 条（多用户，按 user_id 过滤召回）", len(rows))
 	}
 }
 

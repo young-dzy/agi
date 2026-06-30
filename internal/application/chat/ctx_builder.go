@@ -12,6 +12,7 @@ import (
 	"agi-assistant/internal/domain/rag"
 	"agi-assistant/internal/domain/tool"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/usercontext"
 	"context"
 )
 
@@ -29,6 +30,9 @@ func (a *UnifiedAgent) buildContextPrefix(ctx context.Context, query string, mod
 		Embedding: emb,
 		TaskID:    taskID,
 		Mode:      mode,
+		// 多租户隔离主键——透传到 ProfileSource / RecallSource，
+		// 让它们在 LTM 中只取本用户的条目。空字符串等价于"未登录"，下游会跳过。
+		UserID: usercontext.UserIDFromContext(ctx),
 	})
 }
 
@@ -40,14 +44,17 @@ func (a *UnifiedAgent) buildSystemPrompt(memPrefix, basePrompt string) string {
 	return memPrefix + "\n\n" + basePrompt
 }
 
-// buildHistoryMessages 将 STM 历史消息转为 LLM 消息列表（末尾附上当前 user query）
-func (a *UnifiedAgent) buildHistoryMessages(query string) []llm.Message {
+// buildHistoryMessages 将 STM 历史消息转为 LLM 消息列表（末尾附上当前 user query）。
+// userID 为空（未登录）时只返回当前 query，不注入任何历史——避免泄漏其他用户上下文。
+func (a *UnifiedAgent) buildHistoryMessages(userID, query string) []llm.Message {
 	var msgs []llm.Message
-	// STM 最后一条是刚加入的 user query，跳过重复
-	// 通过 Snapshot 拿到一致性副本，避免遍历期间 Add 并发改写底层切片
-	for _, m := range a.mem.stm.Snapshot() {
-		if m.Role == "user" || m.Role == "assistant" {
-			msgs = append(msgs, llm.Message{Role: m.Role, Content: m.Content})
+	if stm := a.mem.STM(userID); stm != nil {
+		// STM 最后一条是刚加入的 user query，跳过重复
+		// 通过 Snapshot 拿到一致性副本，避免遍历期间 Add 并发改写底层切片
+		for _, m := range stm.Snapshot() {
+			if m.Role == "user" || m.Role == "assistant" {
+				msgs = append(msgs, llm.Message{Role: m.Role, Content: m.Content})
+			}
 		}
 	}
 	// 如果最后一条不是当前 query（初次调用时 STM 已包含），则附上
@@ -59,8 +66,13 @@ func (a *UnifiedAgent) buildHistoryMessages(query string) []llm.Message {
 
 // recentHistoryForRAG 把 STM 转成 RAG Rewriter 需要的最小结构。
 // 取最近 6 条（3 轮）足够 history-aware 改写消除指代，再多反而拖长 prompt。
-func (a *UnifiedAgent) recentHistoryForRAG() []rag.HistoryMessage {
-	snap := a.mem.stm.Snapshot()
+// userID 为空时返回 nil（不带历史改写）——RAG 路径会退化到原始 query。
+func (a *UnifiedAgent) recentHistoryForRAG(userID string) []rag.HistoryMessage {
+	stm := a.mem.STM(userID)
+	if stm == nil {
+		return nil
+	}
+	snap := stm.Snapshot()
 	const maxTurns = 6
 	start := 0
 	if len(snap) > maxTurns {

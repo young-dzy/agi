@@ -43,8 +43,10 @@ const (
 
 // extractMemoryFromUserMsg 从用户原始消息中抽取"用户主动陈述"型记忆。
 // 见文件头注释；安全要点：整段预检 + 单条 k-v 复检 + 拼接复检三层 inspection。
-func (a *UnifiedAgent) extractMemoryFromUserMsg(userMsg string) {
-	if userMsg == "" || !a.cfg.IsRealLLM() {
+//
+// userID 来自鉴权后的 ctx；空字符串表示未登录——直接拒绝写入，避免跨用户串号。
+func (a *UnifiedAgent) extractMemoryFromUserMsg(userID, userMsg string) {
+	if userID == "" || userMsg == "" || !a.cfg.IsRealLLM() {
 		return
 	}
 
@@ -64,15 +66,17 @@ func (a *UnifiedAgent) extractMemoryFromUserMsg(userMsg string) {
 
 用户消息：` + userMsg
 
-	a.runMemExtractAndStore("user", prompt, memImportanceFromUserMsg)
+	a.runMemExtractAndStore(userID, "user", prompt, memImportanceFromUserMsg)
 }
 
 // extractMemoryFromExchange 从一对 (用户问题, AI 回答) 中抽取事实型问答。
 //
 // 设计核心：抽取目标必须"被用户问题锚定"——用户问 X 之外的 PII 即使在 reply 里
 // 出现也不会被记下来。这切断了"AI 被 prompt-injection 后吐出无关敏感信息 → 入库"的攻击。
-func (a *UnifiedAgent) extractMemoryFromExchange(userQuery, reply string) {
-	if reply == "" || userQuery == "" || !a.cfg.IsRealLLM() {
+//
+// userID 来自鉴权后的 ctx；空字符串表示未登录——直接拒绝。
+func (a *UnifiedAgent) extractMemoryFromExchange(userID, userQuery, reply string) {
+	if userID == "" || reply == "" || userQuery == "" || !a.cfg.IsRealLLM() {
 		return
 	}
 
@@ -104,15 +108,19 @@ func (a *UnifiedAgent) extractMemoryFromExchange(userQuery, reply string) {
 
 AI回答：` + reply
 
-	a.runMemExtractAndStore("exchange", prompt, memImportanceFromExchange)
+	a.runMemExtractAndStore(userID, "exchange", prompt, memImportanceFromExchange)
 }
 
 // runMemExtractAndStore 通用抽取-入库流水线：
 //
 //	LLM 抽 k-v → 单条 inspect → 拼接 inspect → 分类 → embed → 入 LTM/PG
 //
+// userID 是多租户隔离主键，写到 LTM/Pref 时强制带上。
 // source 仅用于日志区分两条调用路径；importance 由调用方根据来源传入。
-func (a *UnifiedAgent) runMemExtractAndStore(source, prompt string, importance float64) {
+func (a *UnifiedAgent) runMemExtractAndStore(userID, source, prompt string, importance float64) {
+	if userID == "" {
+		return
+	}
 	raw := a.llm.Chat("", []llm.Message{{Role: "user", Content: prompt}})
 	raw = strings.TrimSpace(raw)
 	raw = strings.TrimPrefix(raw, "```json")
@@ -138,8 +146,10 @@ func (a *UnifiedAgent) runMemExtractAndStore(source, prompt string, importance f
 
 		// preference 表只接收 user-source 的 k-v——exchange 派生不算用户偏好
 		if source == "user" {
-			a.mem.pref.Save(k, v)
-			a.repos.pref.Save("default", k, v)
+			if pref := a.mem.Pref(userID); pref != nil {
+				pref.Save(k, v)
+			}
+			a.repos.pref.Save(userID, k, v)
 		}
 		content := fmt.Sprintf("用户%s: %s", k, v)
 		if source == "exchange" {
@@ -167,25 +177,25 @@ func (a *UnifiedAgent) runMemExtractAndStore(source, prompt string, importance f
 		var added bool
 		var newID int
 		if a.mem.graphMem != nil {
-			added, _ = a.mem.graphMem.StoreClassified(content, importance, emb, category, tags, slotHint)
+			added, _ = a.mem.graphMem.StoreClassified(userID, content, importance, emb, category, tags, slotHint)
 			if added {
 				embJSON, _ := json.Marshal(emb)
-				newID = a.repos.ltm.SaveClassified(content, importance, embJSON, category, tags, slotHint)
+				newID = a.repos.ltm.SaveClassified(userID, content, importance, embJSON, category, tags, slotHint)
 				a.mem.graphMem.SyncLastItemPGID(newID)
 			}
-		} else if a.mem.ltm.StoreClassified(content, importance, emb, category, tags, slotHint) {
+		} else if a.mem.ltm.StoreClassified(userID, content, importance, emb, category, tags, slotHint) {
 			added = true
 			embJSON, _ := json.Marshal(emb)
-			newID = a.repos.ltm.SaveClassified(content, importance, embJSON, category, tags, slotHint)
+			newID = a.repos.ltm.SaveClassified(userID, content, importance, embJSON, category, tags, slotHint)
 			a.mem.ltm.SyncLastItemPGID(newID)
 		}
-		log.Printf("🧠 [memory-extract:%s] %s = %s（类别=%s, importance=%.2f）",
-			source, k, v, category, importance)
+		log.Printf("🧠 [memory-extract:%s] user=%s %s = %s（类别=%s, importance=%.2f）",
+			source, userID, k, v, category, importance)
 
 		// 矛盾检测：仅对 identity/preference/fact 类启用，且必须真实入库（newID>0）
 		// 失败 / LLM 不可用时为 no-op，不影响主流程
 		if added && newID > 0 {
-			a.detectAndResolveConflict(context.Background(), content, emb, category, newID)
+			a.detectAndResolveConflict(context.Background(), userID, content, emb, category, newID)
 		}
 	}
 }

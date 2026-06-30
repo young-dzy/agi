@@ -231,14 +231,16 @@ func intStr(n int) string {
 // 返回：(newItem bool, itemID int)
 //   - newItem=false 表示因去重被跳过
 //   - itemID 是写入的条目 ID（新增或已有更新后的 ID）
-func (gm *GraphMemory) Store(content string, importance float64, embedding []float64) (bool, int) {
-	return gm.StoreClassified(content, importance, embedding, "general", nil, "")
+//
+// userID 是多租户隔离主键，透传到 ltm。
+func (gm *GraphMemory) Store(userID, content string, importance float64, embedding []float64) (bool, int) {
+	return gm.StoreClassified(userID, content, importance, embedding, "general", nil, "")
 }
 
-// StoreClassified 带 Schema-driven 分类信息的写入
-func (gm *GraphMemory) StoreClassified(content string, importance float64, embedding []float64,
+// StoreClassified 带 Schema-driven 分类信息的写入。userID 同上。
+func (gm *GraphMemory) StoreClassified(userID, content string, importance float64, embedding []float64,
 	category string, tags []string, slotHint string) (bool, int) {
-	added := gm.ltm.StoreClassified(content, importance, embedding, category, tags, slotHint)
+	added := gm.ltm.StoreClassified(userID, content, importance, embedding, category, tags, slotHint)
 	if !added {
 		return false, gm.findMostSimilarID(embedding)
 	}

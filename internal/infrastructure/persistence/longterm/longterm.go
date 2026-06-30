@@ -15,6 +15,7 @@ import (
 // Row 是长期记忆条目的领域模型
 type Row struct {
 	ID               int
+	UserID           string
 	Content          string
 	Importance       float64
 	Embedding        []float64
@@ -32,10 +33,14 @@ type Row struct {
 
 // Repo 长期记忆仓储接口
 type Repo interface {
-	Save(content string, importance float64, embeddingJSON []byte) int
-	SaveClassified(content string, importance float64, embeddingJSON []byte,
+	Save(userID, content string, importance float64, embeddingJSON []byte) int
+	SaveClassified(userID, content string, importance float64, embeddingJSON []byte,
 		category string, tags []string, slotHint string) int
+	// Load 全量加载（含所有用户的 legacy 老数据）；启动期 boot 用。
+	// 多用户场景下生产建议改用 LoadByUser 按需加载。
 	Load() []Row
+	// LoadByUser 仅加载指定用户的条目；为未来"按需 lazy load"留位。V1 暂未启用。
+	LoadByUser(userID string) []Row
 	Update(id int, content string, importance float64, embeddingJSON []byte)
 	UpdateImportanceBatch(items []ImportanceUpdate)
 	Delete(ids []int)
@@ -60,15 +65,18 @@ type PGRepo struct {
 func NewPGRepo(db *sql.DB) *PGRepo { return &PGRepo{db: db} }
 
 // Save 默认分类 "general" 写入
-func (r *PGRepo) Save(content string, importance float64, embeddingJSON []byte) int {
-	return r.SaveClassified(content, importance, embeddingJSON, "general", nil, "")
+func (r *PGRepo) Save(userID, content string, importance float64, embeddingJSON []byte) int {
+	return r.SaveClassified(userID, content, importance, embeddingJSON, "general", nil, "")
 }
 
-// SaveClassified 带分类信息写入
-func (r *PGRepo) SaveClassified(content string, importance float64, embeddingJSON []byte,
+// SaveClassified 带分类信息写入。userID 是多租户隔离主键；空字符串退化为 'legacy'。
+func (r *PGRepo) SaveClassified(userID, content string, importance float64, embeddingJSON []byte,
 	category string, tags []string, slotHint string) int {
 	if r.db == nil {
 		return -1
+	}
+	if userID == "" {
+		userID = "legacy"
 	}
 	if category == "" {
 		category = "general"
@@ -78,9 +86,9 @@ func (r *PGRepo) SaveClassified(content string, importance float64, embeddingJSO
 	}
 	var id int
 	err := r.db.QueryRow(
-		`INSERT INTO long_term_memory (content, importance, embedding, category, tags, slot_hint)
-		 VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')) RETURNING id`,
-		content, importance, embeddingJSON, category, pq.Array(tags), slotHint,
+		`INSERT INTO long_term_memory (user_id, content, importance, embedding, category, tags, slot_hint)
+		 VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')) RETURNING id`,
+		userID, content, importance, embeddingJSON, category, pq.Array(tags), slotHint,
 	).Scan(&id)
 	if err != nil {
 		log.Printf("⚠️  长期记忆保存失败: %v", err)
@@ -89,12 +97,13 @@ func (r *PGRepo) SaveClassified(content string, importance float64, embeddingJSO
 	return id
 }
 
-// Load 加载全部长期记忆条目
+// Load 加载全部长期记忆条目（含 'legacy' 老数据）。启动期 boot 用。
 func (r *PGRepo) Load() []Row {
 	if r.db == nil {
 		return nil
 	}
-	rows, err := r.db.Query(`SELECT id, content, importance, embedding,
+	rows, err := r.db.Query(`SELECT id, COALESCE(user_id, 'legacy'),
+		content, importance, embedding,
 		COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW()),
 		COALESCE(category, 'general'), COALESCE(tags, '{}'::TEXT[]), COALESCE(slot_hint, ''),
 		COALESCE(quarantined, FALSE), COALESCE(quarantine_reason, ''),
@@ -104,6 +113,30 @@ func (r *PGRepo) Load() []Row {
 		log.Printf("⚠️  加载长期记忆失败: %v", err)
 		return nil
 	}
+	return r.scanRows(rows)
+}
+
+// LoadByUser 仅加载指定用户的条目。给未来"按需 lazy load"留位。
+func (r *PGRepo) LoadByUser(userID string) []Row {
+	if r.db == nil || userID == "" {
+		return nil
+	}
+	rows, err := r.db.Query(`SELECT id, user_id,
+		content, importance, embedding,
+		COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW()),
+		COALESCE(category, 'general'), COALESCE(tags, '{}'::TEXT[]), COALESCE(slot_hint, ''),
+		COALESCE(quarantined, FALSE), COALESCE(quarantine_reason, ''),
+		COALESCE(superseded, FALSE), superseded_at, COALESCE(supersedes, '{}'::INT[])
+		FROM long_term_memory WHERE user_id = $1 ORDER BY id`, userID)
+	if err != nil {
+		log.Printf("⚠️  加载用户 %s 长期记忆失败: %v", userID, err)
+		return nil
+	}
+	return r.scanRows(rows)
+}
+
+// scanRows 是 Load / LoadByUser 共用的反序列化逻辑。
+func (r *PGRepo) scanRows(rows *sql.Rows) []Row {
 	defer rows.Close()
 	var items []Row
 	for rows.Next() {
@@ -112,7 +145,7 @@ func (r *PGRepo) Load() []Row {
 		var tags pq.StringArray
 		var supersedes pq.Int64Array
 		var supersededAt sql.NullTime
-		if err := rows.Scan(&row.ID, &row.Content, &row.Importance, &embJSON,
+		if err := rows.Scan(&row.ID, &row.UserID, &row.Content, &row.Importance, &embJSON,
 			&row.CreatedAt, &row.LastAccessed, &row.Category, &tags, &row.SlotHint,
 			&row.Quarantined, &row.QuarantineReason,
 			&row.Superseded, &supersededAt, &supersedes); err != nil {

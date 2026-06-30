@@ -34,14 +34,15 @@ func (a *UnifiedAgent) toolsSnapshot() map[string]tool.Tool {
 	return a.tools.snapshot()
 }
 
-// ShortTerm 暴露短期记忆，供 HTTP handler 查询
-func (a *UnifiedAgent) ShortTerm() *shortterm.ShortTerm { return a.mem.stm }
+// ShortTerm 暴露指定用户的短期记忆，供 HTTP handler 查询。
+// 多租户：未登录返回 nil；新用户首次访问时懒创建空桶。
+func (a *UnifiedAgent) ShortTerm(userID string) *shortterm.ShortTerm { return a.mem.STM(userID) }
 
 // LongTerm 暴露长期记忆，供 HTTP handler 查询
 func (a *UnifiedAgent) LongTerm() *longterm.LongTerm { return a.mem.ltm }
 
-// Preferences 暴露用户偏好，供 HTTP handler 查询
-func (a *UnifiedAgent) Preferences() *preference.Preference { return a.mem.pref }
+// Preferences 暴露指定用户的偏好桶，供 HTTP handler 查询。
+func (a *UnifiedAgent) Preferences(userID string) *preference.Preference { return a.mem.Pref(userID) }
 
 // Snapshots 返回历史快照列表（持锁拷贝）
 func (a *UnifiedAgent) Snapshots() []Snapshot {
@@ -99,12 +100,13 @@ func (a *UnifiedAgent) saveSnapshot(task *TaskState) {
 // 旧的 buildMemorySystemPrefix / buildMemorySystemPrefixWithCtx 已删除，
 // 由 buildContextPrefix → promptctx.ContextAssembler 取代（Schema-driven 装配）。
 
-// fillParamsFromPreference 用用户偏好自动补全工具调用参数中缺失的值
-func (a *UnifiedAgent) fillParamsFromPreference(tc *tool.CallResult) {
-	if tc == nil {
+// fillParamsFromPreference 用用户偏好自动补全工具调用参数中缺失的值。
+// userID 为空时不补全（未登录请求拿不到任何用户偏好桶）。
+func (a *UnifiedAgent) fillParamsFromPreference(userID string, tc *tool.CallResult) {
+	if tc == nil || userID == "" {
 		return
 	}
-	prefs := a.mem.pref.Snapshot() // 一次性快照，下方可无锁访问
+	prefs := a.mem.prefSnapshot(userID) // 一次性快照，下方可无锁访问
 	if len(prefs) == 0 {
 		return
 	}

@@ -12,6 +12,7 @@ package chat
 import (
 	"agi-assistant/config"
 	"agi-assistant/internal/domain/knowledge"
+	"agi-assistant/internal/domain/memory/shortterm"
 	"agi-assistant/internal/domain/promptctx"
 	"agi-assistant/internal/domain/rag"
 	"agi-assistant/internal/domain/sandbox"
@@ -89,6 +90,30 @@ type Deps struct {
 // 第一阶段把 builtin tool（rag_search / search_web）注册穿插在并发组里，
 // 因为 RegisterTool 是持锁的，与同期的 initSandbox 注册 exec_command 不会冲突。
 func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
+	// hydrator 闭包：把 PG repo 包装成 memoryStack 期望的纯函数签名，
+	// 让 domain/application 层不直接 import infrastructure。
+	stmHydrator := func(userID string) []shortterm.ConversationMessage {
+		// 从 chat_history 表加载最近 N 条历史；按时间正序返回。
+		// repo Load 已经内部排序 + 反转，这里直接转结构。
+		// 取 ShortTermMaxTurns*2 条（每轮 user+assistant）。
+		entries := deps.ChatRepo.Load(userID, cfg.ShortTermMaxTurns*2)
+		if len(entries) == 0 {
+			return nil
+		}
+		msgs := make([]shortterm.ConversationMessage, 0, len(entries))
+		for _, e := range entries {
+			msgs = append(msgs, shortterm.ConversationMessage{
+				Role:      e.Role,
+				Content:   e.Content,
+				Timestamp: e.CreatedAt,
+			})
+		}
+		return msgs
+	}
+	prefHydrator := func(userID string) map[string]string {
+		return deps.PrefRepo.Load(userID)
+	}
+
 	a := &UnifiedAgent{
 		cfg:          cfg,
 		llm:          llm.New(cfg),
@@ -96,7 +121,7 @@ func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
 		tools:        newToolRegistry(toolimpl.DefaultTools()),
 		subagents:    newSubAgentRegistry(),
 		runtime:      newTaskRuntime(),
-		mem:          newMemoryStack(cfg),
+		mem:          newMemoryStack(cfg, stmHydrator, prefHydrator),
 		repos:        newRepoBundle(deps),
 		ragMilvusDim: cfg.RAGMilvusDim,
 	}
@@ -229,7 +254,9 @@ func (a *UnifiedAgent) buildPromptCtx() *promptCtx {
 	}
 
 	reg := promptctx.NewSourceRegistry()
-	reg.Register(promptctx.NewProfileSource(a.mem.pref, a.mem.ltm))
+	// 多租户：把"按 userID 取偏好桶"作为 provider 注入，
+	// ProfileSource 在每次 Fetch 时按 q.UserID 拿当前用户的桶
+	reg.Register(promptctx.NewProfileSource(a.mem.Pref, a.mem.ltm))
 	reg.Register(promptctx.NewPlannerSource(func() *promptctx.PlannerSnapshot {
 		t := a.currentTask() // 持锁读取，避免与 ReAct 循环并发写打架
 		if t == nil {

@@ -17,13 +17,14 @@ func buildAssembler() *ContextAssembler {
 	pref.Save("语言", "中文")
 
 	ltm := longterm.New()
-	ltm.StoreClassified("用户叫张三", 0.9, nil, "identity", []string{"name"}, "profile")
-	ltm.StoreClassified("用户喜欢喝咖啡", 0.85, nil, "preference", nil, "profile")
-	ltm.StoreClassified("上次问过天气API", 0.7, nil, "episodic", nil, "recall_memory")
-	ltm.StoreClassified("python 是一门动态语言", 0.6, nil, "fact", nil, "recall_memory")
+	ltm.StoreClassified("u1", "用户叫张三", 0.9, nil, "identity", []string{"name"}, "profile")
+	ltm.StoreClassified("u1", "用户喜欢喝咖啡", 0.85, nil, "preference", nil, "profile")
+	ltm.StoreClassified("u1", "上次问过天气API", 0.7, nil, "episodic", nil, "recall_memory")
+	ltm.StoreClassified("u1", "python 是一门动态语言", 0.6, nil, "fact", nil, "recall_memory")
 
 	reg := NewSourceRegistry()
-	reg.Register(NewProfileSource(pref, ltm))
+	// 单测用固定 provider：所有 userID 都映射到同一个 *preference.Preference
+	reg.Register(NewProfileSource(func(_ string) *preference.Preference { return pref }, ltm))
 	reg.Register(NewConstraintsSource(sandbox.PolicySnapshot()))
 	reg.Register(NewRecallSource(ltm))
 	reg.Register(NewToolStateSource(
@@ -40,9 +41,15 @@ func buildAssembler() *ContextAssembler {
 	return NewAssembler(DefaultSchemas(), reg)
 }
 
+// testQuery 构造带 UserID 的 Query——RecallSource/ProfileSource 现在
+// 在 UserID 为空时 fail-closed，所有 assembler 单测都需要显式带上。
+func testQuery(mode, text string) Query {
+	return Query{Mode: mode, Text: text, UserID: "u1"}
+}
+
 func TestAssembler_ChatMode_HasFewSlots(t *testing.T) {
 	asm := buildAssembler()
-	rc := asm.Assemble(context.Background(), Query{Mode: "chat", Text: "你好"})
+	rc := asm.Assemble(context.Background(), testQuery("chat", "你好"))
 	if rc == nil {
 		t.Fatal("nil RuntimeContext")
 	}
@@ -63,7 +70,7 @@ func TestAssembler_ChatMode_HasFewSlots(t *testing.T) {
 
 func TestAssembler_ReactMode_RendersPlannerAndTools(t *testing.T) {
 	asm := buildAssembler()
-	rc := asm.Assemble(context.Background(), Query{Mode: "react", Text: "查天气并写诗"})
+	rc := asm.Assemble(context.Background(), testQuery("react", "查天气并写诗"))
 
 	rendered := rc.Render()
 
@@ -78,7 +85,7 @@ func TestAssembler_ReactMode_RendersPlannerAndTools(t *testing.T) {
 
 func TestAssembler_UnknownModeFallsBackToChat(t *testing.T) {
 	asm := buildAssembler()
-	rc := asm.Assemble(context.Background(), Query{Mode: "nonexistent", Text: "hi"})
+	rc := asm.Assemble(context.Background(), testQuery("nonexistent", "hi"))
 
 	if rc.Schema.Mode != "chat" {
 		t.Errorf("expected fallback to chat mode, got %s", rc.Schema.Mode)
@@ -89,7 +96,7 @@ func TestAssembler_GlobalBudgetTruncation(t *testing.T) {
 	asm := buildAssembler()
 	asm.globalLimit = 200 // 极小预算，强制裁剪
 
-	rc := asm.Assemble(context.Background(), Query{Mode: "react", Text: "test"})
+	rc := asm.Assemble(context.Background(), testQuery("react", "test"))
 	rendered := rc.Render()
 
 	if len(rendered) > 400 {
@@ -105,7 +112,7 @@ func TestAssembler_GlobalBudgetTruncation(t *testing.T) {
 
 func TestAssembler_RenderProducesValidPrefix(t *testing.T) {
 	asm := buildAssembler()
-	rc := asm.Assemble(context.Background(), Query{Mode: "chat", Text: "你好"})
+	rc := asm.Assemble(context.Background(), testQuery("chat", "你好"))
 	rendered := rc.Render()
 
 	if rendered == "" {

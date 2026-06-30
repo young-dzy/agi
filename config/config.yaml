@@ -1,13 +1,13 @@
 # 对话模型配置
 llm:
-  api_url: https://api.deepseek.com/chat/completions
-  api_key: "${DEEPSEEK_API_KEY}"
-  model: deepseek-v4-pro
-  temperature: 0.7
+  api_url: https://open.bigmodel.cn/api/paas/v4/chat/completions
+  api_key: "."
+  model: glm-5.2
+  temperature: 1.0
 embedding:
-  api_url: https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal
-  api_key: "你的apikey"
-  model: doubao-embedding-vision-250615
+  api_url: https://open.bigmodel.cn/api/paas/v4/embeddings
+  api_key: "."
+  model: glm-5.2
 
 # 向量数据库配置
 milvus:
@@ -121,3 +121,11 @@ graph_runtime:
   max_parallel: 2            # 最大并行执行节点数
   race_timeout_ms: 30000     # 竞速组内节点超时
   enable_racing: true        # 是否启用竞速机制（First-success-wins）
+
+# ===== 认证 / JWT =====
+# 生产环境强制通过环境变量 JWT_SECRET 注入，至少 32 字节随机
+# 本地开发可以直接写一段固定字符串（≥ 32 字符）方便调试
+auth:
+  jwt_secret: "${JWT_SECRET}"
+  jwt_ttl_hours: 168          # access token 有效期：7 天
+  jwt_issuer: "agi-assistant"

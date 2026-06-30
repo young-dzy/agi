@@ -44,22 +44,26 @@ const (
 // 为简化首版，把"判定"和"标记"拼成一次调用，但在 newID==0 时只判定不标记
 // （供调用方在 Store 失败 / dedup 命中时跳过），newID>0 时执行标记。
 //
+// userID 是多租户隔离主键——只在该用户自己的同主题记忆里找冲突，
+// 不会跨用户取代。空字符串直接 skip。
+//
 // 返回真正被标记的旧条目 ID 列表，便于日志记录。
 func (a *UnifiedAgent) detectAndResolveConflict(
 	ctx context.Context,
+	userID string,
 	newContent string,
 	newEmb []float64,
 	category string,
 	newID int,
 ) []int {
-	if !conflictDetectableCategories[category] {
+	if userID == "" || !conflictDetectableCategories[category] {
 		return nil
 	}
 	if len(newEmb) == 0 || !a.cfg.IsRealLLM() {
 		return nil
 	}
 
-	candidates := a.mem.ltm.ConflictCandidates(newEmb, category, conflictMinSim, conflictMaxSim)
+	candidates := a.mem.ltm.ConflictCandidates(userID, newEmb, category, conflictMinSim, conflictMaxSim)
 	if len(candidates) == 0 {
 		return nil
 	}

@@ -2,7 +2,16 @@
 //
 // handler 不再直接读 RAG/memory/Preferences/InfraStatus 等内部组件——
 // status 端点通过 Status() 拿到一个聚合 map，结构保持与重构前一致以兼容前端。
+//
+// 多租户：Status 接 ctx，short_term_count / preferences 只反映本用户的桶；
+// LTM count / RAG / infra 是全局指标继续输出。
 package chat
+
+import (
+	"context"
+
+	"agi-assistant/internal/usercontext"
+)
 
 // InfraStatus 暴露平台层连接健康快照（供 status 端点使用）
 func (a *UnifiedAgent) InfraStatus() map[string]string {
@@ -10,7 +19,13 @@ func (a *UnifiedAgent) InfraStatus() map[string]string {
 }
 
 // Status 构造系统状态视图模型，供 GET /api/status 渲染。
-func (a *UnifiedAgent) Status() map[string]interface{} {
+//
+// userID 影响哪些字段：
+//   - short_term_count / preferences 只反映本用户桶
+//   - long_term_count / rag / infrastructure 是全局指标，不区分用户
+func (a *UnifiedAgent) Status(ctx context.Context) map[string]interface{} {
+	userID := usercontext.UserIDFromContext(ctx)
+
 	// RAG chunk 预览（最多 60 字符）
 	var chunkPreviews []map[string]interface{}
 	for _, c := range a.rag.Chunks() {
@@ -28,9 +43,9 @@ func (a *UnifiedAgent) Status() map[string]interface{} {
 		"rag_loaded":       a.rag.Loaded,
 		"rag_mode":         a.rag.Mode(),
 		"rag_chunks":       chunkPreviews,
-		"short_term_count": a.mem.stm.Count(),
+		"short_term_count": a.mem.stmCount(userID),
 		"long_term_count":  a.mem.ltm.Count(),
-		"preferences":      a.mem.pref.Snapshot(),
+		"preferences":      a.mem.prefSnapshot(userID),
 		"tools_count":      len(a.toolsSnapshot()),
 		"sub_agents_count": len(a.subagents.snapshot()),
 		"llm_model":        a.cfg.LLMModel,

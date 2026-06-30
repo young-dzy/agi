@@ -34,7 +34,12 @@ func (s *RecallSource) Fetch(ctx context.Context, slot Slot, q Query) ([]Context
 	if s.recaller == nil {
 		return nil, nil
 	}
+	// UserID 为空时不召回——避免登录前的请求把别人的记忆灌进 prompt
+	if q.UserID == "" {
+		return nil, nil
+	}
 	filter := longterm.RecallFilter{
+		UserID:      q.UserID,
 		Categories:  slot.Filter.Categories,
 		RequireTags: slot.Filter.RequireTags,
 		MinScore:    slot.Filter.MinScore,

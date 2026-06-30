@@ -43,6 +43,16 @@ func BootstrapSchema(pg *sql.DB) {
 		return
 	}
 	ddls := []string{
+		// 用户表：username 唯一，bcrypt 密码哈希。
+		// 单体应用阶段用 SERIAL 自增；未来若要分布式可改 UUID。
+		`CREATE TABLE IF NOT EXISTS users (
+			id            SERIAL PRIMARY KEY,
+			username      TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			created_at    TIMESTAMP DEFAULT NOW(),
+			last_login_at TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)`,
 		`CREATE TABLE IF NOT EXISTS user_preferences (
 			user_id    TEXT NOT NULL,
 			key        TEXT NOT NULL,
@@ -85,6 +95,16 @@ func BootstrapSchema(pg *sql.DB) {
 		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS superseded_at  TIMESTAMP`,
 		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS supersedes     INT[] NOT NULL DEFAULT '{}'`,
 		`CREATE INDEX IF NOT EXISTS idx_lti_superseded ON long_term_memory(superseded) WHERE superseded`,
+		// 多租户：所有"用户私有"数据加 user_id 列。
+		// 老数据（迁移前的 user_id IS NULL 或 'default'）统一打 'legacy' 标签——
+		// 防止新用户登录后看到他人记忆，又不丢历史数据便于审计。
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'legacy'`,
+		`CREATE INDEX IF NOT EXISTS idx_lti_user ON long_term_memory(user_id)`,
+		`ALTER TABLE chat_history     ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'legacy'`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_history(user_id, id DESC)`,
+		`ALTER TABLE task_snapshots   ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'legacy'`,
+		// user_preferences 表的 user_id 之前是值 'default'——批量改名到 'legacy' 与上面对齐
+		`UPDATE user_preferences SET user_id = 'legacy' WHERE user_id = 'default'`,
 		`CREATE TABLE IF NOT EXISTS rag_chunks (
 			id          BIGSERIAL PRIMARY KEY,
 			doc_hash    TEXT NOT NULL,

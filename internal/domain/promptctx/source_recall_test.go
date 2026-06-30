@@ -37,7 +37,7 @@ func TestRecallSource_FilterPassThrough(t *testing.T) {
 			MaxAgeHours: 48,
 		},
 	}
-	items, err := src.Fetch(context.Background(), slot, Query{Text: "hi"})
+	items, err := src.Fetch(context.Background(), slot, Query{Text: "hi", UserID: "u1"})
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -45,7 +45,10 @@ func TestRecallSource_FilterPassThrough(t *testing.T) {
 	if !r.called {
 		t.Error("recaller not called")
 	}
-	// 验证 filter 透传
+	// 验证 filter 透传（含多租户 UserID）
+	if r.filter.UserID != "u1" {
+		t.Errorf("UserID not propagated: %q", r.filter.UserID)
+	}
 	if len(r.filter.Categories) != 2 || r.filter.TopK != 2 || r.filter.MinScore != 0.4 || r.filter.MaxAgeHours != 48 {
 		t.Errorf("filter not properly passed: %+v", r.filter)
 	}
@@ -74,8 +77,22 @@ func TestRecallSource_NilRecaller(t *testing.T) {
 func TestRecallSource_EmptyHits(t *testing.T) {
 	r := &fakeRecaller{items: nil}
 	src := NewRecallSource(r)
-	items, _ := src.Fetch(context.Background(), Slot{Kind: SlotRecall}, Query{})
+	items, _ := src.Fetch(context.Background(), Slot{Kind: SlotRecall}, Query{UserID: "u1"})
 	if len(items) != 0 {
 		t.Errorf("expected empty result, got %d items", len(items))
+	}
+}
+
+// TestRecallSource_AnonymousNoCall 验证未登录（UserID="") 时不调用底层 recaller，
+// 防止 application 层忘传时把别人的记忆灌进 prompt。
+func TestRecallSource_AnonymousNoCall(t *testing.T) {
+	r := &fakeRecaller{items: []longterm.Item{{Content: "should-not-leak"}}}
+	src := NewRecallSource(r)
+	items, _ := src.Fetch(context.Background(), Slot{Kind: SlotRecall}, Query{Text: "hi"})
+	if r.called {
+		t.Error("UserID 为空时 recaller 不应被调用")
+	}
+	if items != nil {
+		t.Errorf("UserID 为空时不应返回任何条目")
 	}
 }

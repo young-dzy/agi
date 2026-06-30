@@ -10,6 +10,7 @@ import (
 
 	"agi-assistant/internal/domain/document"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/usercontext"
 )
 
 type SubAgentTask struct {
@@ -72,6 +73,8 @@ func (r *researchAgent) Description() string {
 }
 
 func (r *researchAgent) Run(ctx context.Context, task SubAgentTask) (string, error) {
+	// 子 Agent 复用主请求的 STM 历史给 RAG rewriter 用——userID 从 ctx 取
+	userID := usercontext.UserIDFromContext(ctx)
 	queries := r.planQueries(ctx, task)
 	var observations []string
 	var evidence []string
@@ -80,7 +83,7 @@ func (r *researchAgent) Run(ctx context.Context, task SubAgentTask) (string, err
 			return "", ctx.Err()
 		}
 		if r.agent.rag.Loaded {
-			answer, results := r.agent.rag.QueryWithHistory(q, r.agent.recentHistoryForRAG())
+			answer, results := r.agent.rag.QueryWithHistory(q, r.agent.recentHistoryForRAG(userID))
 			observations = append(observations, fmt.Sprintf("Query: %s\nRAG Answer: %s", q, answer))
 			for _, sr := range results {
 				content := sr.Chunk.Content

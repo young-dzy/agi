@@ -8,6 +8,7 @@ type Query struct {
 	Embedding []float64 // 已计算的 query embedding（可为空）
 	TaskID    string    // 当前任务 ID（用于 Task Memory）
 	Mode      string    // chat / tool / react / rag
+	UserID    string    // 当前请求归属用户——给 Profile/Recall 等 source 用作隔离过滤键
 }
 
 // ContextSource 是某类认知槽位的数据提供者。

@@ -45,6 +45,24 @@ func (m *ShortTerm) Add(role, content string) {
 	}
 }
 
+// Hydrate 从持久层批量灌入历史消息（用户首次活动时从 chat_history 表预热用）。
+//
+// 与 Add 的差异：
+//   - 不更新 Timestamp（保留入参中的原值，反映消息真实发生时间）
+//   - 直接覆盖 Messages 而非 append——调用方应该已经按时间正序裁好了 N 条
+//   - 自动按 MaxTurns*2 截断，避免 PG 给的条数超过窗口
+//
+// 仅在桶刚创建（len(Messages)==0）时安全使用——重复 Hydrate 会丢失运行时增量。
+func (m *ShortTerm) Hydrate(history []ConversationMessage) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	max := m.MaxTurns * 2
+	if max > 0 && len(history) > max {
+		history = history[len(history)-max:]
+	}
+	m.Messages = append(m.Messages[:0], history...)
+}
+
 // Snapshot 返回当前 Messages 的副本（持读锁）
 func (m *ShortTerm) Snapshot() []ConversationMessage {
 	m.mu.RLock()

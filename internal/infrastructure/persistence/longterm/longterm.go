@@ -14,15 +14,20 @@ import (
 
 // Row 是长期记忆条目的领域模型
 type Row struct {
-	ID           int
-	Content      string
-	Importance   float64
-	Embedding    []float64
-	CreatedAt    time.Time
-	LastAccessed time.Time
-	Category     string
-	Tags         []string
-	SlotHint     string
+	ID               int
+	Content          string
+	Importance       float64
+	Embedding        []float64
+	CreatedAt        time.Time
+	LastAccessed     time.Time
+	Category         string
+	Tags             []string
+	SlotHint         string
+	Quarantined      bool
+	QuarantineReason string
+	Superseded       bool
+	SupersededAt     time.Time
+	Supersedes       []int
 }
 
 // Repo 长期记忆仓储接口
@@ -34,6 +39,11 @@ type Repo interface {
 	Update(id int, content string, importance float64, embeddingJSON []byte)
 	UpdateImportanceBatch(items []ImportanceUpdate)
 	Delete(ids []int)
+	// SetQuarantine 设置/清除某条记忆的隔离标记。reason 仅在 quarantined=true 时有意义。
+	SetQuarantine(id int, quarantined bool, reason string)
+	// MarkSuperseded 把 oldIDs 标记为 superseded（带时间戳），并把 oldIDs
+	// 写入 newID 的 supersedes 数组。事务内完成，避免审计链路断裂。
+	MarkSuperseded(oldIDs []int, newID int)
 }
 
 // ImportanceUpdate 批量衰减时的最小变更单元
@@ -86,7 +96,9 @@ func (r *PGRepo) Load() []Row {
 	}
 	rows, err := r.db.Query(`SELECT id, content, importance, embedding,
 		COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW()),
-		COALESCE(category, 'general'), COALESCE(tags, '{}'::TEXT[]), COALESCE(slot_hint, '')
+		COALESCE(category, 'general'), COALESCE(tags, '{}'::TEXT[]), COALESCE(slot_hint, ''),
+		COALESCE(quarantined, FALSE), COALESCE(quarantine_reason, ''),
+		COALESCE(superseded, FALSE), superseded_at, COALESCE(supersedes, '{}'::INT[])
 		FROM long_term_memory ORDER BY id`)
 	if err != nil {
 		log.Printf("⚠️  加载长期记忆失败: %v", err)
@@ -98,14 +110,25 @@ func (r *PGRepo) Load() []Row {
 		var row Row
 		var embJSON []byte
 		var tags pq.StringArray
+		var supersedes pq.Int64Array
+		var supersededAt sql.NullTime
 		if err := rows.Scan(&row.ID, &row.Content, &row.Importance, &embJSON,
-			&row.CreatedAt, &row.LastAccessed, &row.Category, &tags, &row.SlotHint); err != nil {
+			&row.CreatedAt, &row.LastAccessed, &row.Category, &tags, &row.SlotHint,
+			&row.Quarantined, &row.QuarantineReason,
+			&row.Superseded, &supersededAt, &supersedes); err != nil {
 			continue
 		}
 		if len(embJSON) > 0 {
 			json.Unmarshal(embJSON, &row.Embedding)
 		}
 		row.Tags = []string(tags)
+		if supersededAt.Valid {
+			row.SupersededAt = supersededAt.Time
+		}
+		row.Supersedes = make([]int, len(supersedes))
+		for i, v := range supersedes {
+			row.Supersedes[i] = int(v)
+		}
 		items = append(items, row)
 	}
 	return items
@@ -164,5 +187,80 @@ func (r *PGRepo) UpdateImportanceBatch(items []ImportanceUpdate) {
 	)
 	if err != nil {
 		log.Printf("⚠️  长期记忆批量衰减更新失败 (n=%d): %v", len(items), err)
+	}
+}
+
+// SetQuarantine 持久化隔离状态。quarantined=false 时清空 reason。
+// 调用方在内存层 Quarantine/Unquarantine 成功后调用，保证内存与 PG 一致。
+func (r *PGRepo) SetQuarantine(id int, quarantined bool, reason string) {
+	if r.db == nil {
+		return
+	}
+	if !quarantined {
+		reason = ""
+	}
+	_, err := r.db.Exec(
+		`UPDATE long_term_memory SET quarantined = $1, quarantine_reason = NULLIF($2, '')
+		 WHERE id = $3`,
+		quarantined, reason, id,
+	)
+	if err != nil {
+		log.Printf("⚠️  长期记忆隔离标记更新失败 (id=%d): %v", id, err)
+	}
+}
+
+// MarkSuperseded 把 oldIDs 标记为 superseded（带时间戳），并把它们追加到
+// newID.supersedes 数组（去重）。事务内完成——避免"旧条目已下架但新条目
+// 没记录替代关系"的窗口期，让审计链路始终连贯。
+//
+// newID == 0 表示新条目尚未持久化，此时仅标记旧条目（调用方需在新条目
+// 落库后再调一次以补上 supersedes 链接）。
+func (r *PGRepo) MarkSuperseded(oldIDs []int, newID int) {
+	if r.db == nil || len(oldIDs) == 0 {
+		return
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		log.Printf("⚠️  MarkSuperseded 启动事务失败: %v", err)
+		return
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	ids := make([]int64, len(oldIDs))
+	for i, id := range oldIDs {
+		ids[i] = int64(id)
+	}
+	if _, err = tx.Exec(
+		`UPDATE long_term_memory
+		 SET superseded = TRUE, superseded_at = NOW()
+		 WHERE id = ANY($1::INT[]) AND NOT superseded`,
+		pq.Array(ids),
+	); err != nil {
+		log.Printf("⚠️  MarkSuperseded 旧条目标记失败: %v", err)
+		return
+	}
+
+	if newID > 0 {
+		// 用 array_cat + 反向去重写法（确保 supersedes 内无重复）
+		if _, err = tx.Exec(
+			`UPDATE long_term_memory
+			 SET supersedes = (
+			   SELECT ARRAY(SELECT DISTINCT unnest(COALESCE(supersedes, '{}'::INT[]) || $1::INT[]))
+			   FROM long_term_memory WHERE id = $2
+			 )
+			 WHERE id = $2`,
+			pq.Array(ids), newID,
+		); err != nil {
+			log.Printf("⚠️  MarkSuperseded 新条目链接失败 (id=%d): %v", newID, err)
+			return
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		log.Printf("⚠️  MarkSuperseded 提交失败: %v", err)
 	}
 }

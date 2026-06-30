@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 )
 
 // ─────────────────────────── 公开入口 ───────────────────────────
@@ -118,16 +119,34 @@ func (a *UnifiedAgent) prepare(ctx context.Context, query string, opts ChatOptio
 	a.mem.stm.Add("user", query)
 	a.repos.chat.Save("user", query)
 
-	// 偏好提取：优先 LLM（异步）+ 同步规则兜底（立即生效，回显给前端）
+	// 偏好提取：优先 LLM（异步）+ 同步规则兜底（立即生效，回显给前端）。
+	// 安全策略：LLM 抽取出每个 k-v 后，单独过一次 poison gate；
+	// 命中 PII / Injection 直接 skip 并 log，不入 LTM 也不入图记忆。
 	a.goSafe("process.preference-extract", func() {
+		// 入口预检：含越狱/PII 模式的消息整体跳过 LLM 调用
+		if pre := inspectMemoryContent(query); !pre.Safe() {
+			log.Printf("🛡️  [pref-extract] 整段拒绝：risk=%s reason=%s",
+				pre.Risk, pre.Reason)
+			return
+		}
 		kvs := a.llm.ExtractPreferences(query)
 		if len(kvs) == 0 {
 			return
 		}
 		a.mem.pref.SaveBatch(kvs)
 		for k, v := range kvs {
+			// 单条 k-v 复检
+			if insp := inspectKVPair(k, v); !insp.Safe() {
+				log.Printf("🛡️  [pref-extract] 拒绝写入 k=%q: risk=%s reason=%s",
+					k, insp.Risk, insp.Reason)
+				continue
+			}
 			a.repos.pref.Save("default", k, v)
 			content := fmt.Sprintf("用户%s: %s", k, v)
+			if insp := inspectMemoryContent(content); !insp.Safe() {
+				log.Printf("🛡️  [pref-extract] 拼接后命中：risk=%s", insp.Risk)
+				continue
+			}
 			emb, _ := a.llm.Embed(content)
 			if added, _ := a.mem.graphMem.Store(content, 0.8, emb); added {
 				embJSON, _ := json.Marshal(emb)
@@ -222,8 +241,15 @@ func (a *UnifiedAgent) finalize(query string, resp *Response) {
 	a.mem.stm.Add("assistant", resp.Answer)
 	a.repos.chat.Save("assistant", resp.Answer)
 
-	// 从 assistant 回答中提取可记忆信息
-	a.goSafe("process.memory-extract", func() { a.extractMemoryFromReply(resp.Answer) })
+	// 双源记忆抽取：
+	//   1) 从用户消息抽 "用户偏好/身份/事实陈述"（高可信，importance=0.7）
+	//   2) 从对话对抽 "用户问题主题相关的客观事实"（次级可信，importance=0.5）
+	// 两条都过 poison gate；reply 路径额外要求 "key 必须与用户问题主题锚定"，
+	// 切断 "AI 被越狱后吐出无关 PII → 入库" 的攻击放大链。
+	a.goSafe("process.memory-extract", func() {
+		a.extractMemoryFromUserMsg(query)
+		a.extractMemoryFromExchange(query, resp.Answer)
+	})
 
 	// 异步触发记忆合并（去重+合并+衰减+过期；有图层时使用图感知合并以保护高中心度节点）
 	a.goSafe("process.consolidate", func() {

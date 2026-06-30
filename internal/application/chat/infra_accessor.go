@@ -47,6 +47,37 @@ func (a *UnifiedAgent) Preferences() *preference.Preference { return a.mem.pref 
 func (a *UnifiedAgent) Snapshots() []Snapshot {
 	return a.runtime.snapshotList()
 }
+
+// QuarantinedMemories 返回所有被隔离的 LTM 条目（审计端点用）。
+// 隔离不召回 + 不删除——既阻止 prompt 污染，又保留证据用于事后取证。
+func (a *UnifiedAgent) QuarantinedMemories() []longterm.Item {
+	return a.mem.ltm.QuarantinedItems()
+}
+
+// QuarantineMemory 把指定 ID 的 LTM 条目标记为隔离，并同步写 PG。
+// 内存层标记成功后再落盘，避免数据库已写但内存未生效的窗口。
+func (a *UnifiedAgent) QuarantineMemory(id int, reason string) bool {
+	if !a.mem.ltm.Quarantine(id, reason) {
+		return false
+	}
+	a.repos.ltm.SetQuarantine(id, true, reason)
+	return true
+}
+
+// UnquarantineMemory 解除隔离并同步写 PG。
+func (a *UnifiedAgent) UnquarantineMemory(id int) bool {
+	if !a.mem.ltm.Unquarantine(id) {
+		return false
+	}
+	a.repos.ltm.SetQuarantine(id, false, "")
+	return true
+}
+
+// SupersededMemories 列出所有 Superseded=true 的条目（审计用）。
+// 仅返回内存中存在的——重启后已通过 restoreFromDB 灌回。
+func (a *UnifiedAgent) SupersededMemories() []longterm.Item {
+	return a.mem.ltm.SupersededItems()
+}
 func (a *UnifiedAgent) saveSnapshot(task *TaskState) {
 	if task == nil {
 		return

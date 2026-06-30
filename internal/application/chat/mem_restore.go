@@ -24,12 +24,20 @@ func (a *UnifiedAgent) restoreFromDB() {
 	rows := a.repos.ltm.Load()
 	for _, row := range rows {
 		a.mem.ltm.StoreItem(longterm.Item{
-			ID:           row.ID,
-			Content:      row.Content,
-			Importance:   row.Importance,
-			Embedding:    row.Embedding,
-			CreatedAt:    row.CreatedAt,
-			LastAccessed: row.LastAccessed,
+			ID:               row.ID,
+			Content:          row.Content,
+			Importance:       row.Importance,
+			Embedding:        row.Embedding,
+			CreatedAt:        row.CreatedAt,
+			LastAccessed:     row.LastAccessed,
+			Category:         row.Category,
+			Tags:             row.Tags,
+			SlotHint:         row.SlotHint,
+			Quarantined:      row.Quarantined,
+			QuarantineReason: row.QuarantineReason,
+			Superseded:       row.Superseded,
+			SupersededAt:     row.SupersededAt,
+			Supersedes:       row.Supersedes,
 		})
 	}
 

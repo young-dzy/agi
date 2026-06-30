@@ -32,6 +32,17 @@ type Item struct {
 	Category string   `json:"category,omitempty"`  // 主类别：identity / preference / fact / episodic / tool_failure / policy / general
 	Tags     []string `json:"tags,omitempty"`      // 自由标签
 	SlotHint string   `json:"slot_hint,omitempty"` // 建议归属的 SlotKind 字符串
+	// 安全字段：被 poison detector 或人工标记隔离的条目，
+	// 物理上保留在内存/PG 中（便于审计），但 RecallByFilter 默认过滤不召回。
+	// 不读不删的"软删除"——攻击发生后还能查到证据，并通过 Unquarantine 恢复。
+	Quarantined      bool   `json:"quarantined,omitempty"`
+	QuarantineReason string `json:"quarantine_reason,omitempty"`
+	// 矛盾治理字段：当用户陈述与已有 identity/preference/fact 类记忆冲突时，
+	// 旧条目标 Superseded=true（不删除，便于审计与回滚），新条目通过
+	// Supersedes 数组记录"我替代了哪些旧条目"。RecallByFilter 默认过滤 Superseded。
+	Superseded   bool      `json:"superseded,omitempty"`
+	SupersededAt time.Time `json:"superseded_at,omitempty"`
+	Supersedes   []int     `json:"supersedes,omitempty"`
 }
 
 // RecallFilter 控制 RecallByFilter 的语义召回约束（与 promptctx.SlotFilter 同构）
@@ -41,6 +52,12 @@ type RecallFilter struct {
 	MinScore    float64
 	TopK        int
 	MaxAgeHours int
+	// IncludeQuarantined 默认 false：被隔离条目不会被召回（即不会注入 prompt）。
+	// 仅审计 / 调试用途下允许置为 true（如 /api/memory/audit 端点）。
+	IncludeQuarantined bool
+	// IncludeSuperseded 默认 false：被新条目取代的历史记忆不参与召回，
+	// 避免"用户已搬到上海"的事实被旧的"在北京"覆盖。审计端点可显式打开。
+	IncludeSuperseded bool
 }
 
 // ConsolidationConfig 记忆合并配置
@@ -334,6 +351,15 @@ func (m *LongTerm) RecallByFilter(query string, queryEmbedding []float64, filter
 	}
 	var items []scored
 	for i := range m.Items {
+		// 隔离过滤（默认开启）：被 poison detector / 人工标记的不召回，
+		// 但仍然保留在 m.Items 中便于审计端点查看。
+		if m.Items[i].Quarantined && !filter.IncludeQuarantined {
+			continue
+		}
+		// Superseded 过滤（默认开启）：已被新条目取代的不再注入 prompt。
+		if m.Items[i].Superseded && !filter.IncludeSuperseded {
+			continue
+		}
 		// 类别过滤
 		if len(filter.Categories) > 0 && !containsString(filter.Categories, m.Items[i].Category) {
 			continue
@@ -408,7 +434,7 @@ func containsAllTags(itemTags, required []string) bool {
 }
 
 // FilterByCategory 直接返回属于指定 category 的全部条目（不做语义召回）
-// 用于 Profile 等结构化槽位的稳定枚举
+// 用于 Profile 等结构化槽位的稳定枚举。隔离条目会被自动过滤。
 func (m *LongTerm) FilterByCategory(categories []string, limit int) []Item {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -417,6 +443,9 @@ func (m *LongTerm) FilterByCategory(categories []string, limit int) []Item {
 	}
 	var result []Item
 	for i := range m.Items {
+		if m.Items[i].Quarantined || m.Items[i].Superseded {
+			continue
+		}
 		if containsString(categories, m.Items[i].Category) {
 			result = append(result, m.Items[i])
 			if limit > 0 && len(result) >= limit {
@@ -425,6 +454,165 @@ func (m *LongTerm) FilterByCategory(categories []string, limit int) []Item {
 		}
 	}
 	return result
+}
+
+// Quarantine 把指定 ID 的条目标记为隔离，附原因。
+// 物理上不删除——便于事后审计 + 误判恢复。返回是否找到该条目。
+func (m *LongTerm) Quarantine(id int, reason string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.Items {
+		if m.Items[i].ID == id {
+			m.Items[i].Quarantined = true
+			m.Items[i].QuarantineReason = reason
+			return true
+		}
+	}
+	return false
+}
+
+// Unquarantine 解除隔离。审计端点 / 人工复查后调用。
+func (m *LongTerm) Unquarantine(id int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.Items {
+		if m.Items[i].ID == id {
+			m.Items[i].Quarantined = false
+			m.Items[i].QuarantineReason = ""
+			return true
+		}
+	}
+	return false
+}
+
+// QuarantinedItems 返回所有被隔离的条目（持读锁拷贝）。供审计 / 前端展示使用。
+func (m *LongTerm) QuarantinedItems() []Item {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []Item
+	for _, it := range m.Items {
+		if it.Quarantined {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// ─────────────────────────── 矛盾治理（V1）─────────────────────────────
+
+// ConflictCandidate 是 ConflictCandidates 返回的"疑似冲突"单元。
+// Score = cosine(emb, candidate.Embedding)；调用方按需用 LLM-judge 确认。
+type ConflictCandidate struct {
+	Item  Item
+	Score float64
+}
+
+// ConflictCandidates 返回与 (emb, category) 在指定相似度区间内的候选条目。
+//
+// 设计意图：
+//   - 与 Store 的 dedup 阈值（≥0.95）不同——这里筛的是"语义同主题但不到完全重复"，
+//     正好是"我喜欢猫" vs "我不喜欢猫" 这种潜在矛盾的特征区间；
+//   - 仅匹配同 category 的条目——identity 不会与 preference 冲突；
+//   - 排除已 Superseded / Quarantined 的条目；
+//   - domain 层只做"提名"，不做语义判断（LLM-judge 在 application 层）。
+//
+// minSim ≤ 0 时使用 0.75 默认下界；maxSim ≤ 0 时使用 dedup 阈值（默认 0.95）。
+func (m *LongTerm) ConflictCandidates(emb []float64, category string, minSim, maxSim float64) []ConflictCandidate {
+	if len(emb) == 0 || category == "" {
+		return nil
+	}
+	if minSim <= 0 {
+		minSim = 0.75
+	}
+	if maxSim <= 0 {
+		if m.consolidationCfg != nil {
+			maxSim = m.consolidationCfg.DedupThreshold
+		} else {
+			maxSim = 0.95
+		}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []ConflictCandidate
+	for i := range m.Items {
+		it := m.Items[i]
+		if it.Superseded || it.Quarantined {
+			continue
+		}
+		if it.Category != category {
+			continue
+		}
+		if len(it.Embedding) != len(emb) {
+			continue
+		}
+		sim := Cosine(emb, it.Embedding)
+		if sim >= minSim && sim < maxSim {
+			out = append(out, ConflictCandidate{Item: it, Score: sim})
+		}
+	}
+	return out
+}
+
+// MarkSuperseded 把一组旧条目标为 Superseded，并在新条目（newID）的
+// Supersedes 数组里登记替代关系。原子操作（持写锁），保证审计可追溯。
+//
+// newID == 0 表示新条目尚未确定 ID（少见，调用方应在 Store 之后再调用本方法）。
+// 返回真正被标记为 superseded 的旧条目 ID 列表（已存在的、未被排除的）。
+func (m *LongTerm) MarkSuperseded(oldIDs []int, newID int) []int {
+	if len(oldIDs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	oldSet := make(map[int]bool, len(oldIDs))
+	for _, id := range oldIDs {
+		oldSet[id] = true
+	}
+	var marked []int
+	for i := range m.Items {
+		if oldSet[m.Items[i].ID] && !m.Items[i].Superseded {
+			m.Items[i].Superseded = true
+			m.Items[i].SupersededAt = now
+			marked = append(marked, m.Items[i].ID)
+		}
+	}
+	if newID > 0 && len(marked) > 0 {
+		for i := range m.Items {
+			if m.Items[i].ID == newID {
+				m.Items[i].Supersedes = appendUniqueInt(m.Items[i].Supersedes, marked...)
+				break
+			}
+		}
+	}
+	return marked
+}
+
+// SupersededItems 返回所有 Superseded=true 的条目（审计用）
+func (m *LongTerm) SupersededItems() []Item {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []Item
+	for _, it := range m.Items {
+		if it.Superseded {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+func appendUniqueInt(s []int, vals ...int) []int {
+	seen := make(map[int]bool, len(s))
+	for _, x := range s {
+		seen[x] = true
+	}
+	for _, v := range vals {
+		if !seen[v] {
+			s = append(s, v)
+			seen[v] = true
+		}
+	}
+	return s
 }
 
 // Consolidate 执行记忆合并：衰减 → 去重+合并 → 过期淘汰

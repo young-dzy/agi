@@ -76,6 +76,15 @@ func BootstrapSchema(pg *sql.DB) {
 		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS slot_hint TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_lti_category ON long_term_memory(category)`,
 		`CREATE INDEX IF NOT EXISTS idx_lti_tags     ON long_term_memory USING GIN(tags)`,
+		// 投毒防御：被 poison detector / 人工标记隔离的条目，不召回但保留证据
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS quarantined        BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS quarantine_reason  TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_lti_quarantined ON long_term_memory(quarantined) WHERE quarantined`,
+		// 矛盾治理：被新条目取代的历史记忆，不召回但保留以便审计回滚
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS superseded     BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS superseded_at  TIMESTAMP`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS supersedes     INT[] NOT NULL DEFAULT '{}'`,
+		`CREATE INDEX IF NOT EXISTS idx_lti_superseded ON long_term_memory(superseded) WHERE superseded`,
 		`CREATE TABLE IF NOT EXISTS rag_chunks (
 			id          BIGSERIAL PRIMARY KEY,
 			doc_hash    TEXT NOT NULL,

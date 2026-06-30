@@ -37,6 +37,10 @@ func (s *Server) registerRoutes() {
 	http.HandleFunc("/api/documents", s.documents)
 	http.HandleFunc("/api/documents/", s.documentByID)
 	http.HandleFunc("/api/memory", s.memory)
+	http.HandleFunc("/api/memory/quarantine", s.memoryQuarantine)
+	http.HandleFunc("/api/memory/quarantined", s.memoryQuarantined)
+	http.HandleFunc("/api/memory/unquarantine", s.memoryUnquarantine)
+	http.HandleFunc("/api/memory/superseded", s.memorySuperseded)
 	http.HandleFunc("/api/tools", s.toolsList)
 	http.HandleFunc("/api/tools/mcp", s.registerMCPTool)
 	http.HandleFunc("/api/snapshots", s.snapshots)
@@ -323,6 +327,63 @@ func (s *Server) memory(w http.ResponseWriter, r *http.Request) {
 		"short_term": s.agent.ShortTerm().Snapshot(),
 		"long_term":  s.agent.LongTerm().Snapshot(),
 		"preference": s.agent.Preferences().Snapshot(),
+	})
+}
+
+// GET /api/memory/quarantined — 列出所有被隔离（疑似投毒）的 LTM 条目，
+// 用于审计端：管理员/用户可在前端复查后调 unquarantine 恢复，或手动确认删除。
+func (s *Server) memoryQuarantined(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]interface{}{
+		"items": s.agent.QuarantinedMemories(),
+	})
+}
+
+// POST /api/memory/quarantine — 把指定 LTM 条目标记为隔离（不召回、保留）
+// body: {"id": 123, "reason": "manual_review"}
+func (s *Server) memoryQuarantine(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID     int    `json:"id"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID <= 0 {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	reason := req.Reason
+	if reason == "" {
+		reason = "manual"
+	}
+	ok := s.agent.QuarantineMemory(req.ID, reason)
+	writeJSON(w, map[string]interface{}{"ok": ok, "id": req.ID})
+}
+
+// POST /api/memory/unquarantine — 解除隔离（误判恢复用）
+// body: {"id": 123}
+func (s *Server) memoryUnquarantine(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID int `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID <= 0 {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	ok := s.agent.UnquarantineMemory(req.ID)
+	writeJSON(w, map[string]interface{}{"ok": ok, "id": req.ID})
+}
+
+// GET /api/memory/superseded — 列出被新条目取代的历史 LTM。
+// 仍保留在 PG 中（不删），但默认不参与召回。审计用。
+func (s *Server) memorySuperseded(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]interface{}{
+		"items": s.agent.SupersededMemories(),
 	})
 }
 

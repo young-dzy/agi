@@ -157,7 +157,15 @@ func (rt *GraphRuntime) raceGroup(ctx context.Context, g raceGroup, wg *sync.Wai
 	}
 
 	ch := make(chan raceResult, len(g.NodeIDs))
-	raceCtx, cancel := context.WithCancel(ctx)
+	// 竞速 ctx：在父 ctx 之上叠加 RaceTimeout，整组超时则全部取消。
+	// RaceTimeoutMs <= 0 时退化为单纯的 WithCancel（保留首胜取消语义）。
+	var raceCtx context.Context
+	var cancel context.CancelFunc
+	if rt.cfg.RaceTimeoutMs > 0 {
+		raceCtx, cancel = context.WithTimeout(ctx, time.Duration(rt.cfg.RaceTimeoutMs)*time.Millisecond)
+	} else {
+		raceCtx, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
 
 	// 并行启动所有竞速节点
@@ -276,41 +284,83 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 	for k, v := range node.Params {
 		params[k] = v
 	}
-	run := func() (string, error) {
+
+	// run 单次执行：优先用 ExecuteStructured（带错误分类），其次 ExecuteCtx（带 ctx），最后回落 Execute。
+	// 返回 (结果字符串, 是否可重试, error)。可重试标志驱动外层重试循环——
+	// 4xx / 参数错 / cancelled 不应重试，5xx / 网络抖动 / timeout 才重试。
+	run := func(runCtx context.Context) (string, bool, error) {
 		if node.Type == graph.NodeTypeSubAgent {
 			sa, ok := rt.agent.subagents.get(node.AgentName)
 			if !ok {
-				return "", fmt.Errorf("子 Agent %s 不存在", node.AgentName)
+				return "", false, fmt.Errorf("子 Agent %s 不存在", node.AgentName)
 			}
-			return sa.Run(ctx, SubAgentTask{
+			res, err := sa.Run(runCtx, SubAgentTask{
 				ID:       string(nodeID),
 				Goal:     node.Goal,
 				Query:    rt.task.Query,
 				Upstream: rt.upstreamResults(node),
 			})
+			// 子 Agent 错误默认可重试（保守策略，子 Agent 内部可能是 LLM 抖动）
+			return res, err != nil, err
 		}
 		t, ok := rt.tools[node.ToolName]
 		if !ok {
-			return "", fmt.Errorf("工具 %s 不在允许列表中", node.ToolName)
+			return "", false, fmt.Errorf("工具 %s 不在允许列表中", node.ToolName)
 		}
-		return t.Execute(params)
+		// 优先：结构化接口
+		if t.ExecuteStructured != nil {
+			r := t.ExecuteStructured(runCtx, params)
+			if r.Success {
+				return r.Payload, false, nil
+			}
+			retryable := r.Error != nil && r.Error.Retryable
+			return r.Payload, retryable, r.Error
+		}
+		// 其次：带 ctx 的字符串接口
+		if t.ExecuteCtx != nil {
+			s, err := t.ExecuteCtx(runCtx, params)
+			return s, err != nil, err
+		}
+		// 兜底：老 Execute（无 ctx）—— 重试间会被 ctx.Done 截断
+		s, err := t.Execute(params)
+		return s, err != nil, err
 	}
 
 	var result string
 	var execErr error
 	maxRetries := rt.agent.cfg.MaxRetries
 	retryDelay := time.Duration(rt.agent.cfg.RetryDelayMs) * time.Millisecond
+	stepTimeout := time.Duration(rt.agent.cfg.StepTimeoutMs) * time.Millisecond
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if ctx.Err() != nil {
 			rt.graph.SetNodeStatus(nodeID, graph.StatusCancelled)
 			return "", fmt.Errorf("被用户中断")
 		}
-		result, execErr = run()
+
+		// 单步 ctx：每次 attempt 都派生一个新的 timeout ctx，
+		// 这样上一次的超时不会污染下一次。stepTimeout <= 0 时退化为父 ctx。
+		var attemptCtx context.Context
+		var attemptCancel context.CancelFunc
+		if stepTimeout > 0 {
+			attemptCtx, attemptCancel = context.WithTimeout(ctx, stepTimeout)
+		} else {
+			attemptCtx, attemptCancel = context.WithCancel(ctx)
+		}
+
+		var retryable bool
+		result, retryable, execErr = run(attemptCtx)
+		attemptCancel()
+
 		if execErr == nil {
 			break
 		}
 		rt.graph.SetNodeRetryCount(nodeID, attempt+1)
+
+		// 不可重试错误（4xx / 参数错 / cancelled）→ 立刻退出
+		if !retryable {
+			break
+		}
 		if attempt < maxRetries-1 {
 			time.Sleep(retryDelay)
 		}

@@ -28,11 +28,15 @@ type GraphConfig struct {
 	MaxParallel   int  `yaml:"max_parallel"`    // 最大并行数，默认 2
 	RaceTimeoutMs int  `yaml:"race_timeout_ms"` // 竞速组超时（毫秒），默认 30000
 	EnableRacing  bool `yaml:"enable_racing"`   // 是否启用竞速，默认 true
+	// Plan-and-ReAct
+	ReplanEnabled  bool // 每层执行后触发 LLM replan
+	MaxReplan      int  // 单次任务 replan 上限
+	ReplanOnFailed bool // 节点失败时触发局部 replan
 }
 
 // DefaultGraphConfig 返回默认配置
 func DefaultGraphConfig() GraphConfig {
-	return GraphConfig{MaxParallel: 2, RaceTimeoutMs: 30000, EnableRacing: true}
+	return GraphConfig{MaxParallel: 2, RaceTimeoutMs: 30000, EnableRacing: true, MaxReplan: 2}
 }
 
 // ─────────────────────────────── GraphResult ──────────────────────────────────
@@ -75,6 +79,11 @@ type GraphRuntime struct {
 	errors  map[graph.NodeID]string
 	task    *TaskState        // 共享 TaskState，用于快照 / 中断恢复
 	onEvent func(StreamEvent) // SSE 事件回调（nil = 静默模式）
+
+	// Plan-and-ReAct 需要的重规划上下文
+	query      string
+	memPrefix  string
+	replanUsed int // 已消耗的 replan 次数
 }
 
 // NewGraphRuntime 创建图运行时
@@ -95,30 +104,53 @@ func NewGraphRuntime(tg *graph.TaskGraph, agent *UnifiedAgent, cfg GraphConfig, 
 	}
 }
 
-// Execute 执行整个任务图，逐层并行调度
+// SetReplanContext 注入 replan 时需要的用户 query 和记忆前缀。
+// 由 runReAct 在创建 runtime 后调用；不设置则 replan 拿不到 memPrefix，仍能工作。
+func (rt *GraphRuntime) SetReplanContext(query, memPrefix string) {
+	rt.query = query
+	rt.memPrefix = memPrefix
+}
+
+// Execute 执行整个任务图。
+//
+// 迭代式调度：每一轮取当前入度为 0 的节点作为一层并行执行；执行完 →
+// 若开启 Replan 且额度未耗尽 → 让 LLM 决定是否追加节点 → 下一轮再取 ReadyNodes。
+// 直到没有 pending 节点为止（正常完成）或 ctx 取消（中断）。
+//
+// 与旧实现"预先算 levels 一次遍历"的区别：允许运行期动态注入节点。
 func (rt *GraphRuntime) Execute(ctx context.Context) *GraphResult {
-	levels, err := rt.graph.TopologicalLevels()
-	if err != nil {
+	// 首次校验（悬空依赖 + 环）
+	if err := rt.graph.Validate(); err != nil {
 		log.Printf("⚠️  GraphRuntime: 图校验失败 %v", err)
 		return &GraphResult{InterruptedMsg: fmt.Sprintf("图校验失败: %v", err)}
 	}
 
-	// 推送图就绪事件
+	// 推送初始图快照
 	if rt.onEvent != nil {
+		levels, _ := rt.graph.TopologicalLevels()
 		rt.onEvent(NewStreamEvent("graph_ready", map[string]interface{}{
 			"levels": levels,
 			"nodes":  rt.graph.Nodes,
 		}))
 	}
 
-	for levelIdx, level := range levels {
+	layerIdx := 0
+	for {
 		if ctx.Err() != nil {
-			return rt.buildInterruptedResult(ctx, fmt.Sprintf("在第 %d 层执行前被中断", levelIdx))
+			return rt.buildInterruptedResult(ctx, fmt.Sprintf("在第 %d 层执行前被中断", layerIdx))
 		}
+
+		// 取当前所有 pending 且入度为 0 的节点作为本层
+		level := rt.graph.ReadyNodes()
+		if len(level) == 0 {
+			break // 没有可执行节点 → 图跑完
+		}
+
+		// 稳定顺序（NodeID 字典序），避免 map 遍历带来的竞速组分组抖动
+		sort.Slice(level, func(i, j int) bool { return level[i] < level[j] })
 
 		// 按 race_group 分组：同组竞速，其余独立并行
 		groups := rt.groupByRace(level)
-
 		var wg sync.WaitGroup
 		for _, g := range groups {
 			if g.RaceGroup != "" && rt.cfg.EnableRacing {
@@ -133,16 +165,83 @@ func (rt *GraphRuntime) Execute(ctx context.Context) *GraphResult {
 		}
 		wg.Wait()
 
-		// 检查 ctx
+		// 把已完成节点从入度表中"移除"，让下游进入 ready 队列
+		for _, id := range level {
+			n := rt.graph.Nodes[id]
+			// 只有终态节点才推进下游（Done / Skipped / Failed / Cancelled 都算终态）
+			if n.Status == graph.StatusPending || n.Status == graph.StatusRunning {
+				continue
+			}
+			rt.graph.MarkDone(id)
+		}
+
 		if ctx.Err() != nil {
-			return rt.buildInterruptedResult(ctx, fmt.Sprintf("在第 %d 层执行后被中断", levelIdx))
+			return rt.buildInterruptedResult(ctx, fmt.Sprintf("在第 %d 层执行后被中断", layerIdx))
 		}
 
 		// 持久化快照
 		rt.agent.saveSnapshot(rt.task)
+
+		// ── Plan-and-ReAct: 层间 replan ─────────────────────────────
+		if rt.cfg.ReplanEnabled && rt.replanUsed < rt.cfg.MaxReplan {
+			added := rt.tryReplan(ctx, "layer_done", nil)
+			if len(added) > 0 {
+				rt.emitReplanEvent("layer_done", added)
+			}
+		}
+
+		layerIdx++
 	}
 
 	return rt.buildResult()
+}
+
+// tryReplan 让 LLM 基于当前图状态决定是否追加节点。返回追加的节点 id 列表。
+// 消耗一次 replanUsed 额度；解析失败或 LLM 决定不追加则返回空。
+func (rt *GraphRuntime) tryReplan(ctx context.Context, reason string, failed *graph.Node) []graph.NodeID {
+	rt.replanUsed++
+	rc := replanContext{
+		Query:    rt.query,
+		Reason:   reason,
+		Failed:   failed,
+		Snapshot: buildSnapshot(rt.graph),
+	}
+	newNodes := rt.agent.llmReplan(ctx, rc, rt.tools, rt.memPrefix)
+	if len(newNodes) == 0 {
+		return nil
+	}
+	added := rt.graph.AddNodes(newNodes)
+	// 追加后立即校验，检出环立刻回滚：把刚追加的节点标 Cancelled 并从图剔除依赖
+	if err := rt.graph.Validate(); err != nil {
+		log.Printf("⚠️  Replan 引入非法结构 %v，忽略追加", err)
+		for _, id := range added {
+			rt.graph.SetNodeStatus(id, graph.StatusCancelled)
+		}
+		return nil
+	}
+	return added
+}
+
+// emitReplanEvent 推送 SSE replan 事件
+func (rt *GraphRuntime) emitReplanEvent(reason string, added []graph.NodeID) {
+	if rt.onEvent == nil {
+		return
+	}
+	items := make([]map[string]string, 0, len(added))
+	for _, id := range added {
+		n := rt.graph.Nodes[id]
+		items = append(items, map[string]string{
+			"id":       string(id),
+			"executor": executorName(n),
+			"reason":   n.Name,
+		})
+	}
+	rt.onEvent(NewStreamEvent("replan", map[string]interface{}{
+		"reason":     reason,
+		"added":      items,
+		"used_count": rt.replanUsed,
+		"max_count":  rt.cfg.MaxReplan,
+	}))
 }
 
 // ─────────────────────────── 竞速执行（First-success-wins）──────────────────
@@ -188,12 +287,14 @@ func (rt *GraphRuntime) raceGroup(ctx context.Context, g raceGroup, wg *sync.Wai
 
 	// 等待首个成功结果
 	winnerFound := false
+	winnerID := graph.NodeID("")
 	var lastErr error
 	for i := 0; i < len(g.NodeIDs); i++ {
 		r := <-ch
 		if r.err == nil && !winnerFound {
 			// 首个成功 → 取消其余 + 标记胜出
 			winnerFound = true
+			winnerID = r.nodeID
 			cancel()
 			rt.mu.Lock()
 			rt.results[r.nodeID] = r.result
@@ -216,9 +317,17 @@ func (rt *GraphRuntime) raceGroup(ctx context.Context, g raceGroup, wg *sync.Wai
 		} else if !winnerFound {
 			lastErr = r.err
 		}
-		// 非胜出的节点标记 skipped
-		if winnerFound && r.nodeID != r.nodeID {
-			rt.graph.SetNodeStatus(r.nodeID, graph.StatusSkipped)
+	}
+
+	// 竞速结束后，把非胜出节点全部标 Skipped，让下游可以推进
+	if winnerFound {
+		for _, id := range g.NodeIDs {
+			if id == winnerID {
+				continue
+			}
+			if rt.graph.Nodes[id].Status != graph.StatusDone {
+				rt.graph.SetNodeStatus(id, graph.StatusSkipped)
+			}
 		}
 	}
 
@@ -380,6 +489,18 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 		rt.agent.pctx.recordToolCall(promptctx.ToolCallTrace{
 			ToolName: executor, Success: false, Summary: errMsg,
 		})
+
+		// Plan-and-ReAct: 节点失败时触发局部 replan（补一个替代节点）
+		if rt.cfg.ReplanEnabled && rt.cfg.ReplanOnFailed && rt.replanUsed < rt.cfg.MaxReplan {
+			// tryReplan 是并发安全的：AddNodes 在 Execute 主循环单线程调用，
+			// 但这里在节点执行 goroutine 内触发，需要加锁保护 graph 的写路径
+			rt.mu.Lock()
+			added := rt.tryReplan(ctx, "node_failed", node)
+			rt.mu.Unlock()
+			if len(added) > 0 {
+				rt.emitReplanEvent("node_failed", added)
+			}
+		}
 		return "", execErr
 	}
 

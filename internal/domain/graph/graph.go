@@ -233,6 +233,47 @@ func (tg *TaskGraph) SuccessfulResults() []string {
 	return results
 }
 
+// AddNodes 动态追加节点到已有图（Replanner 用）。
+//
+// 追加的节点：
+//   - ID 冲突则跳过（避免覆盖已完成的节点结果）
+//   - depends_on 指向不存在的节点会被静默丢弃（保证追加节点可执行）
+//   - 缓存的 levels 会被清空，下次 TopologicalLevels 重新分层
+//
+// 返回实际追加的节点 ID 列表。调用方应在 Validate 通过后再让 Runtime 继续执行。
+func (tg *TaskGraph) AddNodes(nodes []*Node) []NodeID {
+	var added []NodeID
+	for _, n := range nodes {
+		if _, exists := tg.Nodes[n.ID]; exists {
+			continue
+		}
+		n.Status = StatusPending
+		// 过滤悬空依赖：只保留指向图中已存在节点的依赖
+		var validDeps []NodeID
+		for _, dep := range n.DependsOn {
+			if _, ok := tg.Nodes[dep]; ok {
+				validDeps = append(validDeps, dep)
+			}
+		}
+		n.DependsOn = validDeps
+
+		tg.Nodes[n.ID] = n
+		tg.AdjList[n.ID] = nil
+		tg.InDegree[n.ID] = 0
+		for _, dep := range validDeps {
+			// 若依赖节点已完成（InDegree=-1），新节点入度不再增加，可立即就绪
+			if tg.InDegree[dep] >= 0 {
+				tg.InDegree[n.ID]++
+			}
+			tg.AdjList[dep] = append(tg.AdjList[dep], n.ID)
+		}
+		added = append(added, n.ID)
+	}
+	// 拓扑层缓存失效
+	tg.levels = nil
+	return added
+}
+
 // Summary 返回图的可读摘要。
 func (tg *TaskGraph) Summary() string {
 	levels, err := tg.TopologicalLevels()

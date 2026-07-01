@@ -159,11 +159,15 @@ type SecurityConfig struct {
 	SecAllowlist     []string
 }
 
-// GraphRuntimeConfig 图运行时配置（并行调度 + 竞速）
+// GraphRuntimeConfig 图运行时配置（并行调度 + 竞速 + Replan）
 type GraphRuntimeConfig struct {
 	GraphMaxParallel   int
 	GraphRaceTimeoutMs int
 	GraphEnableRacing  bool
+	// Plan-and-ReAct：每层执行完让 LLM 看观察 → 决定追加/替换节点
+	GraphReplanEnabled  bool
+	GraphMaxReplan      int  // 单次任务最多 replan 次数（含层间 + 失败恢复），防止死循环
+	GraphReplanOnFailed bool // 节点失败时是否触发 LLM 局部 replan（否则纯 retry）
 }
 
 // AuthConfig 认证 / JWT 配置。
@@ -297,9 +301,12 @@ type yamlFile struct {
 		Allowlist        []string `yaml:"allowlist"`
 	} `yaml:"security"`
 	GraphRuntime struct {
-		MaxParallel   int  `yaml:"max_parallel"`
-		RaceTimeoutMs int  `yaml:"race_timeout_ms"`
-		EnableRacing  bool `yaml:"enable_racing"`
+		MaxParallel    int  `yaml:"max_parallel"`
+		RaceTimeoutMs  int  `yaml:"race_timeout_ms"`
+		EnableRacing   bool `yaml:"enable_racing"`
+		ReplanEnabled  bool `yaml:"replan_enabled"`
+		MaxReplan      int  `yaml:"max_replan"`
+		ReplanOnFailed bool `yaml:"replan_on_failed"`
 	} `yaml:"graph_runtime"`
 	Auth struct {
 		JWTSecret string `yaml:"jwt_secret"`
@@ -423,9 +430,12 @@ func DefaultConfig() *APIConfig {
 			SecAllowlist:     y.Security.Allowlist,
 		},
 		GraphRuntimeConfig: GraphRuntimeConfig{
-			GraphMaxParallel:   y.GraphRuntime.MaxParallel,
-			GraphRaceTimeoutMs: y.GraphRuntime.RaceTimeoutMs,
-			GraphEnableRacing:  y.GraphRuntime.EnableRacing,
+			GraphMaxParallel:    y.GraphRuntime.MaxParallel,
+			GraphRaceTimeoutMs:  y.GraphRuntime.RaceTimeoutMs,
+			GraphEnableRacing:   y.GraphRuntime.EnableRacing,
+			GraphReplanEnabled:  y.GraphRuntime.ReplanEnabled,
+			GraphMaxReplan:      y.GraphRuntime.MaxReplan,
+			GraphReplanOnFailed: y.GraphRuntime.ReplanOnFailed,
 		},
 		AuthConfig: AuthConfig{
 			JWTSecret:   y.Auth.JWTSecret,
@@ -549,5 +559,8 @@ func applyDefaults(c *APIConfig) {
 	}
 	if c.GraphRaceTimeoutMs <= 0 {
 		c.GraphRaceTimeoutMs = 30000
+	}
+	if c.GraphMaxReplan <= 0 {
+		c.GraphMaxReplan = 2
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -73,11 +74,15 @@ func (a *UnifiedAgent) runReAct(
 
 	// ── Step 3: GraphRuntime 并行执行 ─────────────────────────────────
 	gcfg := GraphConfig{
-		MaxParallel:   a.cfg.GraphMaxParallel,
-		RaceTimeoutMs: a.cfg.GraphRaceTimeoutMs,
-		EnableRacing:  a.cfg.GraphEnableRacing,
+		MaxParallel:    a.cfg.GraphMaxParallel,
+		RaceTimeoutMs:  a.cfg.GraphRaceTimeoutMs,
+		EnableRacing:   a.cfg.GraphEnableRacing,
+		ReplanEnabled:  a.cfg.GraphReplanEnabled,
+		MaxReplan:      a.cfg.GraphMaxReplan,
+		ReplanOnFailed: a.cfg.GraphReplanOnFailed,
 	}
 	rt := NewGraphRuntime(tg, a, gcfg, ts, task, onEvent)
+	rt.SetReplanContext(query, memPrefix)
 	graphResult := rt.Execute(ctx)
 
 	// 从 GraphResult 收集 ReAct 步骤
@@ -125,32 +130,41 @@ func graphToTaskSteps(tg *graph.TaskGraph) []TaskStep {
 	return steps
 }
 
-// graphResultToReActSteps 从图结果中提取 ReAct 步骤
+// graphResultToReActSteps 从图结果中提取 ReAct 步骤（Response.Steps 兜底）。
+//
+// 前端主渲染路径依赖 SSE 增量事件（executeSingleNode 内推送），
+// 这里只需按稳定顺序把节点转成 Thought/Action/Observation 三元组。
+// 用节点 ID 字典序而非拓扑层级——Execute 结束后 InDegree 已被 MarkDone 消耗，
+// TopologicalLevels 重算不再可靠；且 replan 追加的节点 ID 前缀为 "r"，
+// 天然排在原节点之后，符合执行顺序。
 func graphResultToReActSteps(tg *graph.TaskGraph, gr *GraphResult) []ReActStep {
-	levels, _ := tg.TopologicalLevels()
+	ids := make([]graph.NodeID, 0, len(tg.Nodes))
+	for id := range tg.Nodes {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
 	var steps []ReActStep
-	for _, level := range levels {
-		for _, id := range level {
-			n := tg.Nodes[id]
-			steps = append(steps, ReActStep{Type: StepThought, Content: n.Name})
-			executor := n.ToolName
-			if n.Type == graph.NodeTypeSubAgent {
-				executor = n.AgentName
-			}
-			steps = append(steps, ReActStep{
-				Type: StepAction, Content: fmt.Sprintf("调用 %s", executor),
-				Tool: executor, Params: n.Params,
-			})
-			switch n.Status {
-			case graph.StatusDone:
-				steps = append(steps, ReActStep{Type: StepObservation, Content: n.Result})
-			case graph.StatusFailed:
-				steps = append(steps, ReActStep{Type: StepObservation, Content: fmt.Sprintf("执行失败: %s", n.Error)})
-			case graph.StatusSkipped:
-				steps = append(steps, ReActStep{Type: StepObservation, Content: "[竞速跳过] 其他节点已胜出"})
-			case graph.StatusCancelled:
-				steps = append(steps, ReActStep{Type: StepObservation, Content: "[已中断]"})
-			}
+	for _, id := range ids {
+		n := tg.Nodes[id]
+		steps = append(steps, ReActStep{Type: StepThought, Content: n.Name})
+		executor := n.ToolName
+		if n.Type == graph.NodeTypeSubAgent {
+			executor = n.AgentName
+		}
+		steps = append(steps, ReActStep{
+			Type: StepAction, Content: fmt.Sprintf("调用 %s", executor),
+			Tool: executor, Params: n.Params,
+		})
+		switch n.Status {
+		case graph.StatusDone:
+			steps = append(steps, ReActStep{Type: StepObservation, Content: n.Result})
+		case graph.StatusFailed:
+			steps = append(steps, ReActStep{Type: StepObservation, Content: fmt.Sprintf("执行失败: %s", n.Error)})
+		case graph.StatusSkipped:
+			steps = append(steps, ReActStep{Type: StepObservation, Content: "[竞速跳过] 其他节点已胜出"})
+		case graph.StatusCancelled:
+			steps = append(steps, ReActStep{Type: StepObservation, Content: "[已中断]"})
 		}
 	}
 	return steps

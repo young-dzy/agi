@@ -116,11 +116,14 @@ security:
     - "go"
     - "java"
 
-# ===== 图运行时（ReAct 并行调度 + 竞速）=====
+# ===== 图运行时（ReAct 并行调度 + 竞速 + Replan）=====
 graph_runtime:
   max_parallel: 2            # 最大并行执行节点数
   race_timeout_ms: 30000     # 竞速组内节点超时
   enable_racing: true        # 是否启用竞速机制（First-success-wins）
+  replan_enabled: true       # 每层执行完让 LLM 看观察 → 决定追加/替换节点（Plan-and-ReAct）
+  max_replan: 2              # 单次任务最多 replan 次数上限，防止死循环
+  replan_on_failed: true     # 节点失败时触发局部 replan（补一个替代节点）
 
 # ===== 认证 / JWT =====
 # 生产环境强制通过环境变量 JWT_SECRET 注入，至少 32 字节随机

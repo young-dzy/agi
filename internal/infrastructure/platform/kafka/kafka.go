@@ -3,10 +3,10 @@ package kafka
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"agi-assistant/config"
+	"agi-assistant/internal/pkg/logger"
 
 	kafkago "github.com/segmentio/kafka-go"
 )
@@ -21,17 +21,17 @@ func Connect(cfg config.KafkaConfig) (*kafkago.Writer, string) {
 		BatchTimeout: 10 * time.Millisecond,
 	}
 	if len(cfg.KafkaBrokers) == 0 {
-		log.Printf("⚠️  Kafka 未配置 broker (事件将输出到日志)")
+		logger.L().Warn("kafka broker not configured, events will fall back to log")
 		return w, "disconnected"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	conn, err := kafkago.DialLeader(ctx, "tcp", cfg.KafkaBrokers[0], cfg.KafkaTopic, 0)
 	if err != nil {
-		log.Printf("⚠️  Kafka 连接失败: %v (事件将输出到日志)", err)
+		logger.L().Warn("kafka connect failed, events will fall back to log", "err", err)
 		return w, "disconnected"
 	}
 	conn.Close()
-	log.Println("✅ Kafka 已连接:", cfg.KafkaBrokers)
+	logger.L().Info("kafka connected", "brokers", cfg.KafkaBrokers)
 	return w, "connected"
 }

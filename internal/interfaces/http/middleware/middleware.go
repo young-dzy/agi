@@ -19,16 +19,22 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"time"
+
+	"agi-assistant/internal/pkg/logger"
+	"agi-assistant/internal/usercontext"
 )
 
 // ─────────────────────────────── RequestID ────────────────────────────────
 
-// requestIDKey 是 context 中存放 requestID 的私有键，避免与外部键冲突
+// requestIDKey 是 context 中存放 requestID 的私有键，避免与外部键冲突。
+// 保留此 key 是为了向后兼容旧的 RequestIDFromContext 直接读；
+// 同时中间件也会把 requestID 写入 usercontext.WithRequestID，
+// 让 domain / infra 层可以只依赖 usercontext 拿到同一 ID。
 type requestIDKey struct{}
 
 // RequestIDHeader 是客户端 / 服务端约定的 header 名
@@ -37,7 +43,7 @@ const RequestIDHeader = "X-Request-Id"
 // RequestID 中间件：
 //   - 从入站 header 读取（让客户端可以指定 ID 用于跨服务追踪）
 //   - 没有则生成 16 字节十六进制（128 位，碰撞概率可忽略）
-//   - 写入 ctx + response header
+//   - 写入 ctx（自身私有 key + usercontext 共享 key）+ response header
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(RequestIDHeader)
@@ -46,13 +52,20 @@ func RequestID(next http.Handler) http.Handler {
 		}
 		w.Header().Set(RequestIDHeader, id)
 		ctx := context.WithValue(r.Context(), requestIDKey{}, id)
+		ctx = usercontext.WithRequestID(ctx, id)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 // RequestIDFromContext 从 ctx 取出 requestID。空时返回 "-" 便于日志拼接。
+//
+// 兼容读取顺序：先看本包私有 key（历史调用点），再看 usercontext（新调用点）。
+// 两者由 RequestID 中间件同步写入，正常情况都能命中。
 func RequestIDFromContext(ctx context.Context) string {
 	if v, ok := ctx.Value(requestIDKey{}).(string); ok && v != "" {
+		return v
+	}
+	if v := usercontext.RequestIDFromContext(ctx); v != "" {
 		return v
 	}
 	return "-"
@@ -108,9 +121,11 @@ func (r *responseRecorder) Flush() {
 
 // AccessLog 中间件：在 handler 退出后打一条访问日志。
 //
-// 字段顺序（便于 grep 和后续 zap/slog 平滑迁移）：
+// 结构化字段（slog 可被 ELK / Loki 直接解析）：
 //
-//	[ACCESS] req=<id> method=<X> path=<X> status=<X> bytes=<X> dur=<Xms> remote=<X>
+//	msg=access method path status bytes dur_ms remote request_id user_id
+//
+// request_id / user_id 由 contextHandler 从 ctx 自动附加，不必显式带。
 func AccessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -118,13 +133,13 @@ func AccessLog(next http.Handler) http.Handler {
 		next.ServeHTTP(rec, r)
 		dur := time.Since(start)
 
-		// SSE 路径或长请求只打"完成"那一行，避免双倍日志
-		log.Printf("[ACCESS] req=%s method=%s path=%s status=%d bytes=%d dur=%dms remote=%s",
-			RequestIDFromContext(r.Context()),
-			r.Method, r.URL.Path,
-			statusOr200(rec.status), rec.bytesWrote,
-			dur.Milliseconds(),
-			clientIP(r),
+		logger.C(r.Context()).LogAttrs(r.Context(), slog.LevelInfo, "access",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", statusOr200(rec.status)),
+			slog.Int("bytes", rec.bytesWrote),
+			slog.Int64("dur_ms", dur.Milliseconds()),
+			slog.String("remote", clientIP(r)),
 		)
 	})
 }
@@ -162,8 +177,11 @@ func PanicRecover(next http.Handler) http.Handler {
 			if rec := recover(); rec != nil {
 				reqID := RequestIDFromContext(r.Context())
 				// 完整 stack 打到日志，但不返给客户端（避免泄漏内部路径）
-				log.Printf("[PANIC] req=%s path=%s panic=%v\n%s",
-					reqID, r.URL.Path, rec, debug.Stack())
+				logger.C(r.Context()).Error("handler panic",
+					slog.String("path", r.URL.Path),
+					slog.Any("panic", rec),
+					slog.String("stack", string(debug.Stack())),
+				)
 				// 客户端只看到通用 500 + request_id
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)

@@ -27,12 +27,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	"agi-assistant/internal/domain/memory/longterm"
 	"agi-assistant/internal/infrastructure/llm"
 	ltmrepo "agi-assistant/internal/infrastructure/persistence/longterm"
+	"agi-assistant/internal/pkg/logger"
 )
 
 // 抽取来源对应的默认 importance：用户陈述 > AI 派生
@@ -52,8 +52,8 @@ func (a *UnifiedAgent) extractMemoryFromUserMsg(userID, userMsg string) {
 
 	// 闸门 0：整段消息预检——含越狱/PII 模式的整体跳过，不调 LLM
 	if pre := inspectMemoryContent(userMsg); !pre.Safe() {
-		log.Printf("🛡️  [memory-extract:user] 整段拒绝：risk=%s reason=%s match=%q",
-			pre.Risk, pre.Reason, pre.Matched)
+		logger.L().Warn("memory-extract:user rejected whole msg",
+			"user_id", userID, "risk", pre.Risk, "reason", pre.Reason, "match", pre.Matched)
 		return
 	}
 
@@ -82,14 +82,14 @@ func (a *UnifiedAgent) extractMemoryFromExchange(userID, userQuery, reply string
 
 	// 闸门 0a：用户问题预检——问题本身被注入则整对放弃
 	if pre := inspectMemoryContent(userQuery); !pre.Safe() {
-		log.Printf("🛡️  [memory-extract:exchange] query 拒绝：risk=%s reason=%s",
-			pre.Risk, pre.Reason)
+		logger.L().Warn("memory-extract:exchange rejected query",
+			"user_id", userID, "risk", pre.Risk, "reason", pre.Reason)
 		return
 	}
 	// 闸门 0b：AI 回答预检——AI 已被部分越狱时的最后一道防线
 	if pre := inspectMemoryContent(reply); !pre.Safe() {
-		log.Printf("🛡️  [memory-extract:exchange] reply 拒绝：risk=%s reason=%s match=%q",
-			pre.Risk, pre.Reason, pre.Matched)
+		logger.L().Warn("memory-extract:exchange rejected reply",
+			"user_id", userID, "risk", pre.Risk, "reason", pre.Reason, "match", pre.Matched)
 		return
 	}
 
@@ -139,8 +139,9 @@ func (a *UnifiedAgent) runMemExtractAndStore(userID, source, prompt string, impo
 
 		// 闸门 1：单条 k-v 复检
 		if insp := inspectKVPair(k, v); !insp.Safe() {
-			log.Printf("🛡️  [memory-extract:%s] 拒绝写入 k=%q: risk=%s reason=%s match=%q",
-				source, k, insp.Risk, insp.Reason, insp.Matched)
+			logger.L().Warn("memory-extract kv rejected",
+				"source", source, "user_id", userID, "key", k,
+				"risk", insp.Risk, "reason", insp.Reason, "match", insp.Matched)
 			continue
 		}
 
@@ -159,8 +160,8 @@ func (a *UnifiedAgent) runMemExtractAndStore(userID, source, prompt string, impo
 
 		// 闸门 2：拼接后复检
 		if insp := inspectMemoryContent(content); !insp.Safe() {
-			log.Printf("🛡️  [memory-extract:%s] 拼接后命中：risk=%s",
-				source, insp.Risk)
+			logger.L().Warn("memory-extract concat hit",
+				"source", source, "user_id", userID, "risk", insp.Risk)
 			continue
 		}
 
@@ -189,8 +190,9 @@ func (a *UnifiedAgent) runMemExtractAndStore(userID, source, prompt string, impo
 			newID = a.repos.ltm.SaveClassified(userID, content, importance, embJSON, category, tags, slotHint)
 			a.mem.ltm.SyncLastItemPGID(newID)
 		}
-		log.Printf("🧠 [memory-extract:%s] user=%s %s = %s（类别=%s, importance=%.2f）",
-			source, userID, k, v, category, importance)
+		logger.L().Info("memory-extract stored",
+			"source", source, "user_id", userID, "key", k, "value", v,
+			"category", category, "importance", importance)
 
 		// 矛盾检测：仅对 identity/preference/fact 类启用，且必须真实入库（newID>0）
 		// 失败 / LLM 不可用时为 no-op，不影响主流程
@@ -264,13 +266,14 @@ func (a *UnifiedAgent) llmClassifyMemory(content string) (category string, tags 
 func (a *UnifiedAgent) syncConsolidationToDB(result longterm.ConsolidationResult) {
 	if len(result.DeleteFromDB) > 0 {
 		a.repos.ltm.Delete(result.DeleteFromDB)
-		log.Printf("🧹 记忆合并：删除 %d 条（去重=%d, 合并=%d, 过期=%d）",
-			result.Deduped+result.Merged+result.Expired, result.Deduped, result.Merged, result.Expired)
+		logger.L().Info("memory consolidation: deleted",
+			"total", result.Deduped+result.Merged+result.Expired,
+			"deduped", result.Deduped, "merged", result.Merged, "expired", result.Expired)
 	}
 	for _, item := range result.UpdateInDB {
 		embJSON, _ := json.Marshal(item.Embedding)
 		a.repos.ltm.Update(item.ID, item.Content, item.Importance, embJSON)
-		log.Printf("🔗 记忆合并：更新 id=%d", item.ID)
+		logger.L().Info("memory consolidation: updated", "id", item.ID)
 	}
 	if len(result.DecayUpdates) > 0 {
 		updates := make([]ltmrepo.ImportanceUpdate, 0, len(result.DecayUpdates))
@@ -278,6 +281,6 @@ func (a *UnifiedAgent) syncConsolidationToDB(result longterm.ConsolidationResult
 			updates = append(updates, ltmrepo.ImportanceUpdate{ID: d.ID, Importance: d.Importance})
 		}
 		a.repos.ltm.UpdateImportanceBatch(updates)
-		log.Printf("📉 记忆衰减：批量更新 %d 条 importance", len(updates))
+		logger.L().Info("memory decay batch update", "count", len(updates))
 	}
 }

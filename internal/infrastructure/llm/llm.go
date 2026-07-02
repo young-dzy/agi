@@ -2,13 +2,13 @@ package llm
 
 import (
 	"agi-assistant/config"
+	"agi-assistant/internal/pkg/logger"
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -48,7 +48,7 @@ func (c *Client) ChatContext(ctx context.Context, systemPrompt string, messages 
 			if ctx.Err() != nil {
 				return "[已中断]"
 			}
-			log.Printf("LLM API 调用失败: %v，回退到 Mock", err)
+			logger.C(ctx).Warn("LLM API call failed, falling back to mock", "err", err)
 			return c.mock(messages)
 		}
 		return reply
@@ -71,7 +71,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, systemPrompt string, mes
 		if ctx.Err() != nil {
 			return "[已中断]"
 		}
-		log.Printf("LLM 流式调用失败: %v，回退到同步", err)
+		logger.C(ctx).Warn("LLM stream call failed, falling back to sync", "err", err)
 		return c.ChatContext(ctx, systemPrompt, messages)
 	}
 	return reply

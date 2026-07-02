@@ -4,10 +4,10 @@ package neo4j
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"agi-assistant/config"
+	"agi-assistant/internal/pkg/logger"
 
 	driver "github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
@@ -22,7 +22,8 @@ type Client struct {
 // 由调用方在启动后调用 EnsureConstraints 应用基础约束。
 func Connect(cfg config.Neo4jConfig) *Client {
 	if !cfg.KGEnabled || cfg.Neo4jURI == "" {
-		log.Printf("ℹ️  Neo4j 未启用（KGEnabled=%v, URI=%q）", cfg.KGEnabled, cfg.Neo4jURI)
+		logger.L().Info("neo4j disabled",
+			"kg_enabled", cfg.KGEnabled, "uri", cfg.Neo4jURI)
 		return &Client{available: false}
 	}
 
@@ -31,7 +32,7 @@ func Connect(cfg config.Neo4jConfig) *Client {
 		driver.BasicAuth(cfg.Neo4jUser, cfg.Neo4jPassword, ""),
 	)
 	if err != nil {
-		log.Printf("⚠️  Neo4j 驱动初始化失败: %v（知识图谱将降级跳过）", err)
+		logger.L().Warn("neo4j driver init failed, KG will be skipped", "err", err)
 		return &Client{available: false}
 	}
 
@@ -39,14 +40,14 @@ func Connect(cfg config.Neo4jConfig) *Client {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := d.VerifyConnectivity(ctx); err != nil {
-		log.Printf("⚠️  Neo4j 连通性验证失败: %v（知识图谱将降级跳过）", err)
+		logger.L().Warn("neo4j connectivity check failed, KG will be skipped", "err", err)
 		_ = d.Close(context.Background())
 		return &Client{available: false}
 	}
 
 	c := &Client{driver: d, available: true}
 	c.EnsureConstraints()
-	log.Printf("✅ Neo4j 已连接: %s", cfg.Neo4jURI)
+	logger.L().Info("neo4j connected", "uri", cfg.Neo4jURI)
 	return c
 }
 
@@ -84,7 +85,7 @@ func (c *Client) EnsureConstraints() {
 	for _, q := range queries {
 		if _, err := sess.Run(ctx, q, nil); err != nil {
 			// 约束已存在或版本不支持时忽略
-			log.Printf("ℹ️  Neo4j constraint/index: %v", err)
+			logger.L().Info("neo4j constraint/index note", "err", err)
 		}
 	}
 }

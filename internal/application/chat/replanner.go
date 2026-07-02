@@ -12,12 +12,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	"agi-assistant/internal/domain/graph"
 	"agi-assistant/internal/domain/tool"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/pkg/logger"
 )
 
 // replanContext 打包 replan 所需的图状态快照，方便复用同一 prompt 模板
@@ -135,7 +135,7 @@ func (a *UnifiedAgent) llmReplan(
 
 	var nodes []planNode
 	if err := json.Unmarshal([]byte(raw), &nodes); err != nil {
-		log.Printf("⚠️  Replanner 解析失败: %v。原始输出: %s", err, truncateStr(raw, 200))
+		logger.C(ctx).Warn("replanner parse failed", "err", err, "raw", truncateStr(raw, 200))
 		return nil
 	}
 

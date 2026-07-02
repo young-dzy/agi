@@ -10,13 +10,12 @@
 package chat
 
 import (
-	"log"
-
 	"agi-assistant/internal/domain/knowledge"
 	graphmem "agi-assistant/internal/domain/memory/graph"
 	"agi-assistant/internal/domain/memory/longterm"
 	"agi-assistant/internal/domain/rag"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/pkg/logger"
 )
 
 // restoreFromDB 启动时从 PostgreSQL 恢复长期记忆。
@@ -45,7 +44,7 @@ func (a *UnifiedAgent) restoreFromDB() {
 	}
 
 	if len(rows) > 0 {
-		log.Printf("✅ 长期记忆恢复：%d 条（多用户，按 user_id 过滤召回）", len(rows))
+		logger.L().Info("long-term memory restored (multi-user, per-user filter on recall)", "count", len(rows))
 	}
 }
 
@@ -60,7 +59,7 @@ func (a *UnifiedAgent) restoreRAGFromDB() {
 		chunks = append(chunks, rag.Chunk{ID: i, Content: row.Content})
 	}
 	a.rag.RestoreChunks(chunks)
-	log.Printf("✅ RAG chunks 恢复：%d 条", len(chunks))
+	logger.L().Info("rag chunks restored", "count", len(chunks))
 }
 
 // initKnowledgeGraph 初始化 Neo4j 知识图谱存储，并注入到 RAG 引擎 + GraphMemory
@@ -77,9 +76,9 @@ func (a *UnifiedAgent) initKnowledgeGraph() {
 	a.mem.attachGraph(gm)
 
 	if kg.Available() {
-		log.Printf("🕸️  知识图谱已就绪（Neo4j），RAG 升级为三路混合检索，记忆系统已接入图层")
+		logger.L().Info("knowledge graph ready (neo4j); rag upgraded to 3-way hybrid; memory graph layer attached")
 	} else {
-		log.Printf("ℹ️  Neo4j 不可用，RAG 保持双路检索，记忆系统退化为纯向量模式")
+		logger.L().Info("neo4j unavailable; rag stays 2-way; memory falls back to vector-only")
 	}
 }
 

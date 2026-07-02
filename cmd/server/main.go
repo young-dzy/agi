@@ -45,10 +45,12 @@ import (
 	"agi-assistant/internal/infrastructure/platform/milvus"
 	"agi-assistant/internal/infrastructure/platform/postgres"
 	"agi-assistant/internal/interfaces/http/handler"
+	"agi-assistant/internal/pkg/logger"
 	"context"
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os/signal"
 	"syscall"
@@ -72,8 +74,12 @@ const (
 func main() {
 	cfg := config.DefaultConfig()
 
+	// 结构化日志：启动期用 text 格式便于本地看，生产改 json 需要读环境变量。
+	// 后续 Phase 会把 format/level 挂到 config.yaml，这里先用工程常用默认。
+	logger.Init(logger.Config{Format: "text", Level: "info", AddSource: false})
+
 	// ── 平台层连接（每路独立失败降级，不阻塞启动）──
-	log.Println("🔧 正在连接基础设施...")
+	logger.L().Info("bootstrap: connecting infrastructure")
 	milvusClient, milvusStatus := milvus.Connect(cfg.MilvusConfig)
 	pgDB, pgStatus := postgres.Connect(cfg.PostgresConfig)
 	if pgDB != nil {
@@ -101,6 +107,12 @@ func main() {
 
 	// ── 初始化 UnifiedAgent + Auth Service + HTTP Server ──
 	a := chat.New(cfg, deps)
+
+	// pprof 是"暴露内部信息"的端点，配置错误会直接泄漏 goroutine 栈 / heap。
+	// 开启但没配 admin token 视为 misconfig，启动期直接失败——不给"以为安全其实不安全"的机会。
+	if cfg.PprofEnabled && cfg.PprofAdminToken == "" {
+		log.Fatalf("❌ pprof 已启用但 admin_token 未配置，拒绝启动（请在 config.observability.pprof.admin_token 或 PPROF_ADMIN_TOKEN 环境变量注入随机 token）")
+	}
 
 	// JWT 签发器：secret 必须 ≥32 字节，缺失/过短直接启动失败（防 misconfig 上线）。
 	ttl := time.Duration(cfg.JWTTTLHours) * time.Hour
@@ -137,7 +149,7 @@ func main() {
 			log.Fatalf("❌ HTTP 服务启动失败: %v", err)
 		}
 	case <-ctx.Done():
-		log.Println("📡 收到关停信号，开始 graceful shutdown...")
+		logger.L().Info("shutdown signal received, starting graceful shutdown")
 	}
 
 	// ── Graceful Shutdown ──
@@ -146,9 +158,9 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutCtx); err != nil {
-		log.Printf("⚠️  HTTP shutdown 失败 (可能有请求超时): %v", err)
+		logger.L().Warn("http shutdown returned error (in-flight requests may have timed out)", slog.Any("err", err))
 	} else {
-		log.Println("✅ HTTP server 已关闭")
+		logger.L().Info("http server closed")
 	}
 
 	// 关闭外部连接
@@ -161,7 +173,7 @@ func main() {
 	if kafkaWriter != nil {
 		_ = kafkaWriter.Close()
 	}
-	log.Println("👋 所有外部连接已释放，进程退出")
+	logger.L().Info("all external connections released, process exiting")
 }
 
 // newHTTPServer 装配 chi.Router + 三大 timeout。

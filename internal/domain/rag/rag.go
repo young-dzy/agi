@@ -25,8 +25,8 @@ import (
 	"agi-assistant/internal/domain/knowledge"
 	"agi-assistant/internal/infrastructure/eventbus"
 	"agi-assistant/internal/infrastructure/persistence/ragchunk"
+	"agi-assistant/internal/pkg/logger"
 	"fmt"
-	"log"
 	"runtime/debug"
 	"strings"
 )
@@ -37,7 +37,8 @@ func goSafe(name string, fn func()) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("⚠️  goroutine panic [%s]: %v\n%s", name, r, debug.Stack())
+				logger.L().Error("goroutine panic",
+					"task", name, "panic", r, "stack", string(debug.Stack()))
 			}
 		}()
 		fn()
@@ -311,4 +312,16 @@ func (e *Engine) Chunks() []Chunk {
 		chunks[i] = Chunk{ID: i, Content: r.Content}
 	}
 	return chunks
+}
+
+// firstN 返回 s 的前 n 个 rune；用于日志预览时避免把整个 LLM 原始响应写进日志。
+func firstN(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
 }

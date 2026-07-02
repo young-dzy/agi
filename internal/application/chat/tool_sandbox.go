@@ -3,19 +3,19 @@ package chat
 
 import (
 	"encoding/json"
-	"log"
 	"strings"
 	"time"
 
 	"agi-assistant/internal/domain/sandbox"
 	sandboximpl "agi-assistant/internal/infrastructure/sandbox"
 	toolimpl "agi-assistant/internal/infrastructure/tool"
+	"agi-assistant/internal/pkg/logger"
 )
 
 // initSandbox 初始化命令执行沙箱并注册 exec_command 工具
 func (a *UnifiedAgent) initSandbox() {
 	if !a.cfg.SandboxEnabled {
-		log.Printf("ℹ️  沙箱未启用（config.sandbox.enabled=false），跳过 exec_command 工具")
+		logger.L().Info("sandbox disabled (config.sandbox.enabled=false), skipping exec_command tool")
 		return
 	}
 
@@ -57,7 +57,7 @@ func (a *UnifiedAgent) initSandbox() {
 	// 走 RegisterTool 持锁写入：initSandbox 在 New 中以 goroutine 形式运行，
 	// 与同期的 RAG/search_web 注册存在并发，必须串行化。
 	a.RegisterTool(toolimpl.ExecCommandTool(sb))
-	log.Printf("🛡️  沙箱已就绪，后端=%s，exec_command 工具已注册", sb.Backend())
+	logger.L().Info("sandbox ready, exec_command tool registered", "backend", sb.Backend())
 }
 
 // Sandbox 暴露沙箱实例，供 HTTP handler 或前端查询状态

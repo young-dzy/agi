@@ -3,7 +3,8 @@ package eventbus
 
 import (
 	"context"
-	"log"
+
+	"agi-assistant/internal/pkg/logger"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -32,9 +33,9 @@ func (p *KafkaPublisher) Publish(eventType, payload string) {
 			Value: []byte(payload),
 		}
 		if err := p.w.WriteMessages(context.Background(), msg); err != nil {
-			log.Printf("⚠️  Kafka 写入失败: %v", err)
+			logger.L().Warn("kafka write failed", "event_type", eventType, "err", err)
 		}
 		return
 	}
-	log.Printf("📋 [Kafka-fallback] %s: %s", eventType, payload)
+	logger.L().Info("kafka fallback (log-only)", "event_type", eventType, "payload", payload)
 }

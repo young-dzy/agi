@@ -2,9 +2,8 @@
 package es
 
 import (
-	"log"
-
 	"agi-assistant/config"
+	"agi-assistant/internal/pkg/logger"
 
 	es "github.com/elastic/go-elasticsearch/v8"
 )
@@ -19,15 +18,15 @@ func Connect(cfg config.ESConfig) (*es.Client, string) {
 	}
 	client, err := es.NewClient(esCfg)
 	if err != nil {
-		log.Printf("⚠️  Elasticsearch 连接失败: %v", err)
+		logger.L().Warn("elasticsearch connect failed", "err", err)
 		return nil, "disconnected"
 	}
 	res, err := client.Info()
 	if err != nil {
-		log.Printf("⚠️  Elasticsearch Ping 失败: %v", err)
+		logger.L().Warn("elasticsearch ping failed", "err", err)
 		return nil, "disconnected"
 	}
 	res.Body.Close()
-	log.Println("✅ Elasticsearch 已连接:", cfg.ESAddresses)
+	logger.L().Info("elasticsearch connected", "addresses", cfg.ESAddresses)
 	return client, "connected"
 }

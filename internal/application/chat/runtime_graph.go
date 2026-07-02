@@ -10,7 +10,6 @@ package chat
 import (
 	"context"
 	"fmt"
-	"log"
 	"sort"
 	"strconv"
 	"sync"
@@ -19,6 +18,7 @@ import (
 	"agi-assistant/internal/domain/graph"
 	"agi-assistant/internal/domain/promptctx"
 	"agi-assistant/internal/domain/tool"
+	"agi-assistant/internal/pkg/logger"
 )
 
 // ─────────────────────────────── GraphConfig ──────────────────────────────────
@@ -121,7 +121,7 @@ func (rt *GraphRuntime) SetReplanContext(query, memPrefix string) {
 func (rt *GraphRuntime) Execute(ctx context.Context) *GraphResult {
 	// 首次校验（悬空依赖 + 环）
 	if err := rt.graph.Validate(); err != nil {
-		log.Printf("⚠️  GraphRuntime: 图校验失败 %v", err)
+		logger.C(ctx).Warn("graph runtime: validation failed", "err", err)
 		return &GraphResult{InterruptedMsg: fmt.Sprintf("图校验失败: %v", err)}
 	}
 
@@ -213,7 +213,7 @@ func (rt *GraphRuntime) tryReplan(ctx context.Context, reason string, failed *gr
 	added := rt.graph.AddNodes(newNodes)
 	// 追加后立即校验，检出环立刻回滚：把刚追加的节点标 Cancelled 并从图剔除依赖
 	if err := rt.graph.Validate(); err != nil {
-		log.Printf("⚠️  Replan 引入非法结构 %v，忽略追加", err)
+		logger.C(ctx).Warn("replan produced invalid graph, ignoring append", "err", err)
 		for _, id := range added {
 			rt.graph.SetNodeStatus(id, graph.StatusCancelled)
 		}

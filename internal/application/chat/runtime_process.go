@@ -19,11 +19,11 @@ import (
 	"agi-assistant/internal/domain/memory/longterm"
 	"agi-assistant/internal/domain/tool"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/pkg/logger"
 	"agi-assistant/internal/usercontext"
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 )
 
 // ─────────────────────────── 公开入口 ───────────────────────────
@@ -134,8 +134,8 @@ func (a *UnifiedAgent) prepare(ctx context.Context, query string, opts ChatOptio
 		a.goSafe("process.preference-extract", func() {
 			// 入口预检：含越狱/PII 模式的消息整体跳过 LLM 调用
 			if pre := inspectMemoryContent(query); !pre.Safe() {
-				log.Printf("🛡️  [pref-extract] 整段拒绝：risk=%s reason=%s",
-					pre.Risk, pre.Reason)
+				logger.C(ctx).Warn("pref-extract rejected whole msg",
+					"risk", pre.Risk, "reason", pre.Reason)
 				return
 			}
 			kvs := a.llm.ExtractPreferences(query)
@@ -146,14 +146,14 @@ func (a *UnifiedAgent) prepare(ctx context.Context, query string, opts ChatOptio
 			for k, v := range kvs {
 				// 单条 k-v 复检
 				if insp := inspectKVPair(k, v); !insp.Safe() {
-					log.Printf("🛡️  [pref-extract] 拒绝写入 k=%q: risk=%s reason=%s",
-						k, insp.Risk, insp.Reason)
+					logger.C(ctx).Warn("pref-extract kv rejected",
+						"key", k, "risk", insp.Risk, "reason", insp.Reason)
 					continue
 				}
 				a.repos.pref.Save(userID, k, v)
 				content := fmt.Sprintf("用户%s: %s", k, v)
 				if insp := inspectMemoryContent(content); !insp.Safe() {
-					log.Printf("🛡️  [pref-extract] 拼接后命中：risk=%s", insp.Risk)
+					logger.C(ctx).Warn("pref-extract concat hit", "risk", insp.Risk)
 					continue
 				}
 				emb, _ := a.llm.Embed(content)

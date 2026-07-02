@@ -14,8 +14,9 @@ package rag
 
 import (
 	"encoding/json"
-	"log"
 	"strings"
+
+	"agi-assistant/internal/pkg/logger"
 )
 
 // HistoryMessage 是 Rewriter 看到的对话历史最小结构
@@ -101,7 +102,7 @@ func (r *LLMRewriter) Rewrite(query string, history []HistoryMessage) []string {
 	raw := r.generateFn(systemPrompt, hb.String())
 	queries := parseRewriteJSON(raw)
 	if len(queries) == 0 {
-		log.Printf("⚠️  Query rewrite 解析失败，回退原查询（raw=%.100s）", raw)
+		logger.L().Warn("query rewrite parse failed, using original query", "raw_preview", firstN(raw, 100))
 		return []string{query}
 	}
 

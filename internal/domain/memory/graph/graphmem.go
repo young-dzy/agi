@@ -15,7 +15,6 @@ package graphmem
 
 import (
 	"context"
-	"log"
 	"runtime/debug"
 	"sort"
 	"sync"
@@ -24,6 +23,7 @@ import (
 	"agi-assistant/internal/domain/knowledge"
 	"agi-assistant/internal/domain/memory/longterm"
 	pneo4j "agi-assistant/internal/infrastructure/platform/neo4j"
+	"agi-assistant/internal/pkg/logger"
 )
 
 // goSafe 启动一个带 panic recover 的后台 goroutine。
@@ -33,7 +33,8 @@ func goSafe(name string, fn func()) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("⚠️  goroutine panic [%s]: %v\n%s", name, r, debug.Stack())
+				logger.L().Error("goroutine panic",
+					"task", name, "panic", r, "stack", string(debug.Stack()))
 			}
 		}()
 		fn()
@@ -90,7 +91,7 @@ func (gm *GraphMemory) upsertMemoryNode(memID int, content string, importance fl
 		 SET m.content = $content, m.importance = $importance`,
 		map[string]any{"id": int64(memID), "content": content, "importance": importance})
 	if err != nil {
-		log.Printf("⚠️  Neo4j upsertMemoryNode 失败 (id=%d): %v", memID, err)
+		logger.L().Warn("neo4j upsertMemoryNode failed", "mem_id", memID, "err", err)
 	}
 }
 
@@ -110,7 +111,8 @@ func (gm *GraphMemory) addMemoryEdge(fromID, toID int, edgeType string, weight f
 		"from": int64(fromID), "to": int64(toID), "weight": weight,
 	})
 	if err != nil {
-		log.Printf("⚠️  Neo4j addMemoryEdge 失败 (%d→%d): %v", fromID, toID, err)
+		logger.L().Warn("neo4j addMemoryEdge failed",
+			"from", fromID, "to", toID, "err", err)
 	}
 }
 
@@ -161,7 +163,7 @@ func (gm *GraphMemory) deleteMemoryNode(memID int) {
 		`MATCH (m:Memory {mem_id: $id}) DETACH DELETE m`,
 		map[string]any{"id": int64(memID)})
 	if err != nil {
-		log.Printf("⚠️  Neo4j deleteMemoryNode 失败 (id=%d): %v", memID, err)
+		logger.L().Warn("neo4j deleteMemoryNode failed", "mem_id", memID, "err", err)
 	}
 }
 
@@ -403,7 +405,8 @@ func (gm *GraphMemory) installProtectHookOnce() {
 			}
 			protected := gm.getHighCentralityMemoryIDs(candidates, 3)
 			if len(protected) > 0 {
-				log.Printf("🛡️  图中心度保护：%d 条记忆免于删除（入度≥3）", len(protected))
+				logger.L().Info("graph centrality protected memories from deletion",
+					"protected_count", len(protected))
 			}
 			return protected
 		}

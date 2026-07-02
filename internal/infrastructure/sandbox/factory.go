@@ -5,9 +5,8 @@
 package sandboximpl
 
 import (
-	"log"
-
 	"agi-assistant/internal/domain/sandbox"
+	"agi-assistant/internal/pkg/logger"
 )
 
 // NewSandbox 工厂函数：按 backend 字符串组装 domain.Sandbox。
@@ -27,7 +26,7 @@ func NewSandbox(backend string, sandboxCfg sandbox.SandboxConfig, secCfg sandbox
 		if ds.Available() {
 			exec = ds
 		} else {
-			log.Printf("⚠️  Docker 不可用，沙箱降级到 mock 模式")
+			logger.L().Warn("docker unavailable, sandbox falling back to mock")
 			exec = NewMockSandbox()
 		}
 	case "local":
@@ -35,7 +34,7 @@ func NewSandbox(backend string, sandboxCfg sandbox.SandboxConfig, secCfg sandbox
 	case "mock":
 		exec = NewMockSandbox()
 	default:
-		log.Printf("⚠️  未知沙箱后端 %q，使用 mock", backend)
+		logger.L().Warn("unknown sandbox backend, using mock", "backend", backend)
 		exec = NewMockSandbox()
 	}
 

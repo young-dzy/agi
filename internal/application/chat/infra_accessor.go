@@ -9,9 +9,9 @@ import (
 	"agi-assistant/internal/domain/memory/shortterm"
 	"agi-assistant/internal/domain/rag"
 	"agi-assistant/internal/domain/tool"
+	"agi-assistant/internal/pkg/logger"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 )
 
@@ -87,7 +87,7 @@ func (a *UnifiedAgent) saveSnapshot(task *TaskState) {
 	data, _ := json.Marshal(task)
 	if err := json.Unmarshal(data, &stateCopy); err != nil {
 		// 不应该发生（自序列化），但避免吃掉错误
-		log.Printf("⚠️  saveSnapshot 反序列化失败: %v", err)
+		logger.L().Warn("saveSnapshot deserialize failed", "err", err)
 		return
 	}
 	snap := Snapshot{State: stateCopy, Timestamp: time.Now().Format("15:04:05")}

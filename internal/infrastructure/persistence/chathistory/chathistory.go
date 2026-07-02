@@ -6,7 +6,8 @@ package chathistory
 
 import (
 	"database/sql"
-	"log"
+
+	"agi-assistant/internal/pkg/logger"
 )
 
 // Entry 是一条聊天记录的领域模型
@@ -46,7 +47,7 @@ func (r *PGRepo) Save(userID, role, content string) {
 		userID, role, content,
 	)
 	if err != nil {
-		log.Printf("⚠️  聊天记录保存到 PG 失败: %v", err)
+		logger.L().Warn("chat history save to PG failed", "user_id", userID, "err", err)
 	}
 }
 
@@ -61,7 +62,7 @@ func (r *PGRepo) Load(userID string, limit int) []Entry {
 		userID, limit,
 	)
 	if err != nil {
-		log.Printf("⚠️  加载聊天记录失败: %v", err)
+		logger.L().Warn("chat history load failed", "user_id", userID, "err", err)
 		return nil
 	}
 	defer rows.Close()

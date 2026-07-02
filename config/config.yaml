@@ -132,3 +132,12 @@ auth:
   jwt_secret: "${JWT_SECRET}"
   jwt_ttl_hours: 168          # access token 有效期：7 天
   jwt_issuer: "agi-assistant"
+
+# ===== 观测性（当前仅 pprof）=====
+# pprof 会暴露 goroutine 栈、堆、CPU profile 等内部信息，
+# 生产环境默认关闭；开发/排障时打开需同时通过 admin_token 才能访问。
+observability:
+  pprof:
+    enabled: false
+    admin_token: "${PPROF_ADMIN_TOKEN}"    # 开启时必须配置；启动期强制校验
+

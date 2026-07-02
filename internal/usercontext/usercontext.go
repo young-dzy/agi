@@ -14,6 +14,7 @@ import "context"
 // 私有 key 类型——禁止外部以字符串猜测 key 值碰撞。
 type userIDKey struct{}
 type usernameKey struct{}
+type requestIDKey struct{}
 
 // With 把 userID + username 写入 ctx 一并返回新 ctx。
 // userID 空字符串视为"未登录"——下游业务层应据此拒绝写记忆 / 召回。
@@ -43,6 +44,28 @@ func UsernameFromContext(ctx context.Context) string {
 		return ""
 	}
 	if v, ok := ctx.Value(usernameKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// WithRequestID 把请求 ID 写入 ctx。由最外层 HTTP 中间件调用，
+// 之后 domain / infrastructure 层可通过 RequestIDFromContext 拿到同一 ID
+// 用于日志串联，无需再依赖 interfaces 层。
+func WithRequestID(ctx context.Context, requestID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, requestIDKey{}, requestID)
+}
+
+// RequestIDFromContext 取请求 ID。未设置时返回空——调用方（例如 slog Handler）
+// 决定如何降级（通常显示为 "-"）。
+func RequestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(requestIDKey{}).(string); ok {
 		return v
 	}
 	return ""

@@ -3,10 +3,10 @@ package postgres
 
 import (
 	"database/sql"
-	"log"
 	"time"
 
 	"agi-assistant/config"
+	"agi-assistant/internal/pkg/logger"
 
 	_ "github.com/lib/pq" // 驱动注册
 )
@@ -16,7 +16,7 @@ import (
 func Connect(cfg config.PostgresConfig) (*sql.DB, string) {
 	pg, err := sql.Open("postgres", cfg.PGDSN())
 	if err != nil {
-		log.Printf("⚠️  PostgreSQL 打开失败: %v", err)
+		logger.L().Warn("postgresql open failed", "err", err)
 		return nil, "disconnected"
 	}
 	// 连接池调优：默认 unlimited 在并发量大时会打爆 PG max_connections。
@@ -29,10 +29,10 @@ func Connect(cfg config.PostgresConfig) (*sql.DB, string) {
 	pg.SetConnMaxIdleTime(5 * time.Minute)
 
 	if err := pg.Ping(); err != nil {
-		log.Printf("⚠️  PostgreSQL Ping 失败: %v", err)
+		logger.L().Warn("postgresql ping failed", "err", err)
 		return nil, "disconnected"
 	}
-	log.Println("✅ PostgreSQL 已连接:", cfg.PGDSN())
+	logger.L().Info("postgresql connected", "dsn", cfg.PGDSN())
 	return pg, "connected"
 }
 
@@ -145,8 +145,8 @@ func BootstrapSchema(pg *sql.DB) {
 	}
 	for _, ddl := range ddls {
 		if _, err := pg.Exec(ddl); err != nil {
-			log.Printf("⚠️  PG 建表失败: %v", err)
+			logger.L().Warn("postgresql DDL failed", "err", err)
 		}
 	}
-	log.Println("✅ PostgreSQL 表结构已初始化")
+	logger.L().Info("postgresql schema bootstrapped")
 }

@@ -10,8 +10,9 @@ package chat
 
 import (
 	"context"
-	"log"
 	"runtime/debug"
+
+	"agi-assistant/internal/pkg/logger"
 )
 
 // registerCancel 转发到 taskRuntime
@@ -48,7 +49,11 @@ func (a *UnifiedAgent) goSafe(name string, fn func()) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("⚠️  goroutine panic [%s]: %v\n%s", name, r, debug.Stack())
+				logger.L().Error("goroutine panic",
+					"task", name,
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
 			}
 		}()
 		fn()

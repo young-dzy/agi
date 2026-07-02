@@ -4,10 +4,10 @@ package milvus
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"agi-assistant/config"
+	"agi-assistant/internal/pkg/logger"
 
 	milvusClient "github.com/milvus-io/milvus-sdk-go/v2/client"
 )
@@ -21,9 +21,9 @@ func Connect(cfg config.MilvusConfig) (milvusClient.Client, string) {
 		Address: cfg.MilvusAddr(),
 	})
 	if err != nil {
-		log.Printf("⚠️  Milvus 连接失败: %v (将使用内存向量库)", err)
+		logger.L().Warn("milvus connect failed, in-memory fallback", "err", err)
 		return nil, "disconnected"
 	}
-	log.Println("✅ Milvus 已连接:", cfg.MilvusAddr())
+	logger.L().Info("milvus connected", "addr", cfg.MilvusAddr())
 	return mc, "connected"
 }

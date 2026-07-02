@@ -2,8 +2,9 @@ package knowledge
 
 import (
 	"encoding/json"
-	"log"
 	"strings"
+
+	"agi-assistant/internal/pkg/logger"
 )
 
 // Extractor 通过注入的 LLM 回调从文本中抽取实体和关系
@@ -60,7 +61,7 @@ func (e *Extractor) Extract(text string) ExtractResult {
 
 	var result ExtractResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		log.Printf("⚠️  实体关系抽取解析失败: %v（原始输出: %.100s）", err, raw)
+		logger.L().Warn("entity/relation extract parse failed", "err", err, "raw_preview", firstN(raw, 100))
 		return ExtractResult{}
 	}
 
@@ -108,4 +109,16 @@ func isValidRelType(r string) bool {
 		return true
 	}
 	return false
+}
+
+// firstN 返回 s 的前 n 个 rune，超出加省略号；日志预览用。
+func firstN(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
 }

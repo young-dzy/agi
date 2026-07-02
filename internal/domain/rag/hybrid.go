@@ -5,10 +5,10 @@ import (
 	"agi-assistant/config"
 	"agi-assistant/internal/domain/knowledge"
 	"agi-assistant/internal/infrastructure/persistence/ragchunk"
+	"agi-assistant/internal/pkg/logger"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"log"
 	"sort"
 	"sync"
 )
@@ -106,7 +106,8 @@ func (hs *HybridStore) IndexWithParentsAndMetadata(chunks []Chunk, parents []str
 	// 计算文档哈希（幂等摄入）
 	docHash := fmt.Sprintf("%x", sha256.Sum256([]byte(docContent)))[:16]
 	if !hs.chunks.PGAvailable() {
-		log.Printf("⚠️  RAG 索引跳过：PostgreSQL 不可用，无法保存 chunks (doc_hash=%s, chunks=%d)", docHash, len(chunks))
+		logger.L().Warn("rag index skipped: postgres unavailable",
+			"doc_hash", docHash, "chunks", len(chunks))
 		return docHash, nil
 	}
 
@@ -136,7 +137,7 @@ func (hs *HybridStore) IndexWithParentsAndMetadata(chunks []Chunk, parents []str
 			Section:    metadata.Section,
 		})
 		if err != nil {
-			log.Printf("⚠️  RAG chunk 写入 PG 失败 (idx=%d): %v", i, err)
+			logger.L().Warn("rag chunk write to PG failed", "idx", i, "err", err)
 			continue
 		}
 		indexed = append(indexed, IndexedChunk{ID: i, PGID: pgID, Content: c.Content})
@@ -144,7 +145,7 @@ func (hs *HybridStore) IndexWithParentsAndMetadata(chunks []Chunk, parents []str
 		// 索引到 Elasticsearch
 		if hs.chunks.ESAvailable() {
 			if err := hs.chunks.IndexES(pgID, c.Content, docHash, i); err != nil {
-				log.Printf("⚠️  RAG chunk 索引到 ES 失败 (pg_id=%d): %v", pgID, err)
+				logger.L().Warn("rag chunk index to ES failed", "pg_id", pgID, "err", err)
 			}
 		}
 
@@ -163,7 +164,7 @@ func (hs *HybridStore) IndexWithParentsAndMetadata(chunks []Chunk, parents []str
 	// 批量写入 Milvus
 	if len(pgIDs) > 0 {
 		if err := hs.chunks.InsertMilvus(pgIDs, contents, embeddings); err != nil {
-			log.Printf("⚠️  RAG chunks 写入 Milvus 失败: %v", err)
+			logger.L().Warn("rag chunks batch insert to Milvus failed", "err", err)
 		}
 	}
 	return docHash, indexed
@@ -308,7 +309,7 @@ func (hs *HybridStore) searchOne(query string, topK int, _ bool) []HybridResult 
 	case "keyword":
 		return hs.searchKeyword(query, topK)
 	default:
-		log.Printf("⚠️  检索基础设施不可用（Milvus 和 ES 均未连接）")
+		logger.L().Warn("retrieval infrastructure unavailable (both Milvus and ES not connected)")
 		return nil
 	}
 }
@@ -320,7 +321,7 @@ func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 	// 查询向量化
 	queryEmb, err := hs.embedFn(query)
 	if err != nil {
-		log.Printf("⚠️  查询向量化失败，降级到关键词检索: %v", err)
+		logger.L().Warn("query embed failed, falling back to keyword search", "err", err)
 		return hs.searchKeyword(query, topK)
 	}
 	queryEmb32 := make([]float32, len(queryEmb))
@@ -338,15 +339,16 @@ func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 	esHits, esErr := hs.chunks.SearchES(query, fetchK)
 
 	if milvusErr != nil && esErr != nil {
-		log.Printf("⚠️  Milvus 和 ES 均检索失败: %v / %v", milvusErr, esErr)
+		logger.L().Warn("both Milvus and ES search failed",
+			"milvus_err", milvusErr, "es_err", esErr)
 		return nil
 	}
 	if milvusErr != nil {
-		log.Printf("⚠️  Milvus 检索失败，使用关键词检索: %v", milvusErr)
+		logger.L().Warn("Milvus search failed, using keyword only", "err", milvusErr)
 		return hs.searchKeyword(query, topK)
 	}
 	if esErr != nil {
-		log.Printf("⚠️  ES 检索失败，使用语义检索: %v", esErr)
+		logger.L().Warn("ES search failed, using semantic only", "err", esErr)
 		return hs.searchSemantic(query, topK)
 	}
 
@@ -406,7 +408,7 @@ func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 	}
 	rows, err := hs.chunks.LoadByIDs(ids)
 	if err != nil {
-		log.Printf("⚠️  从 PG 加载 RAG chunk 失败: %v", err)
+		logger.L().Warn("load rag chunks from PG failed", "err", err)
 		return nil
 	}
 
@@ -439,7 +441,7 @@ func (hs *HybridStore) searchHybrid(query string, topK int) []HybridResult {
 func (hs *HybridStore) searchSemantic(query string, topK int) []HybridResult {
 	queryEmb, err := hs.embedFn(query)
 	if err != nil {
-		log.Printf("⚠️  查询向量化失败: %v", err)
+		logger.L().Warn("query embed failed", "err", err)
 		return nil
 	}
 	queryEmb32 := make([]float32, len(queryEmb))
@@ -449,7 +451,7 @@ func (hs *HybridStore) searchSemantic(query string, topK int) []HybridResult {
 
 	hits, err := hs.chunks.SearchMilvus(queryEmb32, topK)
 	if err != nil {
-		log.Printf("⚠️  Milvus 检索失败: %v", err)
+		logger.L().Warn("Milvus search failed", "err", err)
 		return nil
 	}
 
@@ -487,7 +489,7 @@ func (hs *HybridStore) searchSemantic(query string, topK int) []HybridResult {
 func (hs *HybridStore) searchKeyword(query string, topK int) []HybridResult {
 	hits, err := hs.chunks.SearchES(query, topK)
 	if err != nil {
-		log.Printf("⚠️  ES 检索失败: %v", err)
+		logger.L().Warn("ES search failed", "err", err)
 		return nil
 	}
 

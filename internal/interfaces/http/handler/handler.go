@@ -120,6 +120,13 @@ func (s *Server) registerRoutes() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	// pprof 端点：仅在 config.observability.pprof.enabled=true 且请求带匹配的
+	// X-Admin-Token 时开放。生产暴露 pprof 会泄漏 goroutine 栈 / 堆信息，
+	// 因此双重防线（配置开关 + token 校验）——避免因端口误开放而全网可访问。
+	if s.cfg.PprofEnabled {
+		s.mountPprof(r)
+	}
+
 	// 静态资源（前端单文件 HTML）
 	fs := http.FileServer(http.Dir("frontend"))
 	r.Handle("/*", fs)

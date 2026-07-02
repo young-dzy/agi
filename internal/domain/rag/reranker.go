@@ -15,9 +15,10 @@ package rag
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
+
+	"agi-assistant/internal/pkg/logger"
 )
 
 // Reranker 重排序器接口
@@ -87,7 +88,7 @@ func (r *LLMReranker) Rerank(query string, results []HybridResult, topK int) []H
 	raw := r.generateFn(rerankSystemPrompt, sb.String())
 	scores := parseRerankJSON(raw)
 	if len(scores) == 0 {
-		log.Printf("⚠️  Rerank 解析失败，回退到 RRF 顺序（raw=%.100s）", raw)
+		logger.L().Warn("rerank parse failed, falling back to RRF order", "raw_preview", firstN(raw, 100))
 		return truncate(results, topK)
 	}
 

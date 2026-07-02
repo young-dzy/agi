@@ -5,9 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"time"
+
+	"agi-assistant/internal/pkg/logger"
 
 	"github.com/lib/pq"
 )
@@ -91,7 +92,7 @@ func (r *PGRepo) SaveClassified(userID, content string, importance float64, embe
 		userID, content, importance, embeddingJSON, category, pq.Array(tags), slotHint,
 	).Scan(&id)
 	if err != nil {
-		log.Printf("⚠️  长期记忆保存失败: %v", err)
+		logger.L().Warn("long-term memory save failed", "user_id", userID, "err", err)
 		return -1
 	}
 	return id
@@ -110,7 +111,7 @@ func (r *PGRepo) Load() []Row {
 		COALESCE(superseded, FALSE), superseded_at, COALESCE(supersedes, '{}'::INT[])
 		FROM long_term_memory ORDER BY id`)
 	if err != nil {
-		log.Printf("⚠️  加载长期记忆失败: %v", err)
+		logger.L().Warn("long-term memory load failed", "err", err)
 		return nil
 	}
 	return r.scanRows(rows)
@@ -129,7 +130,7 @@ func (r *PGRepo) LoadByUser(userID string) []Row {
 		COALESCE(superseded, FALSE), superseded_at, COALESCE(supersedes, '{}'::INT[])
 		FROM long_term_memory WHERE user_id = $1 ORDER BY id`, userID)
 	if err != nil {
-		log.Printf("⚠️  加载用户 %s 长期记忆失败: %v", userID, err)
+		logger.L().Warn("long-term memory load-by-user failed", "user_id", userID, "err", err)
 		return nil
 	}
 	return r.scanRows(rows)
@@ -177,7 +178,7 @@ func (r *PGRepo) Update(id int, content string, importance float64, embeddingJSO
 		content, importance, embeddingJSON, id,
 	)
 	if err != nil {
-		log.Printf("⚠️  长期记忆更新失败 (id=%d): %v", id, err)
+		logger.L().Warn("long-term memory update failed", "id", id, "err", err)
 	}
 }
 
@@ -194,7 +195,7 @@ func (r *PGRepo) Delete(ids []int) {
 	}
 	query := fmt.Sprintf("DELETE FROM long_term_memory WHERE id IN (%s)", strings.Join(placeholders, ","))
 	if _, err := r.db.Exec(query, args...); err != nil {
-		log.Printf("⚠️  长期记忆批量删除失败: %v", err)
+		logger.L().Warn("long-term memory batch delete failed", "err", err)
 	}
 }
 
@@ -219,7 +220,8 @@ func (r *PGRepo) UpdateImportanceBatch(items []ImportanceUpdate) {
 		pq.Array(ids), pq.Array(imps),
 	)
 	if err != nil {
-		log.Printf("⚠️  长期记忆批量衰减更新失败 (n=%d): %v", len(items), err)
+		logger.L().Warn("long-term memory batch decay update failed",
+			"count", len(items), "err", err)
 	}
 }
 
@@ -238,7 +240,7 @@ func (r *PGRepo) SetQuarantine(id int, quarantined bool, reason string) {
 		quarantined, reason, id,
 	)
 	if err != nil {
-		log.Printf("⚠️  长期记忆隔离标记更新失败 (id=%d): %v", id, err)
+		logger.L().Warn("long-term memory quarantine flag update failed", "id", id, "err", err)
 	}
 }
 
@@ -254,7 +256,7 @@ func (r *PGRepo) MarkSuperseded(oldIDs []int, newID int) {
 	}
 	tx, err := r.db.Begin()
 	if err != nil {
-		log.Printf("⚠️  MarkSuperseded 启动事务失败: %v", err)
+		logger.L().Warn("MarkSuperseded start tx failed", "err", err)
 		return
 	}
 	defer func() {
@@ -273,7 +275,7 @@ func (r *PGRepo) MarkSuperseded(oldIDs []int, newID int) {
 		 WHERE id = ANY($1::INT[]) AND NOT superseded`,
 		pq.Array(ids),
 	); err != nil {
-		log.Printf("⚠️  MarkSuperseded 旧条目标记失败: %v", err)
+		logger.L().Warn("MarkSuperseded flag old rows failed", "err", err)
 		return
 	}
 
@@ -288,12 +290,12 @@ func (r *PGRepo) MarkSuperseded(oldIDs []int, newID int) {
 			 WHERE id = $2`,
 			pq.Array(ids), newID,
 		); err != nil {
-			log.Printf("⚠️  MarkSuperseded 新条目链接失败 (id=%d): %v", newID, err)
+			logger.L().Warn("MarkSuperseded link new row failed", "new_id", newID, "err", err)
 			return
 		}
 	}
 
 	if err = tx.Commit(); err != nil {
-		log.Printf("⚠️  MarkSuperseded 提交失败: %v", err)
+		logger.L().Warn("MarkSuperseded commit failed", "err", err)
 	}
 }

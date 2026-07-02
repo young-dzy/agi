@@ -9,12 +9,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	"agi-assistant/internal/domain/graph"
 	"agi-assistant/internal/domain/tool"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/pkg/logger"
 )
 
 // planNode 是 Planner LLM 输出的图节点（带依赖和竞速组）
@@ -176,7 +176,8 @@ func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[st
 					})
 				}
 			} else {
-				log.Printf("⚠️  Planner LLM 解析失败 (%v / %v / %v)，降级到规则规划。原始输出: %s", err, legacyErr, altErr, raw)
+				logger.C(ctx).Warn("planner LLM parse failed, falling back to rule-based",
+					"err", err, "legacy_err", legacyErr, "alt_err", altErr, "raw", raw)
 				return a.rulePlanNodes(ctx, query, ts, memPrefix)
 			}
 		}

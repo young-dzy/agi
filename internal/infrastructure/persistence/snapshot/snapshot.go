@@ -3,7 +3,8 @@ package snapshot
 
 import (
 	"database/sql"
-	"log"
+
+	"agi-assistant/internal/pkg/logger"
 )
 
 // Repo 任务快照仓储接口
@@ -29,6 +30,6 @@ func (r *PGRepo) Save(taskID string, stateJSON []byte) {
 		taskID, stateJSON,
 	)
 	if err != nil {
-		log.Printf("⚠️  快照保存到 PG 失败: %v", err)
+		logger.L().Warn("task snapshot save to PG failed", "task_id", taskID, "err", err)
 	}
 }

@@ -3,9 +3,9 @@ package knowledge
 import (
 	"agi-assistant/config"
 	"agi-assistant/internal/infrastructure/platform/neo4j"
+	"agi-assistant/internal/pkg/logger"
 	"context"
 	"fmt"
-	"log"
 	"sort"
 )
 
@@ -70,7 +70,7 @@ func (ks *KGStore) IndexDocument(docHash string, chunks []ChunkRef) {
 			ks.upsertRelation(ctx, rel)
 		}
 	}
-	log.Printf("🕸️  知识图谱索引完成：docHash=%s，chunks=%d", docHash, len(chunks))
+	logger.L().Info("knowledge graph indexed", "doc_hash", docHash, "chunks", len(chunks))
 }
 
 // ChunkRef 是 KGStore 摄入时需要的 chunk 信息（避免直接依赖 rag 包形成循环）
@@ -94,7 +94,7 @@ func (ks *KGStore) upsertEntity(ctx context.Context, ent Entity) {
 		"pg_id":    ent.PGID,
 	})
 	if err != nil {
-		log.Printf("⚠️  Neo4j upsertEntity 失败 (%s): %v", ent.Name, err)
+		logger.L().Warn("neo4j upsertEntity failed", "name", ent.Name, "err", err)
 	}
 }
 
@@ -116,7 +116,8 @@ func (ks *KGStore) upsertRelation(ctx context.Context, rel Relation) {
 		"pg_id":    rel.PGID,
 	})
 	if err != nil {
-		log.Printf("⚠️  Neo4j upsertRelation 失败 (%s→%s): %v", rel.FromName, rel.ToName, err)
+		logger.L().Warn("neo4j upsertRelation failed",
+			"from", rel.FromName, "to", rel.ToName, "err", err)
 	}
 }
 
@@ -136,14 +137,14 @@ func (ks *KGStore) DeleteDocument(docHash string) {
 		`MATCH ()-[r {doc_hash: $doc_hash}]-() DELETE r`,
 		map[string]any{"doc_hash": docHash})
 	if err != nil {
-		log.Printf("⚠️  Neo4j 删除文档关系失败: %v", err)
+		logger.L().Warn("neo4j delete document relations failed", "err", err)
 	}
 	// 清理孤立实体节点
 	_, err = sess.Run(ctx,
 		`MATCH (e:Entity) WHERE NOT (e)--() AND e.doc_hash = $doc_hash DELETE e`,
 		map[string]any{"doc_hash": docHash})
 	if err != nil {
-		log.Printf("⚠️  Neo4j 清理孤立节点失败: %v", err)
+		logger.L().Warn("neo4j orphan cleanup failed", "err", err)
 	}
 }
 
@@ -236,7 +237,7 @@ func (ks *KGStore) Search(queryText string, topK int) []GraphSearchResult {
 		raw = append(raw, r)
 	}
 	if err := records.Err(); err != nil {
-		log.Printf("⚠️  Neo4j 图检索 records 错误: %v", err)
+		logger.L().Warn("neo4j graph search records error", "err", err)
 	}
 
 	// 计算分数：命中种子越多 + 图中心度越高 → 分越高

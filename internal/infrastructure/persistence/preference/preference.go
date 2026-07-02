@@ -3,7 +3,8 @@ package preference
 
 import (
 	"database/sql"
-	"log"
+
+	"agi-assistant/internal/pkg/logger"
 )
 
 // Repo 用户偏好仓储接口
@@ -30,7 +31,7 @@ func (r *PGRepo) Save(userID, key, value string) {
 		userID, key, value,
 	)
 	if err != nil {
-		log.Printf("⚠️  偏好保存到 PG 失败: %v", err)
+		logger.L().Warn("preference save to PG failed", "user_id", userID, "key", key, "err", err)
 	}
 }
 
@@ -42,7 +43,7 @@ func (r *PGRepo) Load(userID string) map[string]string {
 	}
 	rows, err := r.db.Query(`SELECT key, value FROM user_preferences WHERE user_id = $1`, userID)
 	if err != nil {
-		log.Printf("⚠️  加载偏好失败: %v", err)
+		logger.L().Warn("preference load failed", "user_id", userID, "err", err)
 		return result
 	}
 	defer rows.Close()

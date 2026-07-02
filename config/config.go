@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 
+	"agi-assistant/internal/pkg/logger"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -181,6 +183,19 @@ type AuthConfig struct {
 	JWTIssuer   string // 签发方标识，默认 "agi-assistant"
 }
 
+// ObservabilityConfig 观测/诊断相关开关。
+//
+// 当前仅包含 pprof 开关——生产暴露 /debug/pprof 会泄漏 goroutine 栈 / 堆信息，
+// 因此默认关闭，且开启后仍要求请求带 X-Admin-Token（避免因端口误开放而全网可访问）。
+// 后续 Phase 会补充 metrics / tracing 相关字段。
+type ObservabilityConfig struct {
+	// PprofEnabled 打开 /debug/pprof 端点；关闭时任何该前缀请求返回 404。
+	PprofEnabled bool
+	// PprofAdminToken 访问 pprof 时必须携带的 X-Admin-Token 值。
+	// 空字符串 + PprofEnabled=true 视为配置错误——启动期直接拒绝，避免线上无鉴权暴露。
+	PprofAdminToken string
+}
+
 // APIConfig 整合所有阶段的 API + 基础设施配置。
 //
 // 所有子结构以 embedded 方式放进来，访问路径 cfg.LLMAPIUrl / cfg.PGHost
@@ -198,6 +213,7 @@ type APIConfig struct {
 	SecurityConfig
 	GraphRuntimeConfig
 	AuthConfig
+	ObservabilityConfig
 }
 
 // yamlFile 对应 config/config.yaml 的结构
@@ -313,6 +329,12 @@ type yamlFile struct {
 		JWTTTLHrs int    `yaml:"jwt_ttl_hours"`
 		JWTIssuer string `yaml:"jwt_issuer"`
 	} `yaml:"auth"`
+	Observability struct {
+		Pprof struct {
+			Enabled    bool   `yaml:"enabled"`
+			AdminToken string `yaml:"admin_token"`
+		} `yaml:"pprof"`
+	} `yaml:"observability"`
 }
 
 // DefaultConfig 从 config/config.yaml 加载配置
@@ -442,6 +464,10 @@ func DefaultConfig() *APIConfig {
 			JWTTTLHours: y.Auth.JWTTTLHrs,
 			JWTIssuer:   y.Auth.JWTIssuer,
 		},
+		ObservabilityConfig: ObservabilityConfig{
+			PprofEnabled:    y.Observability.Pprof.Enabled,
+			PprofAdminToken: y.Observability.Pprof.AdminToken,
+		},
 	}
 
 	applyDefaults(c)
@@ -471,7 +497,7 @@ func loadLocalEnv(path string) {
 		value = strings.TrimSpace(value)
 		value = strings.Trim(value, `"'`)
 		if err := os.Setenv(key, value); err != nil {
-			log.Printf("⚠️  加载本地环境变量失败 (%s): %v", key, err)
+			logger.L().Warn("load local env var failed", "key", key, "err", err)
 		}
 	}
 }

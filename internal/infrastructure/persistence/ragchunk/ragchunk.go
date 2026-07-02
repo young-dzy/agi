@@ -14,8 +14,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
+
+	"agi-assistant/internal/pkg/logger"
 
 	es "github.com/elastic/go-elasticsearch/v8"
 	milvusClient "github.com/milvus-io/milvus-sdk-go/v2/client"
@@ -217,7 +218,7 @@ func (s *Store) EnsureESIndex() error {
 		return fmt.Errorf("create rag_chunks ES index failed: %w", err)
 	}
 	createResp.Body.Close()
-	log.Println("✅ ES rag_chunks 索引已创建")
+	logger.L().Info("es rag_chunks index created")
 	return nil
 }
 
@@ -304,13 +305,14 @@ func (s *Store) EnsureMilvusCollection(dim int) error {
 				if f.Name == "embedding" && f.DataType == entity.FieldTypeFloatVector {
 					existingDim := f.TypeParams["dim"]
 					if existingDim != fmt.Sprintf("%d", dim) {
-						log.Printf("⚠️  Milvus rag_chunks 维度不匹配 (现有=%s, 期望=%d)，重建 collection", existingDim, dim)
+						logger.L().Warn("milvus rag_chunks dim mismatch, recreating collection",
+							"existing", existingDim, "expected", dim)
 						needRecreate = true
 					}
 				}
 				// 主键必须是 pg_id，否则搜索返回的 ID 与 PG 不对齐
 				if f.Name == "id" && f.PrimaryKey {
-					log.Printf("⚠️  Milvus rag_chunks 主键为 id (应为 pg_id)，重建 collection")
+					logger.L().Warn("milvus rag_chunks primary key must be pg_id, recreating")
 					needRecreate = true
 				}
 			}
@@ -336,12 +338,12 @@ func (s *Store) EnsureMilvusCollection(dim int) error {
 	}
 	idx, _ := entity.NewIndexIvfFlat(entity.L2, 128)
 	if err := s.milvus.CreateIndex(ctx, "rag_chunks", "embedding", idx, false); err != nil {
-		log.Printf("⚠️  Milvus rag_chunks 索引创建失败: %v", err)
+		logger.L().Warn("milvus rag_chunks index create failed", "err", err)
 	}
 	if err := s.milvus.LoadCollection(ctx, "rag_chunks", false); err != nil {
-		log.Printf("⚠️  Milvus rag_chunks 加载失败: %v", err)
+		logger.L().Warn("milvus rag_chunks load failed", "err", err)
 	}
-	log.Println("✅ Milvus rag_chunks collection 已创建")
+	logger.L().Info("milvus rag_chunks collection created")
 	return nil
 }
 
@@ -398,12 +400,12 @@ func (s *Store) Delete(docHash string) error {
 	}
 	if s.es != nil {
 		if err := s.deleteES(pgIDs); err != nil {
-			log.Printf("⚠️  ES 删除失败: %v", err)
+			logger.L().Warn("cascade delete: ES delete failed", "err", err)
 		}
 	}
 	if s.milvus != nil {
 		if err := s.deleteMilvus(pgIDs); err != nil {
-			log.Printf("⚠️  Milvus 删除失败: %v", err)
+			logger.L().Warn("cascade delete: Milvus delete failed", "err", err)
 		}
 	}
 	return nil
@@ -438,7 +440,7 @@ func (s *Store) deleteES(pgIDs []int64) error {
 	for _, id := range pgIDs {
 		resp, err := s.es.Delete("rag_chunks", fmt.Sprintf("%d", id))
 		if err != nil {
-			log.Printf("⚠️  ES 删除文档失败 (pg_id=%d): %v", id, err)
+			logger.L().Warn("es delete doc failed", "pg_id", id, "err", err)
 			continue
 		}
 		resp.Body.Close()
@@ -464,12 +466,12 @@ func (s *Store) deleteMilvus(pgIDs []int64) error {
 func (s *Store) Init(dim int) {
 	if s.MilvusAvailable() {
 		if err := s.EnsureMilvusCollection(dim); err != nil {
-			log.Printf("⚠️  Milvus rag_chunks 初始化失败: %v", err)
+			logger.L().Warn("milvus rag_chunks init failed", "err", err)
 		}
 	}
 	if s.ESAvailable() {
 		if err := s.EnsureESIndex(); err != nil {
-			log.Printf("⚠️  ES rag_chunks 初始化失败: %v", err)
+			logger.L().Warn("es rag_chunks init failed", "err", err)
 		}
 	}
 }

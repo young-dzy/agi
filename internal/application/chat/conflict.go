@@ -15,11 +15,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	"agi-assistant/internal/domain/memory/longterm"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/pkg/logger"
 )
 
 // 冲突检测仅对这些 category 启用。其它类型默认共存。
@@ -87,7 +87,7 @@ func (a *UnifiedAgent) detectAndResolveConflict(
 	// newID == 0 时（极少见，调用方应保证已 Store）只在 domain 层标记，
 	// PG 层等下次写入再补——避免数据不一致就直接放弃
 	if newID <= 0 {
-		log.Printf("⚠️  [conflict] newID 缺失，仅标记 domain 层 oldIDs=%v", oldIDs)
+		logger.C(ctx).Warn("conflict: newID missing, marking domain layer only", "old_ids", oldIDs)
 		marked := a.mem.ltm.MarkSuperseded(oldIDs, 0)
 		a.repos.ltm.MarkSuperseded(marked, 0)
 		return marked
@@ -95,7 +95,8 @@ func (a *UnifiedAgent) detectAndResolveConflict(
 
 	marked := a.mem.ltm.MarkSuperseded(oldIDs, newID)
 	a.repos.ltm.MarkSuperseded(marked, newID)
-	log.Printf("🔁 [conflict] new=%d 取代了 oldIDs=%v (category=%s)", newID, marked, category)
+	logger.C(ctx).Info("conflict: new memory supersedes old",
+		"new_id", newID, "old_ids", marked, "category", category)
 	return marked
 }
 
@@ -152,7 +153,7 @@ func (a *UnifiedAgent) llmJudgeConflict(
 
 	var out []conflictVerdict
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		log.Printf("⚠️  [conflict] LLM 判定解析失败: %v raw=%q", err, raw)
+		logger.C(ctx).Warn("conflict: LLM verdict parse failed", "err", err, "raw", raw)
 		return nil
 	}
 	return out

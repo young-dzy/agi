@@ -1,13 +1,21 @@
-node_modules/
+# Build artifacts
+/final-agent
+/bin/
+/dist/
+*.test
+*.out
+.data/
+
+# IDE
+/.idea/
+/.vscode/
+
+# OS
 .DS_Store
-dist/
-build/
+
+# Logs
+*.log
+
+# Local env overrides
 .env
 .env.local
-*.log
-.vscode/
-.idea/
-__pycache__/
-*.pyc
-.next/
-coverage/

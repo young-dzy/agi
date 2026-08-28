@@ -142,11 +142,75 @@ func BootstrapSchema(pg *sql.DB) {
 		`ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS version_id TEXT`,
 		`ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS section TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_rag_chunks_document ON rag_chunks(document_id, version_id)`,
+		// Skill 广场：用户已安装的 skill（多租户，(user_id, skill_id) 唯一）。
+		// enabled 为开关；主 Agent 主循环只扫描 enabled=TRUE 的 skill。
+		`CREATE TABLE IF NOT EXISTS installed_skills (
+			user_id         TEXT NOT NULL,
+			skill_id        TEXT NOT NULL,
+			name            TEXT NOT NULL,
+			description     TEXT NOT NULL DEFAULT '',
+			category        TEXT NOT NULL DEFAULT 'office',
+			source          TEXT NOT NULL,
+			source_url      TEXT,
+			invocation      TEXT NOT NULL DEFAULT 'prompt',
+			endpoint        TEXT,
+			prompt_template TEXT,
+			params          JSONB NOT NULL DEFAULT '[]',
+			enabled         BOOLEAN NOT NULL DEFAULT FALSE,
+			installed_at    TIMESTAMP DEFAULT NOW(),
+			PRIMARY KEY (user_id, skill_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_skills_user_enabled ON installed_skills(user_id, enabled)`,
 	}
+	ddls = append(ddls, MemoryConsistencyDDLs()...)
 	for _, ddl := range ddls {
 		if _, err := pg.Exec(ddl); err != nil {
 			logger.L().Warn("postgresql DDL failed", "err", err)
 		}
 	}
 	logger.L().Info("postgresql schema bootstrapped")
+}
+
+// MemoryConsistencyDDLs returns the idempotent schema upgrades required for
+// PostgreSQL to act as the sole source of truth and transactional outbox.
+func MemoryConsistencyDDLs() []string {
+	return []string{
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS embedding_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS embedding_revision TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_ltm_active_user_id
+			ON long_term_memory(user_id, id) WHERE deleted_at IS NULL`,
+		`CREATE TABLE IF NOT EXISTS memory_outbox (
+			id                BIGSERIAL PRIMARY KEY,
+			event_id          UUID NOT NULL UNIQUE,
+			aggregate_id      BIGINT NOT NULL,
+			user_id           TEXT NOT NULL,
+			aggregate_version BIGINT NOT NULL,
+			event_type        TEXT NOT NULL,
+			target            TEXT NOT NULL,
+			payload           JSONB NOT NULL,
+			status            TEXT NOT NULL DEFAULT 'pending',
+			attempts          INT NOT NULL DEFAULT 0,
+			available_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			locked_at         TIMESTAMPTZ,
+			locked_by         TEXT,
+			processed_at      TIMESTAMPTZ,
+			last_error        TEXT,
+			repair_dedupe_key TEXT UNIQUE,
+			created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			CONSTRAINT memory_outbox_status_check
+				CHECK (status IN ('pending', 'processing', 'processed', 'dead')),
+			CONSTRAINT memory_outbox_target_check
+				CHECK (target IN ('milvus', 'neo4j', 'ltm_cache'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_outbox_ready
+			ON memory_outbox(target, available_at, id) WHERE status = 'pending'`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_outbox_stale_lock
+			ON memory_outbox(target, locked_at) WHERE status = 'processing'`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_outbox_aggregate
+			ON memory_outbox(aggregate_id, aggregate_version)`,
+	}
 }

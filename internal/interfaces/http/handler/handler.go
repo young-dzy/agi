@@ -13,6 +13,7 @@ import (
 	"agi-assistant/config"
 	authapp "agi-assistant/internal/application/auth"
 	"agi-assistant/internal/application/chat"
+	skillapp "agi-assistant/internal/application/skill"
 	authdomain "agi-assistant/internal/domain/auth"
 	"agi-assistant/internal/domain/document"
 	"agi-assistant/internal/domain/tool"
@@ -35,6 +36,7 @@ type Server struct {
 	auth   *authapp.Service
 	issuer *authdomain.TokenIssuer
 	cfg    *config.APIConfig
+	skills *skillapp.Service
 	router *chi.Mux
 }
 
@@ -47,8 +49,8 @@ type Server struct {
 //   - /* 静态资源公开
 //
 // 中间件顺序（外→内）：RequestID → PanicRecover → AccessLog → CORS → [RequireAuth]
-func New(a *chat.UnifiedAgent, authSvc *authapp.Service, issuer *authdomain.TokenIssuer, cfg *config.APIConfig) *Server {
-	s := &Server{agent: a, auth: authSvc, issuer: issuer, cfg: cfg}
+func New(a *chat.UnifiedAgent, authSvc *authapp.Service, issuer *authdomain.TokenIssuer, cfg *config.APIConfig, skills *skillapp.Service) *Server {
+	s := &Server{agent: a, auth: authSvc, issuer: issuer, cfg: cfg, skills: skills}
 	r := chi.NewRouter()
 
 	r.Use(httpmw.RequestID)
@@ -106,6 +108,14 @@ func (s *Server) registerRoutes() {
 		r.Get("/tools", s.toolsList)
 		r.Post("/tools/mcp", s.registerMCPTool)
 
+		r.Route("/skills", func(r chi.Router) {
+			r.Get("/marketplace", s.skillsMarketplace)
+			r.Get("/installed", s.skillsInstalled)
+			r.Post("/install", s.skillsInstall)
+			r.Post("/uninstall", s.skillsUninstall)
+			r.Post("/toggle", s.skillsToggle)
+		})
+
 		r.Get("/snapshots", s.snapshots)
 		r.Get("/status", s.status)
 	})
@@ -127,9 +137,13 @@ func (s *Server) registerRoutes() {
 		s.mountPprof(r)
 	}
 
-	// 静态资源（前端单文件 HTML）
-	fs := http.FileServer(http.Dir("frontend"))
-	r.Handle("/*", fs)
+	// 前端已迁移为独立工程（web/，Vite + Vue3），由独立静态服务器/nginx 托管，
+	// 后端不再托管静态资源。根路径返回一句提示，避免裸 404。
+	r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("AGI-saber API. 前端请运行 web/（npm run dev 或部署 dist）。"))
+	})
 }
 
 // ─────────────────────────────── Auth Handlers ────────────────────────────
@@ -213,19 +227,15 @@ func writeAuthHTTPError(w http.ResponseWriter, r *http.Request, code, msg string
 // POST /api/chat — 统一对话入口（同步模式，向后兼容）
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Message       string   `json:"message"`
-		UseRAG        bool     `json:"use_rag"`
-		SelectedTools []string `json:"selected_tools"`
-		Explicit      bool     `json:"explicit"`
+		Message string `json:"message"`
+		UseRAG  bool   `json:"use_rag"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 	opts := chat.ChatOptions{
-		UseRAG:        req.UseRAG,
-		SelectedTools: req.SelectedTools,
-		Explicit:      req.Explicit,
+		UseRAG: req.UseRAG,
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -236,10 +246,8 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 // POST /api/chat/stream — SSE 流式对话入口
 func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Message       string   `json:"message"`
-		UseRAG        bool     `json:"use_rag"`
-		SelectedTools []string `json:"selected_tools"`
-		Explicit      bool     `json:"explicit"`
+		Message string `json:"message"`
+		UseRAG  bool   `json:"use_rag"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -262,9 +270,7 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := chat.ChatOptions{
-		UseRAG:        req.UseRAG,
-		SelectedTools: req.SelectedTools,
-		Explicit:      req.Explicit,
+		UseRAG: req.UseRAG,
 	}
 
 	sendSSE("start", map[string]interface{}{"message": req.Message})

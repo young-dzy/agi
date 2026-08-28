@@ -2,12 +2,15 @@
 llm:
   api_url: https://open.bigmodel.cn/api/paas/v4/chat/completions
   api_key: "."
-  model: glm-5.2
+  model: glm-5.1
+  # 快模型：规划/参数抽取/子Agent/RAG改写精排等内部步骤用它提速；最终答案仍用 model。
+  # 留空则回落为 model（无行为变化）。
+  fast_model: glm-4.7-flash
   temperature: 1.0
 embedding:
   api_url: https://open.bigmodel.cn/api/paas/v4/embeddings
   api_key: "."
-  model: glm-5.2
+  model: embedding-3
 
 # 向量数据库配置
 milvus:
@@ -76,8 +79,8 @@ server:
   port: "8090"
 
 search:
-  api_key: "你的key"               # 请填入你的 Tavily API Key（可选）
-  api_url: "https://tavily.com"
+  api_key: "."               # 请填入你的 Tavily API Key（可选）
+  api_url: "https://api.tavily.com/search"
 
 # ===== 知识图谱（Neo4j，可选，不可用时跳过图检索）=====
 neo4j:
@@ -88,7 +91,7 @@ neo4j:
   weight: 0.3        # 图检索在 RRF 融合中的权重
   enabled: true      # false 时完全跳过知识图谱
 
-# ===== 沙箱执行（用于终端命令工具）=====
+# ===== 沙箱执行（用于输出产物）=====
 sandbox:
   enabled: true
   backend: "docker"     # "docker" | "local" | "mock"
@@ -100,6 +103,9 @@ sandbox:
   max_pids: 64
   network_disabled: true
   readonly_rootfs: true
+  # loop 产物根目录（宿主机路径，支持 ~）；每次请求在其下按 {userID}/{taskID} 建子目录，
+  # 挂载到沙箱 /workspace，生成的报告/作业等文件会出现在这里（默认桌面）。
+  artifact_host_dir: "~/Desktop/agi-saber"
 
 # ===== 命令安全校验 =====
 security:
@@ -141,3 +147,14 @@ observability:
     enabled: false
     admin_token: "${PPROF_ADMIN_TOKEN}"    # 开启时必须配置；启动期强制校验
 
+# ===== Skill 广场（GitHub 办公类 skill 爬取）=====
+# enabled=false 时广场只展示内置精选，不访问 GitHub。
+# github_token 可选，用于提升 GitHub 搜索 API 配额（匿名仅 10 次/分钟，配 token 后 30 次/分钟）。
+# keyword 是 GitHub 全文搜索词：多个词是「AND」关系，词越多命中越少，
+#   建议 1-2 个词（如 "office assistant" / "office mcp" / "productivity"），
+#   写太长（如 "office productivity assistant prompt"）会返回 0 条结果。
+skillhub:
+  enabled: true
+  github_token: "${GITHUB_TOKEN}"
+  keyword: "office assistant"
+  cache_ttl_min: 30

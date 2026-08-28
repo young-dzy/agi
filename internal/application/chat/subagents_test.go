@@ -62,7 +62,7 @@ func TestDocumentContentStripsMarkdownFence(t *testing.T) {
 func TestResearchQueryPlansSubAgents(t *testing.T) {
 	agent := &UnifiedAgent{}
 
-	nodes := agent.llmPlanGraph(context.Background(), "调研 PPO 的优势，两句话即可", map[string]tool.Tool{}, "")
+	nodes := agent.llmPlanGraph(context.Background(), "调研 PPO 的优势，两句话即可", map[string]tool.Tool{}, "", true)
 	wantAgents := []string{"research_agent", "writer_agent", "review_agent"}
 	if len(nodes) != len(wantAgents) {
 		t.Fatalf("len(nodes) = %d, want %d", len(nodes), len(wantAgents))
@@ -77,7 +77,7 @@ func TestResearchQueryPlansSubAgents(t *testing.T) {
 func TestReportSaveQueryPlansDocAgent(t *testing.T) {
 	agent := &UnifiedAgent{}
 
-	nodes := agent.llmPlanGraph(context.Background(), "生成一份 PPO 报告并保存到本地文档库", map[string]tool.Tool{}, "")
+	nodes := agent.llmPlanGraph(context.Background(), "生成一份 PPO 报告并保存到本地文档库", map[string]tool.Tool{}, "", true)
 	wantAgents := []string{"research_agent", "writer_agent", "review_agent", "doc_agent"}
 	if len(nodes) != len(wantAgents) {
 		t.Fatalf("len(nodes) = %d, want %d", len(nodes), len(wantAgents))

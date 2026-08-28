@@ -17,7 +17,16 @@ import (
 	"agi-assistant/internal/domain/graph"
 	"agi-assistant/internal/domain/tool"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/usercontext"
 )
+
+// reactOpts 控制 runReAct 的子 Agent 行为：
+//   - allowSubAgents：是否允许规划器/重规划器使用子 Agent（普通 loop=false）
+//   - forceSubAgentPlan：强制使用固定的 research→writer→review→doc 流水线（rag_agent 模式）
+type reactOpts struct {
+	allowSubAgents    bool
+	forceSubAgentPlan bool
+}
 
 // runReAct 执行 ReAct 图调度模式。onEvent 为 nil 时即"非流式"路径。
 //
@@ -30,11 +39,17 @@ func (a *UnifiedAgent) runReAct(
 	memPrefix string,
 	histMsgs []llm.Message,
 	onEvent func(StreamEvent),
+	opts reactOpts,
 ) (string, []ReActStep, *TaskState) {
 	var reactSteps []ReActStep
 
-	// ── Step 1: Planner LLM 输出带依赖的图节点 ──────────────────────────
-	planNodes := a.llmPlanGraph(ctx, query, ts, memPrefix)
+	// ── Step 1: 规划——rag_agent 强制固定子 Agent 流水线；否则走 Planner LLM ──
+	var planNodes []*graph.Node
+	if opts.forceSubAgentPlan {
+		planNodes = a.subAgentPipelineNodes(query)
+	} else {
+		planNodes = a.llmPlanGraph(ctx, query, ts, memPrefix, opts.allowSubAgents)
+	}
 
 	// 若 Planner 决定不需要任何工具，直接走 LLM 对话
 	if len(planNodes) == 0 {
@@ -72,6 +87,13 @@ func (a *UnifiedAgent) runReAct(
 	a.pctx.resetTaskMem()
 	a.saveSnapshot(task)
 
+	// ── 起沙箱：准备绑定挂载到宿主机桌面的产物工作目录（正常 loop 每次都起）──
+	userID := usercontext.UserIDFromContext(ctx)
+	hostWS := a.prepareArtifactWorkspace(userID, task.TaskID)
+	if hostWS != "" {
+		emit(onEvent, "sandbox_ready", map[string]string{"workspace": hostWS})
+	}
+
 	// ── Step 3: GraphRuntime 并行执行 ─────────────────────────────────
 	gcfg := GraphConfig{
 		MaxParallel:    a.cfg.GraphMaxParallel,
@@ -82,6 +104,7 @@ func (a *UnifiedAgent) runReAct(
 		ReplanOnFailed: a.cfg.GraphReplanOnFailed,
 	}
 	rt := NewGraphRuntime(tg, a, gcfg, ts, task, onEvent)
+	rt.allowSubAgents = opts.allowSubAgents
 	rt.SetReplanContext(query, memPrefix)
 	graphResult := rt.Execute(ctx)
 
@@ -99,6 +122,15 @@ func (a *UnifiedAgent) runReAct(
 	// ── Step 5: Generator LLM 综合所有观察结果生成最终答案 ────────────────
 	task.Phase = "generating"
 	answer := a.llmGenerate(ctx, query, graphResult.Observations, memPrefix, histMsgs, onEvent)
+
+	// ── Step 5.5: 沙箱产物物化——把最终答案落成交付文件（挂载到宿主机桌面）──
+	if hostWS != "" {
+		if step := a.produceArtifact(ctx, query, answer, hostWS, onEvent); step != nil {
+			reactSteps = append(reactSteps, *step)
+			answer = answer + "\n\n---\n" + step.Content
+		}
+	}
+
 	reactSteps = append(reactSteps, ReActStep{Type: StepFinalAnswer, Content: answer})
 	task.Result = answer
 	task.Status = "completed"
@@ -260,7 +292,7 @@ func (a *UnifiedAgent) extractParamsForTool(ctx context.Context, query string, t
 		"从下面的用户消息中提取工具「%s」所需的参数，以JSON对象格式输出，只输出JSON，不加任何说明。\n\n参数说明：\n%s\n\n用户消息：%s",
 		t.Name, strings.Join(lines, "\n"), query,
 	)
-	raw := a.llm.ChatContext(ctx, "", []llm.Message{{Role: "user", Content: prompt}})
+	raw := a.llm.ChatContextFast(ctx, "", []llm.Message{{Role: "user", Content: prompt}})
 	raw = strings.TrimPrefix(raw, "```json")
 	raw = strings.TrimPrefix(raw, "```")
 	raw = strings.TrimSuffix(raw, "```")

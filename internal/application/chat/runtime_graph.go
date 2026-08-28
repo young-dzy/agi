@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,11 @@ type GraphConfig struct {
 func DefaultGraphConfig() GraphConfig {
 	return GraphConfig{MaxParallel: 2, RaceTimeoutMs: 30000, EnableRacing: true, MaxReplan: 2}
 }
+
+// subAgentStepTimeout 是子 Agent 节点的执行超时下限。
+// 子 Agent 内部会串行做多次 LLM 调用，工具级（秒级）step_timeout 不适用，
+// 这里给一个宽松上限，避免被误判超时。
+const subAgentStepTimeout = 5 * time.Minute
 
 // ─────────────────────────────── GraphResult ──────────────────────────────────
 
@@ -84,6 +90,9 @@ type GraphRuntime struct {
 	query      string
 	memPrefix  string
 	replanUsed int // 已消耗的 replan 次数
+
+	// allowSubAgents 控制 replan 是否可引入子 Agent（普通 loop=false）
+	allowSubAgents bool
 }
 
 // NewGraphRuntime 创建图运行时
@@ -206,7 +215,7 @@ func (rt *GraphRuntime) tryReplan(ctx context.Context, reason string, failed *gr
 		Failed:   failed,
 		Snapshot: buildSnapshot(rt.graph),
 	}
-	newNodes := rt.agent.llmReplan(ctx, rc, rt.tools, rt.memPrefix)
+	newNodes := rt.agent.llmReplan(ctx, rc, rt.tools, rt.memPrefix, rt.allowSubAgents)
 	if len(newNodes) == 0 {
 		return nil
 	}
@@ -393,6 +402,7 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 	for k, v := range node.Params {
 		params[k] = v
 	}
+	rt.enrichParamsWithUpstream(node, params)
 
 	// run 单次执行：优先用 ExecuteStructured（带错误分类），其次 ExecuteCtx（带 ctx），最后回落 Execute。
 	// 返回 (结果字符串, 是否可重试, error)。可重试标志驱动外层重试循环——
@@ -428,10 +438,22 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 		// 其次：带 ctx 的字符串接口
 		if t.ExecuteCtx != nil {
 			s, err := t.ExecuteCtx(runCtx, params)
+			if err == nil && s == "[已中断]" {
+				err = runCtx.Err()
+				if err == nil {
+					err = fmt.Errorf("工具 %s 返回中断状态", node.ToolName)
+				}
+			}
 			return s, err != nil, err
 		}
 		// 兜底：老 Execute（无 ctx）—— 重试间会被 ctx.Done 截断
 		s, err := t.Execute(params)
+		if err == nil && s == "[已中断]" {
+			err = ctx.Err()
+			if err == nil {
+				err = fmt.Errorf("工具 %s 返回中断状态", node.ToolName)
+			}
+		}
 		return s, err != nil, err
 	}
 
@@ -440,6 +462,18 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 	maxRetries := rt.agent.cfg.MaxRetries
 	retryDelay := time.Duration(rt.agent.cfg.RetryDelayMs) * time.Millisecond
 	stepTimeout := time.Duration(rt.agent.cfg.StepTimeoutMs) * time.Millisecond
+	// 子 Agent 内部会串行执行多次 LLM 调用（planQueries + 检索 + 综合），
+	// Skill（skill_*）是 Prompt 驱动的 LLM 工具，单次调用也要十几秒。
+	// 秒级的工具 step_timeout 会把它们直接判超时（观察显示 [已中断]）。
+	// 这里给「子 Agent + skill 节点」放宽到宽松上限，避免被误杀。
+	isLLMHeavy := node.Type == graph.NodeTypeSubAgent || strings.HasPrefix(node.ToolName, "skill_")
+	if isLLMHeavy {
+		if stepTimeout > 0 && stepTimeout < subAgentStepTimeout {
+			stepTimeout = subAgentStepTimeout
+		}
+		// LLM 型节点重试代价高（每次都是完整 LLM 调用），只跑一次
+		maxRetries = 1
+	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if ctx.Err() != nil {
@@ -477,6 +511,8 @@ func (rt *GraphRuntime) executeSingleNode(ctx context.Context, nodeID graph.Node
 
 	if execErr != nil {
 		errMsg := execErr.Error()
+		logger.C(ctx).Warn("node exec failed", "id", nodeID, "type", node.Type, "executor", executor,
+			"step_timeout_ms", stepTimeout.Milliseconds(), "parent_ctx_err", ctx.Err(), "err", errMsg)
 		rt.graph.SetNodeStatus(nodeID, graph.StatusFailed)
 		rt.graph.SetNodeError(nodeID, errMsg)
 		if rt.onEvent != nil {
@@ -561,6 +597,72 @@ func (rt *GraphRuntime) upstreamResults(node *graph.Node) map[string]string {
 		}
 	}
 	return out
+}
+
+// enrichParamsWithUpstream makes dependency outputs available to ordinary tools.
+// Planner prompts often phrase a later skill input as "based on n1 result"; this
+// replaces that placeholder with the actual upstream content before execution.
+func (rt *GraphRuntime) enrichParamsWithUpstream(node *graph.Node, params map[string]interface{}) {
+	upstream := rt.upstreamResults(node)
+	if len(upstream) == 0 {
+		return
+	}
+	text := formatUpstreamResults(upstream)
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+
+	for k, v := range params {
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		if shouldReplacePlaceholderInput(s) {
+			params[k] = text
+		}
+	}
+
+	t, ok := rt.tools[node.ToolName]
+	if !ok {
+		return
+	}
+	for _, p := range t.Parameters {
+		if !p.Required {
+			continue
+		}
+		if _, exists := params[p.Name]; !exists {
+			params[p.Name] = text
+		}
+	}
+}
+
+func formatUpstreamResults(upstream map[string]string) string {
+	var b strings.Builder
+	for _, id := range sortedKeys(upstream) {
+		if strings.TrimSpace(upstream[id]) == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "## %s\n\n%s\n\n", id, upstream[id])
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func shouldReplacePlaceholderInput(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return true
+	}
+	lowered := strings.ToLower(trimmed)
+	placeholderHints := []string{
+		"基于n", "基于 n", "n1", "n2", "n3", "搜索结果", "上一步", "上一节点",
+		"润色后", "最终文本", "初稿", "draft", "previous", "upstream",
+	}
+	for _, hint := range placeholderHints {
+		if strings.Contains(lowered, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 // groupByRace 将同一层中的节点按 race_group 分组

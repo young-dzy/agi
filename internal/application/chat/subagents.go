@@ -109,7 +109,7 @@ func (r *researchAgent) Run(ctx context.Context, task SubAgentTask) (string, err
 	if !r.agent.cfg.IsRealLLM() {
 		return "## Research Findings\n\n" + userMsg, nil
 	}
-	return r.agent.llm.ChatContext(ctx,
+	return r.agent.llm.ChatContextFast(ctx,
 		"你是 research_agent。请基于观察结果输出结构化研究摘要，包含 Findings、Evidence、Open Questions。不要编造未出现的信息。",
 		[]llm.Message{{Role: "user", Content: userMsg}},
 	), nil
@@ -123,7 +123,7 @@ func (r *researchAgent) planQueries(ctx context.Context, task SubAgentTask) []st
 	if !r.agent.cfg.IsRealLLM() {
 		return []string{base}
 	}
-	raw := r.agent.llm.ChatContext(ctx,
+	raw := r.agent.llm.ChatContextFast(ctx,
 		"你是查询规划器。请把研究目标改写成 2-3 条互补检索查询，严格输出 JSON：{\"queries\":[\"...\"]}",
 		[]llm.Message{{Role: "user", Content: base}},
 	)
@@ -155,7 +155,7 @@ func (w *writerAgent) Run(ctx context.Context, task SubAgentTask) (string, error
 	if !w.agent.cfg.IsRealLLM() {
 		return "# " + safeTitle(task.Goal, task.Query) + "\n\n" + input, nil
 	}
-	return w.agent.llm.ChatContext(ctx,
+	return w.agent.llm.ChatContextFast(ctx,
 		"你是 writer_agent。请把输入整理为清晰 Markdown 报告，包含摘要、分析、建议和下一步。",
 		[]llm.Message{{Role: "user", Content: fmt.Sprintf("写作目标：%s\n\n材料：\n%s", task.Goal, input)}},
 	), nil
@@ -172,7 +172,7 @@ func (r *reviewAgent) Run(ctx context.Context, task SubAgentTask) (string, error
 	if !r.agent.cfg.IsRealLLM() {
 		return "Review: 内容已整理；建议人工确认关键事实。", nil
 	}
-	return r.agent.llm.ChatContext(ctx,
+	return r.agent.llm.ChatContextFast(ctx,
 		"你是 review_agent。请审查输入，输出问题清单、可信度和需要补证据的点。",
 		[]llm.Message{{Role: "user", Content: input}},
 	), nil

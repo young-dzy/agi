@@ -1,31 +1,4 @@
 services:
-  # ===== AI Agent 应用 =====
-  final-agent:
-    build: .
-    container_name: final-ai-agent
-    ports:
-      - "8090:8090"
-    # JWT_SECRET 从宿主机 .env 读取；config.docker.yaml 中的 ${JWT_SECRET} 启动期会被 envsubst 展开。
-    # 缺失会 Fatal——启动前确保 .env 存在且含 32 字节以上随机串：
-    #   echo "JWT_SECRET=$(openssl rand -hex 32)" >> .env
-    environment:
-      - TZ=Asia/Shanghai
-      - JWT_SECRET=${JWT_SECRET}
-    volumes:
-      - ./config/config.docker.yaml:/app/config/config.yaml:ro
-    depends_on:
-      milvus:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      elasticsearch:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    restart: unless-stopped
-
   # ===== Milvus 向量数据库 =====
   etcd:
     container_name: milvus-etcd

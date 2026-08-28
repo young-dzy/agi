@@ -10,7 +10,6 @@
 // 核心能力：
 //   - Store           写 LTM 同时建图节点 + FOLLOWS / SIMILAR_TO 边
 //   - RecallByFilter  向量召回 + 1-hop 图扩展，发现关联但不直接相似的历史
-//   - GraphAwareConsolidate  合并时保护图中入度 ≥3 的高中心度节点
 package graphmem
 
 import (
@@ -18,7 +17,6 @@ import (
 	"runtime/debug"
 	"sort"
 	"sync"
-	"time"
 
 	"agi-assistant/internal/domain/knowledge"
 	"agi-assistant/internal/domain/memory/longterm"
@@ -253,16 +251,8 @@ func (gm *GraphMemory) StoreClassified(userID, content string, importance float6
 	}
 	newID := newItem.ID
 
-	if gm.neoAvailable() {
-		goSafe("graphmem.store-node", func() {
-			gm.upsertMemoryNode(newID, content, importance)
-			if gm.prevID >= 0 {
-				gm.addMemoryEdge(gm.prevID, newID, "FOLLOWS", 1.0)
-			}
-			gm.linkSimilarEdges(newItem, newID)
-		})
-	}
-
+	// Neo4j is a projection. Authoritative runtime writes enqueue graph events
+	// transactionally; this compatibility method only updates the local LTM.
 	gm.prevID = newID
 	return true, newID
 }
@@ -367,30 +357,6 @@ func (gm *GraphMemory) RecallByFilter(query string, queryEmbedding []float64, fi
 
 // ─────────────────────────────── Consolidate ─────────────────────────────────
 
-// GraphAwareConsolidate 在 LTM.Consolidate 基础上：
-//  1. 通过 ConsolidationConfig.ProtectFn 钩子，让"图中心度保护"在 LTM 内部
-//     与物理删除发生在同一临界区——不再有"内存已删但 PG 还在"的窗口。
-//  2. 删除 LTM 条目时同步删除 Neo4j 节点。
-//
-// 注意：钩子在 InstallProtectHook 中安装，调用方只要保证 graphMem 已构造即可。
-func (gm *GraphMemory) GraphAwareConsolidate() longterm.ConsolidationResult {
-	gm.installProtectHookOnce()
-	result := gm.ltm.Consolidate()
-
-	if !gm.neoAvailable() {
-		return result
-	}
-
-	// 同步删除 Neo4j 中对应节点（保护节点已在 Consolidate 内部从 DeleteFromDB 移除）
-	goSafe("graphmem.consolidate-delete", func() {
-		for _, id := range result.DeleteFromDB {
-			gm.deleteMemoryNode(id)
-		}
-	})
-
-	return result
-}
-
 // installProtectHookOnce 把"图中心度保护"挂进 LongTerm 的 ProtectFn 钩子。
 // 幂等：多次调用只生效一次。
 func (gm *GraphMemory) installProtectHookOnce() {
@@ -421,25 +387,6 @@ func (gm *GraphMemory) SyncPrevID() {
 	}
 }
 
-// UpdateNodeAfterMerge 记忆合并后更新 Neo4j 节点内容
-func (gm *GraphMemory) UpdateNodeAfterMerge(item longterm.Item) {
-	if gm.neoAvailable() {
-		goSafe("graphmem.update-after-merge", func() {
-			gm.upsertMemoryNode(item.ID, item.Content, item.Importance)
-		})
-	}
-}
-
-// StoreItem 直接插入（从 DB 恢复），同步图节点
-func (gm *GraphMemory) StoreItem(item longterm.Item) {
-	gm.ltm.StoreItem(item)
-	if gm.neoAvailable() {
-		goSafe("graphmem.store-item", func() {
-			gm.upsertMemoryNode(item.ID, item.Content, item.Importance)
-		})
-	}
-}
-
 // Len 返回当前记忆条目数（等同 LTM）
 func (gm *GraphMemory) Len() int { return gm.ltm.Count() }
 
@@ -450,20 +397,3 @@ func (gm *GraphMemory) SetConsolidationConfig(cfg *longterm.ConsolidationConfig)
 
 // NeedConsolidation 代理到 LTM
 func (gm *GraphMemory) NeedConsolidation() bool { return gm.ltm.NeedConsolidation() }
-
-// SyncLastItemPGID 代理到 LTM
-func (gm *GraphMemory) SyncLastItemPGID(pgID int) {
-	gm.ltm.SyncLastItemPGID(pgID)
-	// 同步更新 prevID 到最新条目
-	if last, ok := gm.ltm.LastItem(); ok {
-		gm.prevID = last.ID
-		// 更新 Neo4j 节点 ID（SyncLastItemPGID 会修改最后一条 Item.ID）
-		if gm.neoAvailable() {
-			goSafe("graphmem.sync-pgid", func() {
-				// 给 Neo4j 一点时间完成之前的异步操作
-				time.Sleep(50 * time.Millisecond)
-				gm.upsertMemoryNode(last.ID, last.Content, last.Importance)
-			})
-		}
-	}
-}

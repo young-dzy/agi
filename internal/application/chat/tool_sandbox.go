@@ -3,19 +3,19 @@ package chat
 
 import (
 	"encoding/json"
-	"strings"
 	"time"
 
 	"agi-assistant/internal/domain/sandbox"
 	sandboximpl "agi-assistant/internal/infrastructure/sandbox"
-	toolimpl "agi-assistant/internal/infrastructure/tool"
 	"agi-assistant/internal/pkg/logger"
 )
 
-// initSandbox 初始化命令执行沙箱并注册 exec_command 工具
+// initSandbox 初始化命令执行沙箱（供 loop 产物物化使用）。
+// 裁剪后不再注册 exec_command 工具——沙箱不再作为对话工具暴露，
+// 只在正常 loop 的产物物化阶段用于「在容器内生成文件并落到宿主机桌面」。
 func (a *UnifiedAgent) initSandbox() {
 	if !a.cfg.SandboxEnabled {
-		logger.L().Info("sandbox disabled (config.sandbox.enabled=false), skipping exec_command tool")
+		logger.L().Info("sandbox disabled (config.sandbox.enabled=false), artifact production will fall back to local write")
 		return
 	}
 
@@ -54,35 +54,8 @@ func (a *UnifiedAgent) initSandbox() {
 	})
 
 	a.sandbox = sb
-	// 走 RegisterTool 持锁写入：initSandbox 在 New 中以 goroutine 形式运行，
-	// 与同期的 RAG/search_web 注册存在并发，必须串行化。
-	a.RegisterTool(toolimpl.ExecCommandTool(sb))
-	logger.L().Info("sandbox ready, exec_command tool registered", "backend", sb.Backend())
+	logger.L().Info("sandbox ready (artifact production backend)", "backend", sb.Backend())
 }
 
 // Sandbox 暴露沙箱实例，供 HTTP handler 或前端查询状态
 func (a *UnifiedAgent) Sandbox() *sandbox.Sandbox { return a.sandbox }
-
-// extractShellCommand 从用户自然语言查询中提取实际的 shell 命令
-func extractShellCommand(query string) string {
-	// 简单提取：去掉常见中文前缀后，取第一个词作为命令
-	q := query
-	for _, prefix := range []string{"执行", "运行", "请执行", "请运行", "帮我执行", "帮我运行"} {
-		if strings.HasPrefix(q, prefix) {
-			q = strings.TrimPrefix(q, prefix)
-			break
-		}
-	}
-	// 去掉常见中文后缀
-	for _, suffix := range []string{"命令", "查看CPU信息", "查看内存信息", "查看磁盘信息", "查看系统信息", "查看信息"} {
-		if strings.HasSuffix(q, suffix) {
-			q = strings.TrimSuffix(q, suffix)
-			break
-		}
-	}
-	q = strings.TrimSpace(q)
-	if q != "" {
-		return q
-	}
-	return query
-}

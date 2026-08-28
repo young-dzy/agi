@@ -22,10 +22,13 @@ type ServerConfig struct {
 
 // LLMConfig 聊天模型 API
 type LLMConfig struct {
-	LLMAPIUrl   string
-	LLMAPIKey   string
-	LLMModel    string
-	Temperature float64
+	LLMAPIUrl string
+	LLMAPIKey string
+	LLMModel  string
+	// LLMFastModel 快模型：用于规划/参数抽取/子 Agent/RAG 改写精排等内部步骤。
+	// 为空时回落为 LLMModel（无行为变化）。最终答案仍用 LLMModel。
+	LLMFastModel string
+	Temperature  float64
 }
 
 func (c LLMConfig) IsRealLLM() bool { return c.LLMAPIKey != "" }
@@ -152,6 +155,9 @@ type SandboxConfig struct {
 	SandboxMaxPIDs     int
 	SandboxNetDisabled bool
 	SandboxReadOnly    bool
+	// SandboxArtifactHostDir loop 产物根目录（宿主机路径，支持 ~ 展开）。
+	// 每次请求在其下按 {userID}/{taskID} 建子目录并挂载到沙箱 /workspace。
+	SandboxArtifactHostDir string
 }
 
 // SecurityConfig 命令安全校验
@@ -196,6 +202,18 @@ type ObservabilityConfig struct {
 	PprofAdminToken string
 }
 
+// SkillHubConfig 控制「Skill 广场」的 GitHub 数据源。
+type SkillHubConfig struct {
+	// SkillHubEnabled 是否启用 GitHub 广场爬取；关闭时广场只展示内置精选。
+	SkillHubEnabled bool
+	// SkillHubGitHubToken 可选的 GitHub token，提升搜索 API 配额（匿名 60 次/时）。
+	SkillHubGitHubToken string
+	// SkillHubKeyword GitHub 搜索关键词，默认 "office productivity assistant prompt"。
+	SkillHubKeyword string
+	// SkillHubCacheTTLMin 搜索结果缓存分钟数，默认 30。
+	SkillHubCacheTTLMin int
+}
+
 // APIConfig 整合所有阶段的 API + 基础设施配置。
 //
 // 所有子结构以 embedded 方式放进来，访问路径 cfg.LLMAPIUrl / cfg.PGHost
@@ -214,6 +232,7 @@ type APIConfig struct {
 	GraphRuntimeConfig
 	AuthConfig
 	ObservabilityConfig
+	SkillHubConfig
 }
 
 // yamlFile 对应 config/config.yaml 的结构
@@ -222,6 +241,7 @@ type yamlFile struct {
 		APIUrl      string  `yaml:"api_url"`
 		APIKey      string  `yaml:"api_key"`
 		Model       string  `yaml:"model"`
+		FastModel   string  `yaml:"fast_model"`
 		Temperature float64 `yaml:"temperature"`
 	} `yaml:"llm"`
 	Embedding struct {
@@ -310,6 +330,7 @@ type yamlFile struct {
 		MaxPIDs         int    `yaml:"max_pids"`
 		NetworkDisabled bool   `yaml:"network_disabled"`
 		ReadOnlyRootfs  bool   `yaml:"readonly_rootfs"`
+		ArtifactHostDir string `yaml:"artifact_host_dir"`
 	} `yaml:"sandbox"`
 	Security struct {
 		MaxCommandLength int      `yaml:"max_command_length"`
@@ -335,6 +356,12 @@ type yamlFile struct {
 			AdminToken string `yaml:"admin_token"`
 		} `yaml:"pprof"`
 	} `yaml:"observability"`
+	SkillHub struct {
+		Enabled     bool   `yaml:"enabled"`
+		GitHubToken string `yaml:"github_token"`
+		Keyword     string `yaml:"keyword"`
+		CacheTTLMin int    `yaml:"cache_ttl_min"`
+	} `yaml:"skillhub"`
 }
 
 // DefaultConfig 从 config/config.yaml 加载配置
@@ -361,10 +388,11 @@ func DefaultConfig() *APIConfig {
 			ServerPort: y.Server.Port,
 		},
 		LLMConfig: LLMConfig{
-			LLMAPIUrl:   y.LLM.APIUrl,
-			LLMAPIKey:   y.LLM.APIKey,
-			LLMModel:    y.LLM.Model,
-			Temperature: y.LLM.Temperature,
+			LLMAPIUrl:    y.LLM.APIUrl,
+			LLMAPIKey:    y.LLM.APIKey,
+			LLMModel:     y.LLM.Model,
+			LLMFastModel: y.LLM.FastModel,
+			Temperature:  y.LLM.Temperature,
 		},
 		EmbeddingConfig: EmbeddingConfig{
 			EmbeddingAPIUrl: y.Embedding.APIUrl,
@@ -435,16 +463,17 @@ func DefaultConfig() *APIConfig {
 			SearchAPIURL: y.Search.APIURL,
 		},
 		SandboxConfig: SandboxConfig{
-			SandboxEnabled:     y.Sandbox.Enabled,
-			SandboxBackend:     y.Sandbox.Backend,
-			SandboxImage:       y.Sandbox.Image,
-			SandboxTimeoutMs:   y.Sandbox.TimeoutMs,
-			SandboxMaxOutput:   y.Sandbox.MaxOutputBytes,
-			SandboxMemoryMB:    y.Sandbox.MemoryLimitMB,
-			SandboxCPUPercent:  y.Sandbox.CPUPercent,
-			SandboxMaxPIDs:     y.Sandbox.MaxPIDs,
-			SandboxNetDisabled: y.Sandbox.NetworkDisabled,
-			SandboxReadOnly:    y.Sandbox.ReadOnlyRootfs,
+			SandboxEnabled:         y.Sandbox.Enabled,
+			SandboxBackend:         y.Sandbox.Backend,
+			SandboxImage:           y.Sandbox.Image,
+			SandboxTimeoutMs:       y.Sandbox.TimeoutMs,
+			SandboxMaxOutput:       y.Sandbox.MaxOutputBytes,
+			SandboxMemoryMB:        y.Sandbox.MemoryLimitMB,
+			SandboxCPUPercent:      y.Sandbox.CPUPercent,
+			SandboxMaxPIDs:         y.Sandbox.MaxPIDs,
+			SandboxNetDisabled:     y.Sandbox.NetworkDisabled,
+			SandboxReadOnly:        y.Sandbox.ReadOnlyRootfs,
+			SandboxArtifactHostDir: y.Sandbox.ArtifactHostDir,
 		},
 		SecurityConfig: SecurityConfig{
 			SecMaxCmdLength:  y.Security.MaxCommandLength,
@@ -467,6 +496,12 @@ func DefaultConfig() *APIConfig {
 		ObservabilityConfig: ObservabilityConfig{
 			PprofEnabled:    y.Observability.Pprof.Enabled,
 			PprofAdminToken: y.Observability.Pprof.AdminToken,
+		},
+		SkillHubConfig: SkillHubConfig{
+			SkillHubEnabled:     y.SkillHub.Enabled,
+			SkillHubGitHubToken: y.SkillHub.GitHubToken,
+			SkillHubKeyword:     y.SkillHub.Keyword,
+			SkillHubCacheTTLMin: y.SkillHub.CacheTTLMin,
 		},
 	}
 
@@ -573,6 +608,11 @@ func applyDefaults(c *APIConfig) {
 	if c.SandboxMaxPIDs <= 0 {
 		c.SandboxMaxPIDs = 64
 	}
+	// 产物目录默认 ~/Desktop/agi-artifacts；展开 ~ 为用户家目录
+	if c.SandboxArtifactHostDir == "" {
+		c.SandboxArtifactHostDir = "~/Desktop/agi-artifacts"
+	}
+	c.SandboxArtifactHostDir = expandHome(c.SandboxArtifactHostDir)
 
 	// 安全校验默认值
 	if c.SecMaxCmdLength <= 0 {
@@ -589,4 +629,35 @@ func applyDefaults(c *APIConfig) {
 	if c.GraphMaxReplan <= 0 {
 		c.GraphMaxReplan = 2
 	}
+
+	// Skill 广场默认值
+	if c.SkillHubKeyword == "" {
+		// 注意：GitHub 全文搜索是多词 AND，关键词越多命中越少。
+		// 用 2 个词保证有结果（4 词的 "office productivity assistant prompt" 会返回 0 条）。
+		c.SkillHubKeyword = "office assistant"
+	}
+	if c.SkillHubCacheTTLMin <= 0 {
+		c.SkillHubCacheTTLMin = 30
+	}
+
+	// 快模型未配置时回落为主模型（内部步骤与最终答案同模型，无行为变化）
+	if c.LLMFastModel == "" {
+		c.LLMFastModel = c.LLMModel
+	}
+}
+
+// expandHome 把以 ~ 开头的路径展开为用户家目录；无法获取家目录时原样返回。
+func expandHome(p string) string {
+	if p == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return p
+	}
+	if strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home + p[1:]
+		}
+	}
+	return p
 }

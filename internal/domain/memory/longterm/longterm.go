@@ -12,11 +12,14 @@
 package longterm
 
 import (
+	"errors"
 	"math"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"agi-assistant/internal/domain/memory/consistency"
 )
 
 // Item 是长期记忆的存储单元
@@ -47,6 +50,12 @@ type Item struct {
 	Superseded   bool      `json:"superseded,omitempty"`
 	SupersededAt time.Time `json:"superseded_at,omitempty"`
 	Supersedes   []int     `json:"supersedes,omitempty"`
+	// Projection metadata comes from PostgreSQL, the sole source of truth.
+	// Legacy restored rows with Version=0 are normalized to version 1.
+	Version     int64      `json:"version,omitempty"`
+	ContentHash string     `json:"content_hash,omitempty"`
+	UpdatedAt   time.Time  `json:"updated_at,omitempty"`
+	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
 }
 
 // RecallFilter 控制 RecallByFilter 的语义召回约束（与 promptctx.SlotFilter 同构）
@@ -123,6 +132,11 @@ type LongTerm struct {
 	consolidationCfg *ConsolidationConfig
 }
 
+var (
+	ErrStaleCommittedVersion = errors.New("longterm: stale committed version")
+	ErrCommittedHashConflict = errors.New("longterm: equal version has different content hash")
+)
+
 // New 创建长期记忆
 func New() *LongTerm {
 	return &LongTerm{vocabID: make(map[string]int)}
@@ -189,6 +203,178 @@ func (m *LongTerm) FindByID(id int) (Item, bool) {
 		}
 	}
 	return Item{}, false
+}
+
+// ApplyCommitted applies a PostgreSQL-committed change set atomically to the
+// active cache. It never accepts an older version or conflicting equal version.
+func (m *LongTerm) ApplyCommitted(changes consistency.CommittedChangeSet) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	index := make(map[int]int, len(m.Items))
+	for i := range m.Items {
+		index[m.Items[i].ID] = i
+	}
+	validate := func(record consistency.MemoryRecord) error {
+		i, ok := index[int(record.ID)]
+		if !ok {
+			return nil
+		}
+		current := m.Items[i]
+		currentVersion := current.Version
+		if currentVersion <= 0 {
+			currentVersion = 1
+		}
+		if record.Version < currentVersion {
+			return ErrStaleCommittedVersion
+		}
+		if record.Version == currentVersion &&
+			current.ContentHash != "" && record.ContentHash != "" &&
+			current.ContentHash != record.ContentHash {
+			return ErrCommittedHashConflict
+		}
+		return nil
+	}
+	for _, record := range changes.Upserts {
+		if err := validate(record); err != nil {
+			return err
+		}
+	}
+	for _, record := range changes.Deletes {
+		if err := validate(record); err != nil {
+			return err
+		}
+	}
+
+	for _, record := range changes.Upserts {
+		if record.DeletedAt != nil {
+			continue
+		}
+		item := recordToItem(record)
+		if i, ok := index[item.ID]; ok {
+			m.Items[i] = item
+		} else {
+			index[item.ID] = len(m.Items)
+			m.Items = append(m.Items, item)
+			m.storeCount++
+		}
+	}
+	if len(changes.Deletes) > 0 {
+		deleted := make(map[int]bool, len(changes.Deletes))
+		for _, record := range changes.Deletes {
+			deleted[int(record.ID)] = true
+		}
+		active := m.Items[:0]
+		for _, item := range m.Items {
+			if !deleted[item.ID] {
+				active = append(active, item)
+			}
+		}
+		m.Items = active
+	}
+	m.rebuildVocab()
+	m.recomputeNextID()
+	return nil
+}
+
+// ReplaceCommitted discards the local cache and rebuilds it from authoritative
+// PostgreSQL records. Tombstones are intentionally excluded from active recall.
+func (m *LongTerm) ReplaceCommitted(records []consistency.MemoryRecord) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Items = m.Items[:0]
+	for _, record := range records {
+		if record.DeletedAt != nil {
+			continue
+		}
+		m.Items = append(m.Items, recordToItem(record))
+	}
+	sort.Slice(m.Items, func(i, j int) bool { return m.Items[i].ID < m.Items[j].ID })
+	m.rebuildVocab()
+	m.recomputeNextID()
+	m.storeCount = 0
+}
+
+func (m *LongTerm) recomputeNextID() {
+	m.nextID = 0
+	for _, item := range m.Items {
+		if item.ID >= m.nextID {
+			m.nextID = item.ID + 1
+		}
+	}
+}
+
+func recordToItem(record consistency.MemoryRecord) Item {
+	version := record.Version
+	if version <= 0 {
+		version = 1
+	}
+	var supersededAt time.Time
+	if record.SupersededAt != nil {
+		supersededAt = *record.SupersededAt
+	}
+	supersedes := make([]int, len(record.Supersedes))
+	for i, id := range record.Supersedes {
+		supersedes[i] = int(id)
+	}
+	return Item{
+		ID:               int(record.ID),
+		UserID:           record.UserID,
+		Content:          record.Content,
+		Importance:       record.Importance,
+		Embedding:        append([]float64(nil), record.Embedding...),
+		CreatedAt:        record.CreatedAt,
+		UpdatedAt:        record.UpdatedAt,
+		LastAccessed:     record.LastAccessed,
+		Category:         record.Category,
+		Tags:             append([]string(nil), record.Tags...),
+		SlotHint:         record.SlotHint,
+		Quarantined:      record.Quarantined,
+		QuarantineReason: record.QuarantineReason,
+		Superseded:       record.Superseded,
+		SupersededAt:     supersededAt,
+		Supersedes:       supersedes,
+		Version:          version,
+		ContentHash:      record.ContentHash,
+		DeletedAt:        record.DeletedAt,
+	}
+}
+
+func itemToRecord(item Item) consistency.MemoryRecord {
+	supersedes := make([]int64, len(item.Supersedes))
+	for i, id := range item.Supersedes {
+		supersedes[i] = int64(id)
+	}
+	var supersededAt *time.Time
+	if !item.SupersededAt.IsZero() {
+		value := item.SupersededAt
+		supersededAt = &value
+	}
+	version := item.Version
+	if version <= 0 {
+		version = 1
+	}
+	return consistency.MemoryRecord{
+		ID:               int64(item.ID),
+		UserID:           item.UserID,
+		Content:          item.Content,
+		Importance:       item.Importance,
+		Embedding:        append([]float64(nil), item.Embedding...),
+		Category:         item.Category,
+		Tags:             append([]string(nil), item.Tags...),
+		SlotHint:         item.SlotHint,
+		Version:          version,
+		ContentHash:      item.ContentHash,
+		CreatedAt:        item.CreatedAt,
+		UpdatedAt:        item.UpdatedAt,
+		LastAccessed:     item.LastAccessed,
+		DeletedAt:        item.DeletedAt,
+		Quarantined:      item.Quarantined,
+		QuarantineReason: item.QuarantineReason,
+		Superseded:       item.Superseded,
+		SupersededAt:     supersededAt,
+		Supersedes:       supersedes,
+	}
 }
 
 func (m *LongTerm) buildVocab(text string) {
@@ -308,19 +494,6 @@ func (m *LongTerm) StoreItem(item Item) {
 		item.LastAccessed = item.CreatedAt
 	}
 	m.Items = append(m.Items, item)
-}
-
-// SyncLastItemPGID 将最后一条记忆的 ID 同步为 PG 自增 ID
-// 用于解决内存 ID 与 PG ID 不一致的问题
-func (m *LongTerm) SyncLastItemPGID(pgID int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.Items) > 0 && pgID > 0 {
-		m.Items[len(m.Items)-1].ID = pgID
-		if pgID >= m.nextID {
-			m.nextID = pgID + 1
-		}
-	}
 }
 
 // NeedConsolidation 检查是否需要触发记忆合并
@@ -654,6 +827,198 @@ func appendUniqueInt(s []int, vals ...int) []int {
 		}
 	}
 	return s
+}
+
+// PlanConsolidation computes the authoritative changes consolidation would
+// make without mutating the active cache. Every change carries the version
+// observed during planning so PostgreSQL can reject stale plans.
+func (m *LongTerm) PlanConsolidation(now time.Time) consistency.ConsolidationPlan {
+	m.mu.RLock()
+	items := make([]Item, len(m.Items))
+	for i := range m.Items {
+		items[i] = m.Items[i]
+		items[i].Embedding = append([]float64(nil), m.Items[i].Embedding...)
+		items[i].Tags = append([]string(nil), m.Items[i].Tags...)
+		items[i].Supersedes = append([]int(nil), m.Items[i].Supersedes...)
+	}
+	var cfg *ConsolidationConfig
+	if m.consolidationCfg != nil {
+		copyCfg := *m.consolidationCfg
+		cfg = &copyCfg
+	}
+	m.mu.RUnlock()
+
+	if cfg == nil || len(items) <= 1 {
+		return consistency.ConsolidationPlan{}
+	}
+	removed := make(map[int]bool)
+	reasons := make(map[int]string)
+	updates := make(map[int]consistency.MemoryUpdate)
+
+	const minDecayDelta = 0.01
+	for i := range items {
+		days := now.Sub(items[i].CreatedAt).Hours() / 24
+		if days < 0 {
+			days = 0
+		}
+		oldImportance := items[i].Importance
+		items[i].Importance = oldImportance * math.Pow(cfg.DecayRate, days)
+		if oldImportance-items[i].Importance >= minDecayDelta {
+			record := itemToRecord(items[i])
+			updates[items[i].ID] = consistency.MemoryUpdate{
+				Record:          record,
+				ExpectedVersion: normalizedVersion(items[i].Version),
+			}
+		}
+	}
+
+	for i := 0; i < len(items); i++ {
+		if removed[i] {
+			continue
+		}
+		for j := i + 1; j < len(items); j++ {
+			if removed[j] || items[i].UserID != items[j].UserID {
+				continue
+			}
+			similarity := itemSimilarityPure(items[i], items[j])
+			switch {
+			case similarity >= cfg.DedupThreshold:
+				removeIndex := j
+				if items[j].Importance >= items[i].Importance {
+					removeIndex = i
+				}
+				removed[removeIndex] = true
+				reasons[removeIndex] = "deduplicated"
+				delete(updates, items[removeIndex].ID)
+			case similarity >= cfg.SimilarityThreshold:
+				survivorIndex, removedIndex := i, j
+				if items[j].Importance > items[i].Importance {
+					survivorIndex, removedIndex = j, i
+				}
+				items[survivorIndex] = mergeItemsPure(items[i], items[j], now)
+				removed[removedIndex] = true
+				reasons[removedIndex] = "merged"
+				delete(updates, items[removedIndex].ID)
+				updates[items[survivorIndex].ID] = consistency.MemoryUpdate{
+					Record:          itemToRecord(items[survivorIndex]),
+					ExpectedVersion: normalizedVersion(items[survivorIndex].Version),
+				}
+			}
+			if removed[i] {
+				break
+			}
+		}
+	}
+
+	for i := range items {
+		if removed[i] {
+			continue
+		}
+		days := now.Sub(items[i].CreatedAt).Hours() / 24
+		if cfg.TTLDays > 0 && days > float64(cfg.TTLDays) &&
+			items[i].Importance < cfg.MinImportance {
+			removed[i] = true
+			reasons[i] = "expired"
+			delete(updates, items[i].ID)
+		}
+	}
+
+	if cfg.ProtectFn != nil {
+		var candidates []int
+		for i := range items {
+			if removed[i] {
+				candidates = append(candidates, items[i].ID)
+			}
+		}
+		protected := cfg.ProtectFn(candidates)
+		protectedSet := make(map[int]bool, len(protected))
+		for _, id := range protected {
+			protectedSet[id] = true
+		}
+		for i := range items {
+			if removed[i] && protectedSet[items[i].ID] {
+				removed[i] = false
+				delete(reasons, i)
+			}
+		}
+	}
+
+	plan := consistency.ConsolidationPlan{}
+	for _, update := range updates {
+		plan.Updates = append(plan.Updates, update)
+	}
+	sort.Slice(plan.Updates, func(i, j int) bool {
+		return plan.Updates[i].Record.ID < plan.Updates[j].Record.ID
+	})
+	for i, isRemoved := range removed {
+		if !isRemoved {
+			continue
+		}
+		plan.Deletes = append(plan.Deletes, consistency.MemoryDelete{
+			ID:              int64(items[i].ID),
+			UserID:          items[i].UserID,
+			ExpectedVersion: normalizedVersion(items[i].Version),
+			Reason:          reasons[i],
+		})
+	}
+	sort.Slice(plan.Deletes, func(i, j int) bool { return plan.Deletes[i].ID < plan.Deletes[j].ID })
+	return plan
+}
+
+func normalizedVersion(version int64) int64 {
+	if version <= 0 {
+		return 1
+	}
+	return version
+}
+
+func itemSimilarityPure(a, b Item) float64 {
+	if len(a.Embedding) > 0 && len(a.Embedding) == len(b.Embedding) {
+		return Cosine(a.Embedding, b.Embedding)
+	}
+	vocabulary := make(map[string]int)
+	for _, token := range append(Tokenize(a.Content), Tokenize(b.Content)...) {
+		if _, ok := vocabulary[token]; !ok {
+			vocabulary[token] = len(vocabulary)
+		}
+	}
+	left := make([]float64, len(vocabulary))
+	right := make([]float64, len(vocabulary))
+	for _, token := range Tokenize(a.Content) {
+		left[vocabulary[token]]++
+	}
+	for _, token := range Tokenize(b.Content) {
+		right[vocabulary[token]]++
+	}
+	return Cosine(left, right)
+}
+
+func mergeItemsPure(a, b Item, now time.Time) Item {
+	base, other := a, b
+	if b.Importance > a.Importance {
+		base, other = b, a
+	}
+	merged := base
+	merged.Importance = math.Max(base.Importance, other.Importance)
+	merged.LastAccessed = now
+	if !strings.Contains(base.Content, other.Content) && !strings.Contains(other.Content, base.Content) {
+		merged.Content = base.Content + "；" + other.Content
+	} else if len(other.Content) > len(base.Content) {
+		merged.Content = other.Content
+	}
+	if len(base.Embedding) > 0 && len(base.Embedding) == len(other.Embedding) {
+		total := base.Importance + other.Importance
+		if total > 0 {
+			merged.Embedding = make([]float64, len(base.Embedding))
+			for i := range base.Embedding {
+				merged.Embedding[i] = (base.Embedding[i]*base.Importance + other.Embedding[i]*other.Importance) / total
+			}
+		}
+	}
+	merged.Tags = mergeTags(base.Tags, other.Tags)
+	merged.Supersedes = appendUniqueInt(append([]int(nil), base.Supersedes...), other.ID)
+	merged.Supersedes = appendUniqueInt(merged.Supersedes, other.Supersedes...)
+	return merged
 }
 
 // Consolidate 执行记忆合并：衰减 → 去重+合并 → 过期淘汰

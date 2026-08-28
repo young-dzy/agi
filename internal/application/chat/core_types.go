@@ -108,7 +108,5 @@ func NewStreamEvent(eventType string, data interface{}) StreamEvent {
 
 // ChatOptions 控制本次对话的路由行为
 type ChatOptions struct {
-	UseRAG        bool     // 是否使用 RAG 知识库
-	SelectedTools []string // 用户明确选中的工具列表；nil = 自动路由，[] = 禁用工具
-	Explicit      bool     // true 时以 SelectedTools/UseRAG 为准，false 时自动路由
+	UseRAG bool // 是否使用 RAG 知识库
 }

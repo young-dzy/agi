@@ -62,13 +62,14 @@ func toNodeIDs(ss []string) []graph.NodeID {
 }
 
 // llmPlanGraph 调用 Planner LLM，输出带依赖关系的 planNode 列表。
+// allowSubAgents=false 时：不触发子 Agent 硬规则、不向 LLM 暴露子 Agent、并过滤掉 sub_agent 节点。
 // 若 LLM 不可用或解析失败，降级为关键词规则。
-func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[string]tool.Tool, memPrefix string) []*graph.Node {
-	if a.needsSubAgentPlan(strings.ToLower(query)) {
-		return a.rulePlanNodes(ctx, query, ts, memPrefix)
+func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[string]tool.Tool, memPrefix string, allowSubAgents bool) []*graph.Node {
+	if allowSubAgents && a.needsSubAgentPlan(strings.ToLower(query)) {
+		return a.rulePlanNodes(ctx, query, ts, memPrefix, allowSubAgents)
 	}
 	if !a.cfg.IsRealLLM() {
-		return a.rulePlanNodes(ctx, query, ts, memPrefix)
+		return a.rulePlanNodes(ctx, query, ts, memPrefix, allowSubAgents)
 	}
 
 	// 构造工具描述
@@ -88,43 +89,51 @@ func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[st
 		}
 		toolLines = append(toolLines, fmt.Sprintf("- %s: %s [参数: %s]", name, t.Description, params))
 	}
-	var agentLines []string
-	for name, sa := range a.subagents.snapshot() {
-		agentLines = append(agentLines, fmt.Sprintf("- %s: %s", name, sa.Description()))
+
+	// 子 Agent 段落：仅在 allowSubAgents 时暴露给规划器
+	subAgentRule := ""
+	agentSection := ""
+	if allowSubAgents {
+		var agentLines []string
+		for name, sa := range a.subagents.snapshot() {
+			agentLines = append(agentLines, fmt.Sprintf("- %s: %s", name, sa.Description()))
+		}
+		subAgentRule = "\n- 需要研究、总结、报告、写文档时，优先使用 research_agent / writer_agent / review_agent / doc_agent 组合\n- doc_agent 负责把上游内容保存到本地文档库并写入 RAG"
+		agentSection = "\n\n可用子 Agent：\n" + strings.Join(agentLines, "\n")
 	}
 
-	planPrompt := fmt.Sprintf(`你是一个任务规划器。根据用户问题，从可用工具和可用子 Agent 中选出需要调用的节点，并标注它们之间的依赖关系。
+	planPrompt := fmt.Sprintf(`你是一个任务规划器。根据用户问题，从可用工具%s中选出需要调用的节点，并标注它们之间的依赖关系。
 
 规则：
 - 给每个节点分配一个唯一 id（如 n1, n2, n3...）
-- type 只能是 "tool" 或 "sub_agent"
-- 工具节点填写 tool 和 params；子 Agent 节点填写 agent 和 goal
+- type 只能是 "tool"%s
+- 工具节点填写 tool 和 params%s
 - 如果节点 B 需要节点 A 的输出，则 B 的 depends_on 包含 A 的 id
 - 如果两个工具功能类似（如多个搜索源），设相同的 race_group，系统会并行执行谁先返回用谁
-- 无依赖关系的节点不要互相等待，depends_on 设为 []
-- 需要研究、总结、报告、写文档时，优先使用 research_agent / writer_agent / review_agent / doc_agent 组合
-- doc_agent 负责把上游内容保存到本地文档库并写入 RAG
+- 无依赖关系的节点不要互相等待，depends_on 设为 []%s
 
 用户问题：%s
 可用工具：
-%s
-
-可用子 Agent：
-%s
+%s%s
 
 请以 JSON 数组格式输出执行计划：
-[{"id":"n1","type":"sub_agent","agent":"research_agent","goal":"研究目标","params":{},"reason":"一句话说明为什么调用","depends_on":[],"race_group":""}]
-如果无需工具直接回答，输出 []。只输出 JSON，不要其他内容。`, query, strings.Join(toolLines, "\n"), strings.Join(agentLines, "\n"))
+[{"id":"n1","type":"tool","tool":"search_web","params":{"query":"..."},"reason":"一句话说明为什么调用","depends_on":[],"race_group":""}]
+如果无需工具直接回答，输出 []。只输出 JSON，不要其他内容。`,
+		ternary(allowSubAgents, "和可用子 Agent", ""),
+		ternary(allowSubAgents, ` 或 "sub_agent"`, ""),
+		ternary(allowSubAgents, "；子 Agent 节点填写 agent 和 goal", ""),
+		subAgentRule,
+		query, strings.Join(toolLines, "\n"), agentSection)
 
 	plannerBase := "你是一个精准的任务规划器，只在必要时才调用工具，不做无意义的调用。能识别工具间的依赖关系和可竞速的同类工具。"
 	if memPrefix != "" {
 		plannerBase = memPrefix + "\n\n" + plannerBase + "\n注意：用户偏好可能影响工具参数选择（如城市、时区等），请在参数中体现。"
 	}
-	raw := a.llm.ChatContext(ctx, plannerBase,
+	raw := a.llm.ChatContextFast(ctx, plannerBase,
 		[]llm.Message{{Role: "user", Content: planPrompt}})
 
 	if ctx.Err() != nil {
-		return a.rulePlanNodes(ctx, query, ts, memPrefix)
+		return a.rulePlanNodes(ctx, query, ts, memPrefix, allowSubAgents)
 	}
 
 	// 清洗 LLM 输出
@@ -178,7 +187,7 @@ func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[st
 			} else {
 				logger.C(ctx).Warn("planner LLM parse failed, falling back to rule-based",
 					"err", err, "legacy_err", legacyErr, "alt_err", altErr, "raw", raw)
-				return a.rulePlanNodes(ctx, query, ts, memPrefix)
+				return a.rulePlanNodes(ctx, query, ts, memPrefix, allowSubAgents)
 			}
 		}
 	}
@@ -194,6 +203,10 @@ func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[st
 			}
 		}
 		if n.Type == string(graph.NodeTypeSubAgent) {
+			// 普通 loop 不允许子 Agent：直接丢弃（双保险，即便 prompt 已不暴露）
+			if !allowSubAgents {
+				continue
+			}
 			if _, ok := a.subagents.get(n.Agent); !ok {
 				continue
 			}
@@ -218,7 +231,7 @@ func (a *UnifiedAgent) llmPlanGraph(ctx context.Context, query string, ts map[st
 }
 
 // rulePlanNodes 关键词规则降级规划（无真实 LLM 时使用），所有节点 depends_on=[] 无依赖
-func (a *UnifiedAgent) rulePlanNodes(ctx context.Context, query string, ts map[string]tool.Tool, memPrefix string) []*graph.Node {
+func (a *UnifiedAgent) rulePlanNodes(ctx context.Context, query string, ts map[string]tool.Tool, memPrefix string, allowSubAgents bool) []*graph.Node {
 	q := strings.ToLower(query)
 	var nodes []*graph.Node
 	counter := 0
@@ -227,7 +240,7 @@ func (a *UnifiedAgent) rulePlanNodes(ctx context.Context, query string, ts map[s
 		return fmt.Sprintf("n%d", counter)
 	}
 
-	if a.needsSubAgentPlan(q) {
+	if allowSubAgents && a.needsSubAgentPlan(q) {
 		researchID := nextID()
 		writerID := nextID()
 		reviewID := nextID()
@@ -258,35 +271,6 @@ func (a *UnifiedAgent) rulePlanNodes(ctx context.Context, query string, ts map[s
 		return nodes
 	}
 
-	if _, ok := ts["get_time"]; ok {
-		if strings.Contains(q, "时间") || strings.Contains(q, "几点") || strings.Contains(q, "现在") {
-			params := map[string]string{}
-			if strings.Contains(q, "东京") {
-				params["timezone"] = "Asia/Tokyo"
-			}
-			nodes = append(nodes, &graph.Node{
-				ID: graph.NodeID(nextID()), Type: graph.NodeTypeTool,
-				ToolName: "get_time", Params: params, Name: "查询当前时间",
-				DependsOn: []graph.NodeID{}, RaceGroup: "",
-			})
-		}
-	}
-	if _, ok := ts["get_weather"]; ok {
-		if strings.Contains(q, "天气") {
-			city := "北京"
-			for _, c := range []string{"东京", "北京", "上海", "广州", "深圳", "纽约", "伦敦"} {
-				if strings.Contains(q, c) {
-					city = c
-					break
-				}
-			}
-			nodes = append(nodes, &graph.Node{
-				ID: graph.NodeID(nextID()), Type: graph.NodeTypeTool,
-				ToolName: "get_weather", Params: map[string]string{"city": city},
-				Name: "查询" + city + "天气", DependsOn: []graph.NodeID{}, RaceGroup: "",
-			})
-		}
-	}
 	if _, ok := ts["search_web"]; ok {
 		if strings.Contains(q, "搜索") || strings.Contains(q, "查询") || strings.Contains(q, "介绍") ||
 			strings.Contains(q, "是什么") || strings.Contains(q, "怎么") || strings.Contains(q, "如何") {
@@ -297,27 +281,8 @@ func (a *UnifiedAgent) rulePlanNodes(ctx context.Context, query string, ts map[s
 			})
 		}
 	}
-	if _, ok := ts["exec_command"]; ok {
-		if strings.Contains(q, "执行") || strings.Contains(q, "运行") || strings.Contains(q, "命令") ||
-			strings.Contains(q, "终端") || strings.Contains(q, "lscpu") || strings.Contains(q, "cpu") ||
-			strings.Contains(q, "磁盘") || strings.Contains(q, "内存") || strings.Contains(q, "系统信息") {
-			cmd := extractShellCommand(query)
-			nodes = append(nodes, &graph.Node{
-				ID: graph.NodeID(nextID()), Type: graph.NodeTypeTool,
-				ToolName: "exec_command", Params: map[string]string{"command": cmd},
-				Name: "执行终端命令", DependsOn: []graph.NodeID{}, RaceGroup: "",
-			})
-		}
-	}
-	if _, ok := ts["rag_search"]; ok {
-		nodes = append(nodes, &graph.Node{
-			ID: graph.NodeID(nextID()), Type: graph.NodeTypeTool,
-			ToolName: "rag_search", Params: map[string]string{"query": query},
-			Name: "检索个人知识库", DependsOn: []graph.NodeID{}, RaceGroup: "search",
-		})
-	}
-	// MCP / 自定义工具
-	builtins := map[string]bool{"get_time": true, "get_weather": true, "search_web": true, "rag_search": true, "exec_command": true}
+	// 其余自定义工具（含 skill 广场的 skill_* 工具）：裁剪后内置只剩 search_web
+	builtins := map[string]bool{"search_web": true}
 	for name, t := range ts {
 		if builtins[name] {
 			continue
@@ -337,6 +302,46 @@ func (a *UnifiedAgent) needsSubAgentPlan(q string) bool {
 		strings.Contains(q, "总结") || strings.Contains(q, "报告") ||
 		strings.Contains(q, "文档") || strings.Contains(q, "方案") ||
 		strings.Contains(q, "分析")
+}
+
+// subAgentPipelineNodes 返回固定的 Agentic RAG 流水线：
+// research（读知识库取证）→ writer（成文）→ review（审查）→ doc（回填知识库）。
+// 用于 rag_agent 模式（强制流水线）与 allowSubAgents 的规则规划兜底。
+func (a *UnifiedAgent) subAgentPipelineNodes(_ string) []*graph.Node {
+	research := "n1"
+	writer := "n2"
+	review := "n3"
+	doc := "n4"
+	return []*graph.Node{
+		{
+			ID: graph.NodeID(research), Type: graph.NodeTypeSubAgent,
+			AgentName: "research_agent", Goal: "围绕用户任务在知识库中多轮检索并整理证据",
+			Name: "子 Agent 研究与证据收集", DependsOn: []graph.NodeID{},
+		},
+		{
+			ID: graph.NodeID(writer), Type: graph.NodeTypeSubAgent,
+			AgentName: "writer_agent", Goal: "基于研究结果生成 Markdown 报告",
+			Name: "子 Agent 生成报告", DependsOn: []graph.NodeID{graph.NodeID(research)},
+		},
+		{
+			ID: graph.NodeID(review), Type: graph.NodeTypeSubAgent,
+			AgentName: "review_agent", Goal: "检查报告质量、风险和证据缺口",
+			Name: "子 Agent 审查报告", DependsOn: []graph.NodeID{graph.NodeID(writer)},
+		},
+		{
+			ID: graph.NodeID(doc), Type: graph.NodeTypeSubAgent,
+			AgentName: "doc_agent", Goal: "保存报告到本地文档库并写入 RAG",
+			Name: "子 Agent 保存文档", DependsOn: []graph.NodeID{graph.NodeID(writer), graph.NodeID(review)},
+		},
+	}
+}
+
+// ternary 是三元表达式的小工具（Go 无内置），用于按开关拼接 prompt 片段。
+func ternary(cond bool, ifTrue, ifFalse string) string {
+	if cond {
+		return ifTrue
+	}
+	return ifFalse
 }
 
 func wantsDocumentWrite(q string) bool {

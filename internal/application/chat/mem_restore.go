@@ -10,6 +10,8 @@
 package chat
 
 import (
+	"context"
+
 	"agi-assistant/internal/domain/knowledge"
 	graphmem "agi-assistant/internal/domain/memory/graph"
 	"agi-assistant/internal/domain/memory/longterm"
@@ -21,6 +23,22 @@ import (
 // restoreFromDB 启动时从 PostgreSQL 恢复长期记忆。
 // preference / chat_history 改为请求级懒加载，本函数不再处理。
 func (a *UnifiedAgent) restoreFromDB() {
+	if a.repos.memoryTx != nil {
+		records, err := a.repos.memoryTx.LoadActive(context.Background())
+		if err != nil {
+			logger.L().Warn("authoritative long-term memory restore failed", "err", err)
+			return
+		}
+		a.mem.ltm.ReplaceCommitted(records)
+		if len(records) > 0 {
+			logger.L().Info("long-term memory restored from source of truth",
+				"count", len(records))
+		}
+		return
+	}
+
+	// Compatibility fallback for tests and transitional callers that have not
+	// yet injected memorytx. Production wiring always supplies memorytx.
 	// 恢复长期记忆（含所有用户的条目；召回时由 UserID 过滤实现隔离）
 	rows := a.repos.ltm.Load()
 	for _, row := range rows {

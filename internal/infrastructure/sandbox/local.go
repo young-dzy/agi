@@ -58,6 +58,9 @@ func (l *LocalSandbox) Exec(ctx context.Context, req sandbox.ExecRequest) sandbo
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, "sh", "-c", req.Command)
+	if req.WorkspaceHostDir != "" {
+		cmd.Dir = req.WorkspaceHostDir // 本地模式：直接在产物工作目录执行
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = limitWriter(&stdout, l.cfg.MaxOutputBytes)
 	cmd.Stderr = limitWriter(&stderr, l.cfg.MaxOutputBytes)

@@ -10,6 +10,8 @@ import (
 	"agi-assistant/internal/domain/rag"
 	"agi-assistant/internal/domain/tool"
 	"agi-assistant/internal/pkg/logger"
+	"agi-assistant/internal/usercontext"
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -17,6 +19,19 @@ import (
 
 func (a *UnifiedAgent) RegisterTool(t tool.Tool) {
 	a.tools.register(t)
+}
+
+// enabledSkillTools 返回当前请求用户「已安装且开启」的 skill 工具集。
+// skillProvider 未注入或未登录时返回 nil——由调用方合并时做空守卫。
+func (a *UnifiedAgent) enabledSkillTools(ctx context.Context) map[string]tool.Tool {
+	if a.skillProvider == nil {
+		return nil
+	}
+	userID := usercontext.UserIDFromContext(ctx)
+	if userID == "" {
+		return nil
+	}
+	return a.skillProvider(userID)
 }
 
 // RAG 暴露 RAG 引擎，供 HTTP handler 直接调用 Ingest

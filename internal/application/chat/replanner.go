@@ -64,6 +64,7 @@ func (a *UnifiedAgent) llmReplan(
 	rc replanContext,
 	ts map[string]tool.Tool,
 	memPrefix string,
+	allowSubAgents bool,
 ) []*graph.Node {
 	if !a.cfg.IsRealLLM() {
 		return nil
@@ -76,9 +77,14 @@ func (a *UnifiedAgent) llmReplan(
 	for name, t := range ts {
 		toolLines = append(toolLines, fmt.Sprintf("- %s: %s", name, t.Description))
 	}
-	var agentLines []string
-	for name, sa := range a.subagents.snapshot() {
-		agentLines = append(agentLines, fmt.Sprintf("- %s: %s", name, sa.Description()))
+	// 子 Agent 段落：仅在 allowSubAgents 时暴露
+	agentSection := ""
+	if allowSubAgents {
+		var agentLines []string
+		for name, sa := range a.subagents.snapshot() {
+			agentLines = append(agentLines, fmt.Sprintf("- %s: %s", name, sa.Description()))
+		}
+		agentSection = "\n\n可用子 Agent：\n" + strings.Join(agentLines, "\n")
 	}
 
 	failedHint := ""
@@ -100,10 +106,7 @@ func (a *UnifiedAgent) llmReplan(
 %s
 
 可用工具：
-%s
-
-可用子 Agent：
-%s
+%s%s
 
 判断规则：
 - 如果现有观察已足够回答用户问题，返回 []（不追加）
@@ -115,14 +118,14 @@ func (a *UnifiedAgent) llmReplan(
 以 JSON 数组格式输出（结构与 planner 相同）：
 [{"id":"r1","type":"tool","tool":"search_web","params":{...},"reason":"...","depends_on":["n2"],"race_group":""}]
 只输出 JSON。`, rc.Query, rc.Reason, failedHint, string(snapJSON),
-		strings.Join(toolLines, "\n"), strings.Join(agentLines, "\n"))
+		strings.Join(toolLines, "\n"), agentSection)
 
 	base := "你是一个精准的任务重规划器，只在现有观察不足时才追加节点，避免无意义的调用。"
 	if memPrefix != "" {
 		base = memPrefix + "\n\n" + base
 	}
 
-	raw := a.llm.ChatContext(ctx, base, []llm.Message{{Role: "user", Content: prompt}})
+	raw := a.llm.ChatContextFast(ctx, base, []llm.Message{{Role: "user", Content: prompt}})
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -154,6 +157,9 @@ func (a *UnifiedAgent) llmReplan(
 			}
 		}
 		if n.Type == string(graph.NodeTypeSubAgent) {
+			if !allowSubAgents {
+				continue
+			}
 			if _, ok := a.subagents.get(n.Agent); !ok {
 				continue
 			}

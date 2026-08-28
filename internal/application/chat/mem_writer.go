@@ -29,9 +29,8 @@ import (
 	"fmt"
 	"strings"
 
-	"agi-assistant/internal/domain/memory/longterm"
 	"agi-assistant/internal/infrastructure/llm"
-	ltmrepo "agi-assistant/internal/infrastructure/persistence/longterm"
+	"agi-assistant/internal/infrastructure/persistence/memorytx"
 	"agi-assistant/internal/pkg/logger"
 )
 
@@ -174,30 +173,30 @@ func (a *UnifiedAgent) runMemExtractAndStore(userID, source, prompt string, impo
 		tags = appendUniqueTag(tags, "src:"+source)
 
 		emb, _ := a.llm.Embed(content)
-		// 写入返回 (added, newID)：newID==0 表示因 dedup/失败未入库，跳过 conflict 检测
-		var added bool
-		var newID int
-		if a.mem.graphMem != nil {
-			added, _ = a.mem.graphMem.StoreClassified(userID, content, importance, emb, category, tags, slotHint)
-			if added {
-				embJSON, _ := json.Marshal(emb)
-				newID = a.repos.ltm.SaveClassified(userID, content, importance, embJSON, category, tags, slotHint)
-				a.mem.graphMem.SyncLastItemPGID(newID)
-			}
-		} else if a.mem.ltm.StoreClassified(userID, content, importance, emb, category, tags, slotHint) {
-			added = true
-			embJSON, _ := json.Marshal(emb)
-			newID = a.repos.ltm.SaveClassified(userID, content, importance, embJSON, category, tags, slotHint)
-			a.mem.ltm.SyncLastItemPGID(newID)
+		record, err := a.commitMemory(context.Background(), memorytx.CreateCommand{
+			UserID:         userID,
+			Content:        content,
+			Importance:     importance,
+			Embedding:      emb,
+			Category:       category,
+			Tags:           tags,
+			SlotHint:       slotHint,
+			EmitGraphEdges: true,
+		})
+		if err != nil {
+			logger.L().Warn("memory-extract commit failed",
+				"source", source, "user_id", userID, "key", k, "err", err)
+			continue
 		}
 		logger.L().Info("memory-extract stored",
 			"source", source, "user_id", userID, "key", k, "value", v,
-			"category", category, "importance", importance)
+			"category", category, "importance", importance,
+			"memory_id", record.ID, "version", record.Version)
 
 		// 矛盾检测：仅对 identity/preference/fact 类启用，且必须真实入库（newID>0）
 		// 失败 / LLM 不可用时为 no-op，不影响主流程
-		if added && newID > 0 {
-			a.detectAndResolveConflict(context.Background(), userID, content, emb, category, newID)
+		if record.ID > 0 {
+			a.detectAndResolveConflict(context.Background(), userID, content, emb, category, int(record.ID))
 		}
 	}
 }
@@ -260,27 +259,4 @@ func (a *UnifiedAgent) llmClassifyMemory(content string) (category string, tags 
 		return "general", nil, ""
 	}
 	return result.Category, result.Tags, result.SlotHint
-}
-
-// syncConsolidationToDB 将记忆合并结果同步到 PostgreSQL
-func (a *UnifiedAgent) syncConsolidationToDB(result longterm.ConsolidationResult) {
-	if len(result.DeleteFromDB) > 0 {
-		a.repos.ltm.Delete(result.DeleteFromDB)
-		logger.L().Info("memory consolidation: deleted",
-			"total", result.Deduped+result.Merged+result.Expired,
-			"deduped", result.Deduped, "merged", result.Merged, "expired", result.Expired)
-	}
-	for _, item := range result.UpdateInDB {
-		embJSON, _ := json.Marshal(item.Embedding)
-		a.repos.ltm.Update(item.ID, item.Content, item.Importance, embJSON)
-		logger.L().Info("memory consolidation: updated", "id", item.ID)
-	}
-	if len(result.DecayUpdates) > 0 {
-		updates := make([]ltmrepo.ImportanceUpdate, 0, len(result.DecayUpdates))
-		for _, d := range result.DecayUpdates {
-			updates = append(updates, ltmrepo.ImportanceUpdate{ID: d.ID, Importance: d.Importance})
-		}
-		a.repos.ltm.UpdateImportanceBatch(updates)
-		logger.L().Info("memory decay batch update", "count", len(updates))
-	}
 }

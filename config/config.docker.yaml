@@ -67,7 +67,7 @@ server:
 
 search:
   api_key: "填入自己的api"
-  api_url: "https://tavily.com"
+  api_url: "https://api.tavily.com/search"
 
 # ===== 知识图谱（Neo4j）=====
 neo4j:

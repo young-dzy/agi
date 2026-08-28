@@ -10,6 +10,7 @@ import (
 	"agi-assistant/internal/infrastructure/persistence/chathistory"
 	docrepo "agi-assistant/internal/infrastructure/persistence/documentrepo"
 	ltmrepo "agi-assistant/internal/infrastructure/persistence/longterm"
+	"agi-assistant/internal/infrastructure/persistence/memorytx"
 	prefrepo "agi-assistant/internal/infrastructure/persistence/preference"
 	"agi-assistant/internal/infrastructure/persistence/ragchunk"
 	"agi-assistant/internal/infrastructure/persistence/snapshot"
@@ -21,6 +22,7 @@ type repoBundle struct {
 	pref     prefrepo.Repo
 	snap     snapshot.Repo
 	ltm      ltmrepo.Repo
+	memoryTx memorytx.Store
 	ragChunk ragchunk.Repo
 	docs     docrepo.Repo
 	events   eventbus.Publisher
@@ -34,6 +36,7 @@ func newRepoBundle(deps Deps) *repoBundle {
 		pref:     deps.PrefRepo,
 		snap:     deps.SnapRepo,
 		ltm:      deps.LTMRepo,
+		memoryTx: deps.MemoryTxRepo,
 		ragChunk: deps.RAGChunkRepo,
 		docs:     deps.DocumentRepo,
 		events:   deps.Events,

@@ -81,7 +81,7 @@ func (d *DockerSandbox) Exec(ctx context.Context, req sandbox.ExecRequest) sandb
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := d.buildDockerArgs(req.Command)
+	args := d.buildDockerArgs(req)
 
 	cmd := exec.CommandContext(execCtx, "docker", args...)
 
@@ -123,7 +123,7 @@ func (d *DockerSandbox) Exec(ctx context.Context, req sandbox.ExecRequest) sandb
 }
 
 // buildDockerArgs 构造 docker run 的完整参数列表
-func (d *DockerSandbox) buildDockerArgs(command string) []string {
+func (d *DockerSandbox) buildDockerArgs(req sandbox.ExecRequest) []string {
 	args := []string{
 		"run",
 		"--rm",
@@ -148,12 +148,17 @@ func (d *DockerSandbox) buildDockerArgs(command string) []string {
 	if d.cfg.MaxPIDs > 0 {
 		args = append(args, "--pids-limit", fmt.Sprintf("%d", d.cfg.MaxPIDs))
 	}
+	// 产物工作目录：把宿主机目录绑定挂载到 /workspace（可写），命令在此目录执行。
+	// 即使 rootfs 只读，挂载卷仍可写，产物文件落到宿主机对应目录（桌面）。
+	if req.WorkspaceHostDir != "" {
+		args = append(args, "-v", req.WorkspaceHostDir+":/workspace:rw", "-w", "/workspace")
+	}
 
 	image := d.cfg.Image
 	if image == "" {
 		image = "ubuntu:22.04"
 	}
-	args = append(args, image, "sh", "-c", command)
+	args = append(args, image, "sh", "-c", req.Command)
 	return args
 }
 

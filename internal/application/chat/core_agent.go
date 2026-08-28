@@ -22,10 +22,12 @@ import (
 	"agi-assistant/internal/infrastructure/persistence/chathistory"
 	docrepo "agi-assistant/internal/infrastructure/persistence/documentrepo"
 	ltmrepo "agi-assistant/internal/infrastructure/persistence/longterm"
+	"agi-assistant/internal/infrastructure/persistence/memorytx"
 	prefrepo "agi-assistant/internal/infrastructure/persistence/preference"
 	"agi-assistant/internal/infrastructure/persistence/ragchunk"
 	"agi-assistant/internal/infrastructure/persistence/snapshot"
 	toolimpl "agi-assistant/internal/infrastructure/tool"
+	"agi-assistant/internal/pkg/logger"
 	"context"
 	"fmt"
 	"sync"
@@ -64,6 +66,10 @@ type UnifiedAgent struct {
 	// per-request 共享状态：snapshots、当前任务、in-flight cancel funcs。
 	// 由 taskRuntime 聚合并管理 sync.Mutex，避免在 agent struct 上铺锁字段。
 	runtime *taskRuntime
+
+	// skillProvider 按 userID 返回「已安装且开启」的 skill 工具集，由 main.go
+	// 注入（application/skill.Service.EnabledTools）。可为 nil（未接入广场时）。
+	skillProvider func(userID string) map[string]tool.Tool
 }
 
 // Deps 是 UnifiedAgent 的依赖注入容器，由 main.go 在启动期组装。
@@ -72,11 +78,15 @@ type Deps struct {
 	PrefRepo     prefrepo.Repo
 	SnapRepo     snapshot.Repo
 	LTMRepo      ltmrepo.Repo
+	MemoryTxRepo memorytx.Store
 	RAGChunkRepo ragchunk.Repo
 	DocumentRepo docrepo.Repo
 	Events       eventbus.Publisher
 	// InfraStatus 平台层连接健康快照
 	InfraStatus map[string]string
+	// EnabledSkillTools 按 userID 返回已开启 skill 的工具集（Skill 广场）。
+	// 可为 nil；由 main.go 用 application/skill.Service.EnabledTools 装配。
+	EnabledSkillTools func(userID string) map[string]tool.Tool
 }
 
 // New 创建并初始化 UnifiedAgent。
@@ -125,6 +135,7 @@ func New(cfg *config.APIConfig, deps Deps) *UnifiedAgent {
 		repos:        newRepoBundle(deps),
 		ragMilvusDim: cfg.RAGMilvusDim,
 	}
+	a.skillProvider = deps.EnabledSkillTools
 	a.wireRAGCallbacks()
 	a.registerBuiltinSubAgents()
 	a.bootstrapConcurrent()
@@ -152,17 +163,17 @@ func (a *UnifiedAgent) wireRAGCallbacks() {
 		return a.llm.Embed(text)
 	})
 	// Query Rewriter（history-aware + multi-query）。用独立 LLM 闭包不带
-	// 记忆前缀，避免改写 prompt 被偏好污染。
+	// 记忆前缀，避免改写 prompt 被偏好污染。改写属内部步骤 → 走快模型。
 	if cfg.RAGRewriteEnabled && cfg.RAGRewriteNumQueries > 1 {
 		rewriteLLM := func(systemPrompt, userMsg string) string {
-			return a.llm.Chat(systemPrompt, []llm.Message{{Role: "user", Content: userMsg}})
+			return a.llm.ChatFast(systemPrompt, []llm.Message{{Role: "user", Content: userMsg}})
 		}
 		a.rag.SetRewriter(rag.NewLLMRewriter(rewriteLLM, cfg.RAGRewriteNumQueries))
 	}
-	// Reranker（LLM listwise 精排）
+	// Reranker（LLM listwise 精排）——内部步骤 → 走快模型
 	if cfg.RAGRerankEnabled {
 		rerankLLM := func(systemPrompt, userMsg string) string {
-			return a.llm.Chat(systemPrompt, []llm.Message{{Role: "user", Content: userMsg}})
+			return a.llm.ChatFast(systemPrompt, []llm.Message{{Role: "user", Content: userMsg}})
 		}
 		a.rag.SetReranker(rag.NewLLMReranker(rerankLLM, cfg.RAGRerankPreviewLen))
 	}
@@ -194,29 +205,10 @@ func (a *UnifiedAgent) bootstrapConcurrent() {
 	wg.Wait()
 }
 
-// registerBuiltinTools 注册内置工具：rag_search（个人知识库检索）、
-// search_web（Tavily 优先、LLM 知识降级）。两者都通过 RegisterTool 持锁写入，
-// 与 initSandbox 的 exec_command 注册并发安全。
+// registerBuiltinTools 注册内置工具：裁剪后只保留 search_web
+// （Tavily 优先、LLM 知识降级）。rag_search / 文档工具已下线，
+// 知识检索改由「知识库」开关走 rag 模式，文档保存仍由 doc_agent 直接调用 WriteDocument。
 func (a *UnifiedAgent) registerBuiltinTools() {
-	// 个人知识库检索
-	a.RegisterTool(tool.Tool{
-		Name:        "rag_search",
-		Description: "从私人黑洞（个人知识库）中检索相关文档内容",
-		Parameters: []tool.Param{
-			{Name: "query", Type: "string", Description: "检索关键词或问题", Required: true},
-		},
-		Execute: func(params map[string]interface{}) (string, error) {
-			q, _ := params["query"].(string)
-			if q == "" {
-				q = "相关内容"
-			}
-			if !a.rag.Loaded {
-				return "", fmt.Errorf("知识库为空，请先在「私人黑洞」上传文档")
-			}
-			answer, _ := a.rag.Query(q)
-			return answer, nil
-		},
-	})
 	// Tavily 优先 + LLM 知识降级（替换默认 mock search_web）
 	a.RegisterTool(tool.Tool{
 		Name:        "search_web",
@@ -232,6 +224,8 @@ func (a *UnifiedAgent) registerBuiltinTools() {
 			if a.cfg.SearchAPIKey != "" {
 				if result, err := toolimpl.TavilySearch(q, a.cfg.SearchAPIKey, a.cfg.SearchAPIURL); err == nil {
 					return result, nil
+				} else {
+					logger.L().Warn("Tavily search failed, falling back to LLM", "query", q, "err", err)
 				}
 			}
 			return a.llm.Chat(
@@ -240,8 +234,6 @@ func (a *UnifiedAgent) registerBuiltinTools() {
 			), nil
 		},
 	})
-
-	a.registerDocumentTools()
 }
 
 // buildPromptCtx 构造 Schema-driven 的 prompt 装配器。

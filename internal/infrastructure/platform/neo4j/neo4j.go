@@ -80,7 +80,7 @@ func (c *Client) EnsureConstraints() {
 	queries := []string{
 		`CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE`,
 		`CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.type)`,
-		`CREATE INDEX memory_node_id IF NOT EXISTS FOR (m:Memory) ON (m.mem_id)`,
+		`CREATE CONSTRAINT memory_node_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.memory_id IS UNIQUE`,
 	}
 	for _, q := range queries {
 		if _, err := sess.Run(ctx, q, nil); err != nil {

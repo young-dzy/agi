@@ -84,41 +84,16 @@ type CallResult struct {
 // ─────────────────────────────── 工具选择 ────────────────────────────────
 
 // Decide 基于规则推断应调用的工具及参数。
-// 只会返回 ts 中实际存在的工具；若规则匹配到的工具不在 ts 中则返回 nil。
+// 裁剪后内置工具只剩 search_web；命中检索类关键词走 search_web，
+// 否则回落到工具集中的第一个工具（含 skill_* / MCP）。
+// 只会返回 ts 中实际存在的工具；ts 为空时返回 nil。
 func Decide(query string, ts map[string]Tool) *CallResult {
 	q := strings.ToLower(query)
-
-	if strings.Contains(q, "几点") || strings.Contains(q, "时间") {
-		if _, ok := ts["get_time"]; ok {
-			params := map[string]interface{}{}
-			if strings.Contains(q, "东京") {
-				params["timezone"] = "Asia/Tokyo"
-			}
-			return &CallResult{ToolName: "get_time", Params: params}
-		}
-	}
-
-	if strings.Contains(q, "天气") {
-		if _, ok := ts["get_weather"]; ok {
-			city := "北京"
-			for _, c := range []string{"东京", "北京", "上海", "纽约", "伦敦", "广州", "深圳"} {
-				if strings.Contains(q, c) {
-					city = c
-					break
-				}
-			}
-			return &CallResult{ToolName: "get_weather", Params: map[string]interface{}{"city": city}}
-		}
-	}
 
 	if strings.Contains(q, "查") || strings.Contains(q, "搜索") || strings.Contains(q, "是什么") {
 		if _, ok := ts["search_web"]; ok {
 			return &CallResult{ToolName: "search_web", Params: map[string]interface{}{"query": query}}
 		}
-	}
-
-	if _, ok := ts["exec_command"]; ok {
-		return &CallResult{ToolName: "exec_command", Params: map[string]interface{}{"command": query}}
 	}
 
 	// 无规则命中或命中工具不在集合中时，取集合中第一个工具兜底

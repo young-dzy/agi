@@ -16,14 +16,15 @@
 package chat
 
 import (
-	"agi-assistant/internal/domain/memory/longterm"
 	"agi-assistant/internal/domain/tool"
 	"agi-assistant/internal/infrastructure/llm"
+	"agi-assistant/internal/infrastructure/persistence/memorytx"
 	"agi-assistant/internal/pkg/logger"
 	"agi-assistant/internal/usercontext"
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // ─────────────────────────── 公开入口 ───────────────────────────
@@ -32,7 +33,7 @@ func (a *UnifiedAgent) Process(query string) *Response {
 	ctx, cancel := context.WithCancel(context.Background())
 	unregister := a.registerCancel(cancel)
 	defer unregister()
-	return a.runOnce(ctx, query, ChatOptions{Explicit: false}, nil)
+	return a.runOnce(ctx, query, ChatOptions{}, nil)
 }
 
 // ProcessWithOptions 带显式选项的入口，供前端精确控制路由
@@ -157,10 +158,18 @@ func (a *UnifiedAgent) prepare(ctx context.Context, query string, opts ChatOptio
 					continue
 				}
 				emb, _ := a.llm.Embed(content)
-				if added, _ := a.mem.graphMem.Store(userID, content, 0.8, emb); added {
-					embJSON, _ := json.Marshal(emb)
-					pgID := a.repos.ltm.Save(userID, content, 0.8, embJSON)
-					a.mem.graphMem.SyncLastItemPGID(pgID)
+				if _, err := a.commitMemory(ctx, memorytx.CreateCommand{
+					UserID:         userID,
+					Content:        content,
+					Importance:     0.8,
+					Embedding:      emb,
+					Category:       "preference",
+					Tags:           []string{"preference", "src:user"},
+					SlotHint:       "profile",
+					EmitGraphEdges: true,
+				}); err != nil {
+					logger.C(ctx).Warn("preference memory commit failed",
+						"user_id", userID, "key", k, "err", err)
 				}
 			}
 		})
@@ -177,6 +186,19 @@ func (a *UnifiedAgent) prepare(ctx context.Context, query string, opts ChatOptio
 	// 路由决策
 	mode, routeTools := a.routeDecide(query, opts)
 
+	// 合并当前用户「已安装且开启」的 skill —— 仅在正常 loop（react）合并；
+	// RAG 模式严格不合并 skill、不进 loop。
+	if mode == "react" {
+		if skills := a.enabledSkillTools(ctx); len(skills) > 0 {
+			if routeTools == nil {
+				routeTools = a.toolsSnapshot()
+			}
+			for name, t := range skills {
+				routeTools[name] = t
+			}
+		}
+	}
+
 	// 装配 Schema-driven 上下文前缀 + 对话历史
 	memPrefix := a.buildContextPrefix(ctx, query, mode)
 	histMsgs := a.buildHistoryMessages(userID, query)
@@ -191,39 +213,23 @@ func (a *UnifiedAgent) prepare(ctx context.Context, query string, opts ChatOptio
 	}
 }
 
-// routeDecide 把"显式 vs 自动路由"的判断从 process 主流程中抽出。
-// 显式优先（Explicit=true 时按 SelectedTools / UseRAG 决定），否则按关键词启发式判定。
+// routeDecide 三分支路由：
+//   - 知识增强开 + 报告类意图 → rag_agent（Agentic RAG 子 Agent 流水线）
+//   - 知识增强开 + 简单问答   → rag（轻量检索问答）
+//   - 否则                    → react（普通 loop，无子 Agent）
 func (a *UnifiedAgent) routeDecide(query string, opts ChatOptions) (mode string, routeTools map[string]tool.Tool) {
-	if opts.Explicit {
-		switch {
-		case len(opts.SelectedTools) > 0:
-			routeTools = a.filterTools(opts.SelectedTools)
-			if a.needReActFromTools(query, routeTools) {
-				mode = "react"
-			} else {
-				mode = "tool"
-			}
-		case opts.UseRAG && a.rag.Loaded:
-			mode = "rag"
-		default:
-			mode = "chat"
+	if opts.UseRAG && a.rag.Loaded {
+		if a.reportIntent(query) {
+			return "rag_agent", nil
 		}
-		return
+		return "rag", nil
 	}
+	return "react", a.toolsSnapshot()
+}
 
-	switch {
-	case a.needReAct(query):
-		mode = "react"
-		routeTools = a.toolsSnapshot()
-	case a.needTool(query):
-		mode = "tool"
-		routeTools = a.toolsSnapshot()
-	case a.needRAG(query):
-		mode = "rag"
-	default:
-		mode = "chat"
-	}
-	return
+// reportIntent 判断是否为「要成文交付物」的意图（复用子 Agent 关键词，可调）。
+func (a *UnifiedAgent) reportIntent(query string) bool {
+	return a.needsSubAgentPlan(strings.ToLower(query))
 }
 
 // dispatch 按 mode 调对应 handler，把结果填回 resp。
@@ -231,7 +237,12 @@ func (a *UnifiedAgent) routeDecide(query string, opts ChatOptions) (mode string,
 func (a *UnifiedAgent) dispatch(ctx context.Context, pr preparedRequest, resp *Response, onEvent func(StreamEvent)) {
 	switch pr.mode {
 	case "react":
-		answer, steps, task := a.runReAct(ctx, pr.query, pr.routeTools, pr.memPrefix, pr.histMsgs, onEvent)
+		// 普通 loop：只用工具 + skill，不允许子 Agent
+		answer, steps, task := a.runReAct(ctx, pr.query, pr.routeTools, pr.memPrefix, pr.histMsgs, onEvent, reactOpts{allowSubAgents: false})
+		resp.Answer, resp.Steps, resp.Task = answer, steps, task
+	case "rag_agent":
+		// 知识增强 + 报告意图：强制 Agentic RAG 子 Agent 流水线（research→writer→review→doc）
+		answer, steps, task := a.runReAct(ctx, pr.query, pr.routeTools, pr.memPrefix, pr.histMsgs, onEvent, reactOpts{allowSubAgents: true, forceSubAgentPlan: true})
 		resp.Answer, resp.Steps, resp.Task = answer, steps, task
 	case "tool":
 		answer, tc := a.runTool(ctx, pr.query, pr.routeTools, pr.memPrefix, pr.histMsgs, onEvent)
@@ -277,13 +288,9 @@ func (a *UnifiedAgent) finalize(ctx context.Context, query string, resp *Respons
 	// 异步触发记忆合并（去重+合并+衰减+过期；有图层时使用图感知合并以保护高中心度节点）
 	a.goSafe("process.consolidate", func() {
 		if a.mem.ltm.NeedConsolidation() {
-			var result longterm.ConsolidationResult
-			if a.mem.graphMem != nil {
-				result = a.mem.graphMem.GraphAwareConsolidate()
-			} else {
-				result = a.mem.ltm.Consolidate()
+			if err := a.consolidateCommitted(context.Background()); err != nil {
+				logger.L().Warn("memory consolidation commit failed", "err", err)
 			}
-			a.syncConsolidationToDB(result)
 		}
 	})
 

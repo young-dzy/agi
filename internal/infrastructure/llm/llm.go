@@ -29,8 +29,10 @@ type Client struct {
 // New 创建 LLM 客户端
 func New(cfg *config.APIConfig) *Client {
 	return &Client{
-		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		cfg: cfg,
+		// glm-5.2 是推理型模型，长 prompt + 非流式（等整段生成）单次可能数十秒，
+		// 60s 会把慢调用掐断降级 mock。放宽到 180s 保正确性（流式路径不受此上限影响体验）。
+		httpClient: &http.Client{Timeout: 180 * time.Second},
 	}
 }
 
@@ -40,20 +42,43 @@ func (c *Client) Chat(systemPrompt string, messages []Message) string {
 	return c.ChatContext(context.Background(), systemPrompt, messages)
 }
 
-// ChatContext 带 context 的对话请求，支持取消。
-func (c *Client) ChatContext(ctx context.Context, systemPrompt string, messages []Message) string {
+// ChatFast 使用快模型的一次性对话（内部步骤用，无 context）。
+func (c *Client) ChatFast(systemPrompt string, messages []Message) string {
+	return c.ChatContextFast(context.Background(), systemPrompt, messages)
+}
+
+// fastModel 返回快模型名；未配置时回落主模型。
+func (c *Client) fastModel() string {
+	if c.cfg.LLMFastModel != "" {
+		return c.cfg.LLMFastModel
+	}
+	return c.cfg.LLMModel
+}
+
+// chatWithModel 是带 context 的对话核心：指定 model，封装 mock/取消/降级逻辑。
+func (c *Client) chatWithModel(ctx context.Context, model, systemPrompt string, messages []Message) string {
 	if c.cfg.IsRealLLM() {
-		reply, err := c.callAPIWithContext(ctx, systemPrompt, messages)
+		reply, err := c.callAPIWithContext(ctx, model, systemPrompt, messages)
 		if err != nil {
 			if ctx.Err() != nil {
 				return "[已中断]"
 			}
-			logger.C(ctx).Warn("LLM API call failed, falling back to mock", "err", err)
+			logger.C(ctx).Warn("LLM API call failed, falling back to mock", "model", model, "err", err)
 			return c.mock(messages)
 		}
 		return reply
 	}
 	return c.mock(messages)
+}
+
+// ChatContext 带 context 的对话请求（主模型），支持取消。
+func (c *Client) ChatContext(ctx context.Context, systemPrompt string, messages []Message) string {
+	return c.chatWithModel(ctx, c.cfg.LLMModel, systemPrompt, messages)
+}
+
+// ChatContextFast 带 context 的对话请求（快模型），用于内部步骤。
+func (c *Client) ChatContextFast(ctx context.Context, systemPrompt string, messages []Message) string {
+	return c.chatWithModel(ctx, c.fastModel(), systemPrompt, messages)
 }
 
 // ChatStreamContext 流式对话请求，每收到一个 token 片段调用 onToken 回调。
@@ -111,10 +136,10 @@ type streamChunk struct {
 }
 
 func (c *Client) callAPI(systemPrompt string, messages []Message) (string, error) {
-	return c.callAPIWithContext(context.Background(), systemPrompt, messages)
+	return c.callAPIWithContext(context.Background(), c.cfg.LLMModel, systemPrompt, messages)
 }
 
-func (c *Client) callAPIWithContext(ctx context.Context, systemPrompt string, messages []Message) (string, error) {
+func (c *Client) callAPIWithContext(ctx context.Context, model, systemPrompt string, messages []Message) (string, error) {
 	var msgs []Message
 	if systemPrompt != "" {
 		msgs = append(msgs, Message{Role: "system", Content: systemPrompt})
@@ -122,7 +147,7 @@ func (c *Client) callAPIWithContext(ctx context.Context, systemPrompt string, me
 	msgs = append(msgs, messages...)
 
 	body, err := json.Marshal(apiRequest{
-		Model:       c.cfg.LLMModel,
+		Model:       model,
 		Messages:    msgs,
 		Temperature: c.cfg.Temperature,
 	})

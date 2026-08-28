@@ -27,6 +27,10 @@ type ExecRequest struct {
 	Command string        // 待执行的 Shell 命令
 	Timeout time.Duration // 超时时间，0 表示使用 Sandbox 默认值
 	Confirm bool          // 对 Warn 级别命令的二次确认标记
+	// WorkspaceHostDir 非空时把该宿主机目录绑定挂载到容器 /workspace（可写）
+	// 并把工作目录设为 /workspace；用于 loop 产物物化（生成文件落宿主机桌面）。
+	// Local 后端则直接把该目录作为命令执行的工作目录。
+	WorkspaceHostDir string
 }
 
 // ExecResult 是一次命令执行的完整结果
